@@ -178,8 +178,8 @@ variable "build_command" {
     Its output is not kept and its exit code does not fail the warm — only the
     files it leaves in `turbo_cache_dir` matter. Unset, the warm re-installs
     (detected the same way, and with lifecycle scripts, because this step exists
-    to run the repository's own build) and then runs every `build` task through
-    turbo with `--cache-dir` pointed at `turbo_cache_dir`, so where artifacts are
+    to run the repository's own build) and then runs the `turbo_tasks` tasks
+    through turbo with `--cache-dir` pointed at `turbo_cache_dir`, so where artifacts are
     written and where they are collected cannot drift apart.
 
     A repository with no turbo pipeline can set this to `true` and still get the
@@ -197,6 +197,52 @@ variable "build_command" {
   EOT
   type        = string
   default     = null
+}
+
+variable "turbo_tasks" {
+  description = <<-EOT
+    The turbo tasks the default `build_command` runs, in one `turbo run`
+    invocation. `["build"]` by default.
+
+    List every task a pull-request job runs through turbo and reads from the
+    pool, for example `["build", "typecheck", "lint"]`. A task the warm does not
+    run is never in the pool, so the pull-request job runs it cold every time.
+    The pool is keyed by task hash, so a published task hits only when the
+    pull-request job hashes it the same way. Tasks that declare no `env` hash
+    the same in the warm and on a host.
+
+    Ignored when `build_command` is set. Each entry is a turbo task name
+    (`task` or `package#task`). The character set is limited to letters,
+    digits and `: # @ . _ / -`, because the names are joined into a shell
+    command line.
+  EOT
+  type        = list(string)
+  default     = ["build"]
+
+  validation {
+    condition     = length(var.turbo_tasks) > 0 && alltrue([for t in var.turbo_tasks : can(regex("^[A-Za-z0-9][A-Za-z0-9:#@._/-]{0,127}$", t))])
+    error_message = "turbo_tasks must name at least one task, and each must be a turbo task name made of letters, digits and : # @ . _ / - only. The names are joined into the build step's shell command, so anything else could become a second command."
+  }
+}
+
+variable "build_node_max_old_space_mb" {
+  description = <<-EOT
+    V8 heap ceiling for the build step, in MiB, passed as
+    `NODE_OPTIONS=--max-old-space-size=<n>`. Null by default, which leaves
+    node's own default (sized from system RAM).
+
+    Set it to the value the repository's own CI uses for the same tasks. A task
+    that passes there and runs out of heap here is a task the warm never
+    publishes, and turbo cancels the tasks queued behind it. Size
+    `machine_type` to fit: concurrent tasks can each grow to this ceiling.
+  EOT
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.build_node_max_old_space_mb == null || try(var.build_node_max_old_space_mb >= 512 && var.build_node_max_old_space_mb <= 65536 && floor(var.build_node_max_old_space_mb) == var.build_node_max_old_space_mb, false)
+    error_message = "build_node_max_old_space_mb must be null or a whole number of MiB between 512 and 65536."
+  }
 }
 
 variable "turbo_cache_dir" {
