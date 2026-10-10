@@ -255,10 +255,12 @@ output). With `disabled = true` the policy is created disabled.
 alert nobody receives is the incident it replaces.
 
 **The applying identity needs two more permissions** than before, in this
-module's project: `logging.logMetrics.create/update/delete` (for example
-`roles/logging.configWriter`) and `monitoring.alertPolicies.create/update/delete`
+module's project: `logging.logMetrics.create/get/update/delete` (a custom role
+holding only these — not `roles/logging.configWriter`, which also lets its
+holder create sinks and exclusions, i.e. export or drop the build logs) and `monitoring.alertPolicies.create/update/delete`
 (`roles/monitoring.alertPolicyEditor`), plus read on the notification channels
-it names (`roles/monitoring.notificationChannelViewer`). Without them the apply
+it names (`roles/monitoring.notificationChannelViewer`). The plan also refuses
+a channel that is not in this module's project. Without them the apply
 fails at this module; it does not silently skip the alarm.
 
 ### Three refusals that all happen at FIRE time, and the last one says nothing

@@ -79,6 +79,14 @@ resource "google_monitoring_alert_policy" "warm" {
   notification_channels = var.alert_notification_channels
   severity              = "ERROR"
 
+  lifecycle {
+    # A variable validation cannot read var.project_id on Terraform 1.5.
+    precondition {
+      condition     = alltrue([for c in var.alert_notification_channels : split("/", c)[1] == var.project_id])
+      error_message = "Every alert_notification_channels entry must be a channel in project_id (${var.project_id})."
+    }
+  }
+
   conditions {
     display_name = "a warm ended in a non-DONE outcome in the last hour"
     condition_prometheus_query_language {
