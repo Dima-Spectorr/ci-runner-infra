@@ -161,6 +161,11 @@ if [ -n "${CACHE_SCAN_ALLOW_FILE:-}" ]; then
     scan_allow_label=$(printf '%s' "${scan_allow_line#*#}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -n "$scan_allow_name" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has an empty comment — name the package that ships the file"
+    # A refusal prints `# <package that ships this file>` when the path names no
+    # package; pasted unedited it would excuse a digest nobody identified.
+    case "$scan_allow_label" in
+      '<'* ) die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno still has the placeholder comment — replace it with the package that ships the file: $(safe_path "$scan_allow_line")" ;;
+    esac
     scan_allow_digest=$(printf '%s' "$scan_allow_digest" | tr -d '[:space:]')
     [ -n "$scan_allow_digest" ] \
       || die "CACHE_SCAN_ALLOW_FILE line $scan_allow_lineno has a comment but no digest: $(safe_path "$scan_allow_line")"

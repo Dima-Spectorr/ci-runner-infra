@@ -1042,6 +1042,10 @@ has_trusted_snapshot_build() { # <file>
   # the list that gets rubber-stamped.
   matches "$code" 'excuses a digest with no comment naming the package' || return 1
   matches "$code" 'has an empty comment' || return 1
+  # The placeholder a refusal prints when the path names no package must not
+  # pass as a name when pasted unedited.
+  matches "$code" 'still has the placeholder comment' || return 1
+  matches "$code" "^[[:space:]]*'<'\\* \\) die" || return 1
   # The guards themselves, not only the sentences they die with. A `[ ... ]`
   # replaced by `true` leaves the message in place, so a suite that reads only
   # the message reports a script that no longer checks anything as intact.
@@ -2729,7 +2733,8 @@ else
   if matches "$allhits" 'embedded credential in 2 file\(s\)' \
     && matches "$allhits" 'matched in .*@acme/fixture/test/signing-fixture' \
     && matches "$allhits" 'matched in .*sha512/ab/blob' \
-    && matches "$allhits" "^    $BEH_PEM_SHA  # @acme/fixture\$"; then
+    && matches "$allhits" "^    $BEH_PEM_SHA  # @acme/fixture\$" \
+    && [ "$(grep -cE '^    [0-9a-f]{64}  #' <<<"$allhits")" -eq 1 ]; then
     ok
   else
     bad "behaviour: a refusal with two hits did not explain both, count them, and print the paste-ready line for the printable one"
