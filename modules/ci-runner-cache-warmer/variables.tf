@@ -237,7 +237,10 @@ variable "turbo_tasks_exclude" {
     must never run with the warmer's credentials. A test task that needs a database, a
     browser or another service fails on every warm (a failed task is never
     cached), and a slow one can push a shared warm past `build_timeout`. Set
-    `[]` to warm every cacheable task, test tasks included.
+    `[]` to warm every cacheable task — which ALSO re-enables deploy, release,
+    publish, migrate and clean tasks; when overriding, keep those patterns.
+    Matching is case-sensitive and by name only, so a side-effecting task with
+    another name (e.g. `db:seed`, `upload`) must be added here.
   EOT
   type        = list(string)
   default     = ["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]
