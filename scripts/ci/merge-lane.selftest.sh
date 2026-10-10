@@ -3574,6 +3574,7 @@ behavioural_premerge_cases() {
   else
     echo "PASS the merge call pins the verified sha"
   fi
+  # shellcheck disable=SC2034  # read by the evalled lane_take_action.
   LANE_LABEL_WAIVED[7]="$V"
   _pm_case "a pin-bump waiver for this head waives the label" merged ready-to-merge "$UNLABELLED"
   rm -rf "$fix"
