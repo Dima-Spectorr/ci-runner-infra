@@ -72,8 +72,9 @@ normalise_attestor() {
       local embedded="${ATTESTOR#projects/}"
       embedded="${embedded%%/attestors/*}"
       ATTESTOR="${ATTESTOR##*/attestors/}"
-      [ -n "$embedded" ] && [ -n "$ATTESTOR" ] && [ "${embedded#*/}" = "$embedded" ] \
-        || die "attestor looks fully qualified but does not parse: '$RIS_ATTESTOR' (expected projects/<project>/attestors/<name>)."
+      if [ -z "$embedded" ] || [ -z "$ATTESTOR" ] || [ "${embedded#*/}" != "$embedded" ]; then
+        die "attestor looks fully qualified but does not parse: '$RIS_ATTESTOR' (expected projects/<project>/attestors/<name>)."
+      fi
       if [ -n "$ATTESTOR_PROJECT" ] && [ "$ATTESTOR_PROJECT" != "$embedded" ]; then
         die "attestor names project '$embedded' but attestor-project is '$ATTESTOR_PROJECT' — refusing to guess which attestor is meant."
       fi
