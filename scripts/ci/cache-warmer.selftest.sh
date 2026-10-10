@@ -612,7 +612,9 @@ fi
 #       logs nothing), and keeps `or vector(0)`, without which "no DONE at all"
 #       is an empty comparison and therefore silence;
 #       the failure condition counts anything that is not DONE;
-#       the policy notifies the declared channels, and the channels are required.
+#       the policy notifies the declared channels, and the channels are required;
+#       it has ONE condition with both branches joined by `or` — the API refuses
+#       (400) a second prometheus_query_language condition on a policy.
 owns_its_alarm() { # <alert.tf>
   local code
   code=$(code_of "$1")
@@ -623,7 +625,8 @@ owns_its_alarm() { # <alert.tf>
   matches "$code" 'outcome!=\\"DONE\\"\}\[1h\]\)\) > 0' || return 1
   matches "$code" 'outcome=\\"DONE\\"\}\[\$\{var\.alert_stale_after_hours\}h\]\)\) or vector\(0\)\) < 1' || return 1
   matches "$code" 'notification_channels[[:space:]]*=[[:space:]]*var\.alert_notification_channels' || return 1
-  matches "$code" 'combiner[[:space:]]*=[[:space:]]*"OR"'
+  matches "$code" '\[1h\]\)\) > 0\) or \(\(sum\(increase' || return 1
+  [ "$(grep -c '^  conditions {$' <<<"$code")" -eq 1 ] || return 1
 }
 
 requires_alert_channels() { # <variables.tf>
@@ -942,8 +945,12 @@ mutate "the policy notifies nobody" "$ALERT" \
   's|notification_channels = var\.alert_notification_channels|notification_channels = []|' \
   owns_its_alarm
 
-mutate "the conditions combined with AND" "$ALERT" \
-  's|combiner     = "OR"|combiner     = "AND"|' \
+mutate "the two branches joined with and" "$ALERT" \
+  's|> 0) or ((sum|> 0) and ((sum|' \
+  owns_its_alarm
+
+mutate "a second condition the API refuses" "$ALERT" \
+  's|^  conditions {$|  conditions {\n  }\n  conditions {|' \
   owns_its_alarm
 
 mutate "the alert channels given an empty default" "$VARS" \

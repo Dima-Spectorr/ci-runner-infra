@@ -73,7 +73,8 @@ resource "google_logging_metric" "warm_outcome" {
 resource "google_monitoring_alert_policy" "warm" {
   project      = var.project_id
   display_name = "CI cache warmer / ${local.trigger_name} failing or stale"
-  combiner     = "OR"
+  # Required by the API; with one condition it has nothing to combine.
+  combiner = "OR"
   # A disabled warmer is not expected to succeed; an enabled one always is.
   enabled               = !var.disabled
   notification_channels = var.alert_notification_channels
@@ -87,23 +88,19 @@ resource "google_monitoring_alert_policy" "warm" {
     }
   }
 
+  # ONE condition, two branches joined by PromQL `or`. Cloud Monitoring refuses
+  # (400) a policy with more than one prometheus_query_language condition —
+  # measured 2026-10-10 on the first real apply — so failing and stale cannot be
+  # two `conditions` blocks. `or` on two label-less sums yields the left side
+  # when it has a sample and the right otherwise, so either branch alone fires.
   conditions {
-    display_name = "a warm ended in a non-DONE outcome in the last hour"
-    condition_prometheus_query_language {
-      query               = "sum(increase(${local.outcome_promql}{${local.outcome_selector},outcome!=\"DONE\"}[1h])) > 0"
-      duration            = "0s"
-      evaluation_interval = "300s"
-    }
-  }
-
-  conditions {
-    display_name = "no successful warm in ${var.alert_stale_after_hours}h"
+    display_name = "a warm ended in a non-DONE outcome in the last hour, or none succeeded in ${var.alert_stale_after_hours}h"
     condition_prometheus_query_language {
       # `or vector(0)`: with no DONE at all there is no series to compare, and
       # an empty comparison is silence — the exact failure this exists for.
-      query               = "(sum(increase(${local.outcome_promql}{${local.outcome_selector},outcome=\"DONE\"}[${var.alert_stale_after_hours}h])) or vector(0)) < 1"
+      query               = "(sum(increase(${local.outcome_promql}{${local.outcome_selector},outcome!=\"DONE\"}[1h])) > 0) or ((sum(increase(${local.outcome_promql}{${local.outcome_selector},outcome=\"DONE\"}[${var.alert_stale_after_hours}h])) or vector(0)) < 1)"
       duration            = "0s"
-      evaluation_interval = "900s"
+      evaluation_interval = "300s"
     }
   }
 
