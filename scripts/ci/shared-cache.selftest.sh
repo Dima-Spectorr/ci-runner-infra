@@ -1010,6 +1010,11 @@ has_trusted_snapshot_build() { # <file>
   # cache that file's name is a content hash, so without this the log says only
   # that something matched somewhere — indistinguishable from a false positive.
   matches "$code" 'explain_credential_hit "\$root" "\$bad"' || return 1
+  # ...and EVERY refusal is explained before the single fatal line. A `die`
+  # back inside the loop hides each later hit until the previous one is fixed,
+  # one nightly run per false positive.
+  matches "$code" 'embedded credential in \$refused file\(s\)' || return 1
+  ! matches "$(printf '%s\n' "$code" | grep -A2 -F 'explain_credential_hit "$root" "$bad"')" '(^|[;&| ])die ' || return 1
   # ...and readable without printing what it caught. What sits before `://` in a
   # cache blob is not reliably a scheme word, so an unfiltered echo of it is the
   # leak this function exists to avoid; only an allow-listed scheme is printed.
@@ -2117,7 +2122,9 @@ mutate_scansh 'the credential reporter loses its byte locale' has_trusted_snapsh
 # false positive without reproducing the whole install, and the predictable
 # response to a gate nobody can read is deleting it.
 mutate_scansh 'the credential refusal stops saying what it caught' has_trusted_snapshot_build \
-  's@^    explain_credential_hit "\$root" "\$bad"$@@'
+  's@^      explain_credential_hit "\$root" "\$bad"$@@'
+mutate_scansh 'the credential scan dies on the first refusal again' has_trusted_snapshot_build \
+  's@^      explain_credential_hit "\$root" "\$bad"$@&; die "refused"@'
 # The allowlist is the one place this script excuses a scan hit, so each of its
 # bounds gets a mutation. Every one of these leaves a script that still builds,
 # still scans and still publishes.
@@ -2698,6 +2705,34 @@ else
     ok
   else
     bad "behaviour: the high-bit token run failed, but not on the content pass"
+  fi
+fi
+
+# EVERY refusal is explained before the one fatal line, and a printable digest
+# arrives as a paste-ready allowlist line naming its package. Dying on the first
+# hit hid the rest, so an allowlist was repaired one false positive per nightly
+# run. Two files here: a PEM fixture under a scoped package (printable) and a
+# registry token (never excusable). Both must be named, the count must say 2,
+# and the run must still refuse — explaining more is not excusing anything.
+# The PEM is not named `*.pem`: the filename pass refuses that by name, before
+# the content scan this case is about ever runs.
+if printf '%s\n' "$BEH_PEM_BODY" >"$TMP/pem2" && behave_run '
+set -eu
+stage=$(dirname "$npm_config_cache")
+mkdir -p "$stage/pnpm-store/node_modules/@acme/fixture/test" "$stage/npm/_cacache/content-v2/sha512/ab"
+cat '"'$TMP/pem2'"' >"$stage/pnpm-store/node_modules/@acme/fixture/test/signing-fixture"
+printf "%s\n" "//registry.example.com/:_authToken=deadbeef" >"$stage/npm/_cacache/content-v2/sha512/ab/blob"
+' >"$TMP/beh.allhits.log" 2>&1; then
+  bad "behaviour: two refusable files were published"
+else
+  allhits=$(cat "$TMP/beh.allhits.log")
+  if matches "$allhits" 'embedded credential in 2 file\(s\)' \
+    && matches "$allhits" 'matched in .*@acme/fixture/test/signing-fixture' \
+    && matches "$allhits" 'matched in .*sha512/ab/blob' \
+    && matches "$allhits" "^    $BEH_PEM_SHA  # @acme/fixture\$"; then
+    ok
+  else
+    bad "behaviour: a refusal with two hits did not explain both, count them, and print the paste-ready line for the printable one"
   fi
 fi
 
