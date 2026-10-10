@@ -79,6 +79,8 @@ parse_required() {
 # The attestor's project: explicit, or embedded in a qualified attestor name.
 # Never the build project — the release attestor lives in the signing project.
 normalise_attestor() {
+  # RIS_* arrive from the environment (action.yml), not from an assignment here.
+  # shellcheck disable=SC2153
   ATTESTOR="$RIS_ATTESTOR"
   ATTESTOR_PROJECT="${RIS_ATTESTOR_PROJECT:-}"
   case "$ATTESTOR" in
@@ -276,10 +278,14 @@ require_tools() {
 }
 
 do_sign() {
+  # Take the token out of the environment FIRST, into an unexported shell
+  # variable, so no child process (not even `gcloud --help` below) inherits it.
+  local token="${RIS_ACCESS_TOKEN:-}"
+  unset RIS_ACCESS_TOKEN
   parse_required
   scan_inputs
   [ "${#MISSING[@]}" -eq 0 ] || die "sign ran with inputs missing (${MISSING[*]}) — sign only runs armed, so this is a defect in the caller."
-  [ -n "${RIS_ACCESS_TOKEN:-}" ] \
+  [ -n "$token" ] \
     || die "sign ran without the signer's access token — the auth step must run with token_format: access_token, and only this step receives it."
   validate_armed
   require_tools
@@ -293,8 +299,8 @@ do_sign() {
   # The signer's token, readable by this user only, gone when the step ends.
   # gcloud reads it through auth/access_token_file; it is never written to a
   # gcloud config, a credentials file or an exported GOOGLE_* variable.
-  ( umask 077 && printf '%s' "$RIS_ACCESS_TOKEN" > "$work/token" )
-  unset RIS_ACCESS_TOKEN
+  ( umask 077 && printf '%s' "$token" > "$work/token" )
+  token=""
   export CLOUDSDK_AUTH_ACCESS_TOKEN_FILE="$work/token"
   # The project is explicit on every call AND here, so nothing falls back to an
   # ambient gcloud configuration's project.
