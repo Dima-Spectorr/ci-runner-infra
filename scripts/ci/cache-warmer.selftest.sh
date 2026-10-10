@@ -392,7 +392,11 @@ has_config_under_the_cliff() { # <file>
   # and the task derivation the build step runs before anything else.
   matches "$code" 'derive_sha  = filesha256\(' || return 1
   matches "$code" '\$\{local\.derive_sha\}  \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs. \| sha256sum -c - >/dev/null \|\| exit 1' || return 1
-  [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 3 ] || return 1
+  # Four: the read-only cache server the build step starts is staged too, and
+  # it runs in the step that also runs the repository's build.
+  matches "$code" 'server_sha  = filesha256\(' || return 1
+  matches "$code" '\$\{local\.server_sha\}  \$\{local\.staged_dir\}/turbo-cache-server\.py. \| sha256sum -c - >/dev/null \|\| exit 1' || return 1
+  [ "$(printf '%s\n' "$code" | grep -c 'sha256sum -c -')" -eq 4 ] || return 1
   matches "$code" 'condition     = local\.build_config_bytes < [0-9]+' || return 1
   # And the big script reaches the config exactly once. Twice is the 199 KB
   # config that never ran.
@@ -561,7 +565,7 @@ derives_tasks_by_default() { # <main.tf>
   matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
   # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
   # `\n` in an ERE is not that, and matched nothing.
-  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\n\$\{local\.derive_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\n\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
   matches "$code" 'WARM_TASKS=\$\(node \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs turbo\.json \$\{join\(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'\$\{g\}'"'"'"\]\)\}\) \|\| \{ .*exit 1; \}' || return 1
   matches "$code" "gzip -d > \\$\{local\.staged_dir\}/derive-turbo-tasks\.cjs"
 }
@@ -647,6 +651,140 @@ if requires_alert_channels "$VARS"; then ok; else
   bad "alert_notification_channels is no longer required and non-empty (or the stale default moved) — an alert nobody receives repeats the incident"
 fi
 
+# 20. THE BUILD READS THE POOL BEFORE IT BUILDS. Measured on build 6e721cc4: 0
+#     of 956 tasks cached, every one rebuilt and re-published, nightly. The build
+#     step now starts the HOST POOL's own read-only server — the same file, not a
+#     copy, so a warm trusts exactly what a pull request trusts — on loopback,
+#     digest-checked, before the build command; and the publisher is told which
+#     hashes it served so it never asks the bucket about them.
+HOSTSERVER="$ROOT/modules/ci-runner-host-pool/scripts/turbo-cache-server.py"
+reads_the_pool_before_building() { # <main.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'server_gz = base64gzip\(file\("\$\{path\.module\}/\.\./ci-runner-host-pool/scripts/turbo-cache-server\.py"\)\)' || return 1
+  matches "$code" '\$\{local\.server_sha\}  \$\{local\.staged_dir\}/turbo-cache-server\.py. \| sha256sum -c - >/dev/null \|\| exit 1' || return 1
+  # Loopback only: the server holds a token that can read the whole prefix.
+  matches "$code" 'CI_TURBO_HOST=127\.0\.0\.1 ' || return 1
+  ! matches "$code" 'CI_TURBO_HOST=0\.0\.0\.0' || return 1
+  matches "$code" 'export TURBO_API=http://127\.0\.0\.1:' || return 1
+  matches "$code" 'build_step_script = .*\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" '"WARM_SERVED_DIR=\$\{local\.served_dir\}"'
+}
+
+if [ -f "$HOSTSERVER" ] && reads_the_pool_before_building "$MAIN"; then ok; else
+  bad "the warm no longer reads the pool through the host's own read-only server before it builds — every task is rebuilt and re-published on every run, or the server is a drifting copy, unchecked, or reachable off the loopback"
+fi
+
+# 21. A SNAPSHOT REFUSAL NO LONGER LOSES THE TURBO WARM, AND STILL TURNS RED.
+#     `dependencies` may fail so the build and publish-turbo still run; that is
+#     only safe while all of these hold together: the archive both phases name is
+#     one path, stage-scripts deletes whatever the checkout put there, the
+#     install phase writes it only after its scan, publish-snapshot is NOT
+#     allowed to fail and dies on a missing archive. Then the build is ERROR, the
+#     outcome metric counts a non-DONE, and the alert fires as it did before.
+step_block() { # <text> <step id>
+  printf '%s\n' "$1" | awk -v want="$2" '
+    /^[[:space:]]*step[[:space:]]*\{/ { inside = 0 }
+    $0 ~ ("id[[:space:]]*=[[:space:]]*\"" want "\"") { inside = 1 }
+    inside { print }
+  '
+}
+
+snapshot_failure_still_red() { # <main.tf>
+  local code deps pub stage
+  code=$(code_of "$1")
+  deps=$(step_block "$code" dependencies)
+  pub=$(step_block "$code" publish-snapshot)
+  stage=$(step_block "$code" stage-scripts)
+  [ -n "$deps" ] && [ -n "$pub" ] && [ -n "$stage" ] || return 1
+  matches "$deps" 'allow_failure[[:space:]]*=[[:space:]]*true' || return 1
+  ! matches "$pub" 'allow_failure' || return 1
+  ! matches "$stage" 'allow_failure' || return 1
+  matches "$deps" '"CACHE_ARCHIVE_OUT=\$\{local\.snapshot_archive\}"' || return 1
+  matches "$pub" '"CACHE_ARCHIVE_IN=\$\{local\.snapshot_archive\}"' || return 1
+  matches "$code" 'rm -f \$\{local\.snapshot_archive\}' || return 1
+  matches "$code" 'rm -rf \$\{local\.served_dir\}'
+}
+
+publisher_refuses_a_missing_archive() { # <publish-cache-snapshot.sh>
+  local code scan_at cp_at
+  code=$(code_of "$1")
+  matches "$code" '\[ -f "\$CACHE_ARCHIVE_IN" \] \|\| die' || return 1
+  scan_at=$(grep -n 'scan_or_die "\$VERIFY"' "$1" | tail -1 | cut -d: -f1)
+  cp_at=$(grep -n 'cp -- "\$ARCHIVE" "\$CACHE_ARCHIVE_OUT"' "$1" | head -1 | cut -d: -f1)
+  [ -n "$scan_at" ] && [ -n "$cp_at" ] && [ "$cp_at" -gt "$scan_at" ]
+}
+
+if snapshot_failure_still_red "$MAIN" && publisher_refuses_a_missing_archive "$SHARED"; then ok; else
+  bad "the dependencies step may fail but the build no longer ends red — a refused snapshot would be a DONE warm and the alert would never fire"
+fi
+
+# 22. THE PUBLISHER, RUN. Fake curl, gcloud and zstd on PATH: a served hash
+#     costs no request, a hash already in the bucket is not uploaded, a file that
+#     is not a whole zstd frame is refused, and uploads run in parallel within
+#     the bound — the 16-minute one-at-a-time loop was build 6e721cc4.
+publishes_incrementally() { # <warm-turbo.sh>
+  local t rc peak
+  t=$(mktemp -d)
+  mkdir -p "$t/bin" "$t/turbo" "$t/served" "$t/state/inflight"
+  cat >"$t/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+url="${*: -1}"; out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] && : >"$out"
+echo "$url" >>"$FAKE_STATE/calls"
+case "$url" in
+  */upload/*)
+    # Held until the bound is full, every upload has started, or starts have
+    # stalled for half a second — so the peak measures the script's bound, not
+    # how fast this machine forks.
+    echo x >>"$FAKE_STATE/started"
+    : >"$FAKE_STATE/inflight/$BASHPID"
+    last=-1; still=0
+    while :; do
+      n=$(find "$FAKE_STATE/inflight" -type f | wc -l)
+      s=$(wc -l <"$FAKE_STATE/started")
+      echo "$n" >>"$FAKE_STATE/peaks"
+      if [ "$n" -ge 16 ] || [ "$s" -ge "$FAKE_TOTAL" ]; then break; fi
+      if [ "$s" = "$last" ]; then still=$((still + 1)); [ "$still" -ge 5 ] && break
+      else still=0; last=$s; fi
+      sleep 0.1
+    done
+    sleep 0.5
+    find "$FAKE_STATE/inflight" -type f | wc -l >>"$FAKE_STATE/peaks"
+    rm -f "$FAKE_STATE/inflight/$BASHPID"
+    echo "$url" >>"$FAKE_STATE/uploads"
+    printf 200 ;;
+  *present*) printf 200 ;;
+  *) printf 404 ;;
+esac
+FAKE
+  printf '#!/bin/sh\necho faketoken\n' >"$t/bin/gcloud"
+  printf '#!/bin/sh\nfor f; do :; done\n! grep -q CORRUPT "$f"\n' >"$t/bin/zstd"
+  chmod +x "$t/bin/curl" "$t/bin/gcloud" "$t/bin/zstd"
+  art() { { printf '\050\265\057\375'; printf '%s' "$2"; } >"$t/turbo/$1.tar.zst"; }
+  art served1 ok; : >"$t/served/served1"
+  art present1 ok
+  art corrupt1 CORRUPT
+  printf 'nozstd' >"$t/turbo/badmagic1.tar.zst"
+  # 18: just past the bound of 16, so an unbounded loop shows a peak over it.
+  for i in $(seq -w 1 18); do art "up$i" ok; done
+  PATH="$t/bin:$PATH" FAKE_STATE="$t/state" FAKE_TOTAL=18 WARM_BUCKET=b WARM_TURBO_PREFIX=turbo/o/r/ \
+    WARM_TURBO_DIR="$t/turbo" WARM_SERVED_DIR="$t/served" bash "$1" >/dev/null 2>&1
+  rc=0
+  [ "$(wc -l <"$t/state/uploads" 2>/dev/null || echo 0)" -eq 18 ] || rc=1
+  ! grep -q served1 "$t/state/calls" 2>/dev/null || rc=1
+  ! grep -qE 'present1|corrupt1|badmagic1' "$t/state/uploads" 2>/dev/null || rc=1
+  peak=$(sort -n "$t/state/peaks" 2>/dev/null | tail -1)
+  [ "${peak:-0}" -gt 1 ] && [ "${peak:-0}" -le 16 ] || rc=1
+  rm -rf "$t"
+  return "$rc"
+}
+
+if publishes_incrementally "$TURBO"; then ok; else
+  bad "warm-turbo.sh, run against fake curl/gcloud/zstd, re-asked about a served hash, re-uploaded a present one, published a truncated artifact, or uploaded one at a time / unbounded"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -718,7 +856,7 @@ mutate "the library is read but never written beside the publisher" "$MAIN" \
   has_shared_publisher
 
 mutate "install and upload in one phase" "$MAIN" \
-  's@"CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",@@' \
+  's@"CACHE_ARCHIVE_OUT=\${local\.snapshot_archive}",@@' \
   has_two_phases
 
 # The mutation above removes the split; this one keeps it and hands the install
@@ -726,7 +864,7 @@ mutate "install and upload in one phase" "$MAIN" \
 # it is one less step" edit actually takes. It is the only mutation that
 # exercises the slice, and the reason the check was rewritten to use one.
 mutate "the install step is handed the bucket" "$MAIN" \
-  's@"CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",@&\n        "CACHE_BUCKET=${var.cache_bucket}",@' \
+  's@"CACHE_ARCHIVE_OUT=\${local\.snapshot_archive}",@&\n        "CACHE_BUCKET=${var.cache_bucket}",@' \
   has_two_phases
 
 mutate "the pointer grant widened to a prefix" "$MAIN" \
@@ -766,7 +904,7 @@ mutate "the uploader overwrites what is already published" "$TURBO" \
   has_uploader_bounds
 
 mutate "the upload goes back through gcloud storage cp" "$TURBO" \
-  's@gcloud storage objects describe@gcloud storage cp@' \
+  's@gcs_upload "\$artifact"@gcloud storage cp "$artifact"@' \
   has_uploader_bounds
 
 mutate "a package manager assumed instead of detected" "$MAIN" \
@@ -830,7 +968,7 @@ mutate "the publishing script inlined into its step again" "$MAIN" \
   has_config_under_the_cliff
 
 mutate "a staged script run without checking its digest" "$MAIN" \
-  's@\\nexec \${local\.staged_dir}/warm-turbo\.sh@\\nexec ${local.staged_dir}/warm-turbo.sh@;s@sha256sum -c -\\nexec \${local\.staged_dir}/warm-turbo\.sh@exec ${local.staged_dir}/warm-turbo.sh@' \
+  's@ | sha256sum -c -\\n\${local\.ensure_zstd}exec \${local\.staged_dir}/warm-turbo\.sh@\\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh@' \
   has_config_under_the_cliff
 
 mutate "the scanner staged but left unchecked" "$MAIN" \
@@ -895,7 +1033,7 @@ mutate "derivation runs even when a list is given" "$MAIN" \
   derives_tasks_by_default
 
 mutate "the derive step never reaches the build script" "$MAIN" \
-  's@\\n${local\.derive_step}${local\.build_command}@\\n${local.build_command}@' \
+  's@\\n${local\.derive_step}${local\.serve_step}@\\n${local.serve_step}@' \
   derives_tasks_by_default
 
 mutate "an empty derivation builds anyway" "$MAIN" \
@@ -960,6 +1098,62 @@ mutate "the alert channels given an empty default" "$VARS" \
 mutate "the empty channel list accepted" "$VARS" \
   's|length(var\.alert_notification_channels) > 0 \&\& alltrue|alltrue|' \
   requires_alert_channels
+
+mutate "the read-only server bound to every interface" "$MAIN" \
+  's@CI_TURBO_HOST=127\.0\.0\.1@CI_TURBO_HOST=0.0.0.0@' \
+  reads_the_pool_before_building
+
+mutate "the build no longer reads the pool first" "$MAIN" \
+  's@\${local\.serve_step}\${local\.build_command}@${local.build_command}@' \
+  reads_the_pool_before_building
+
+mutate "the publisher not told what was served" "$MAIN" \
+  's@^ *"WARM_SERVED_DIR=\${local\.served_dir}",$@@' \
+  reads_the_pool_before_building
+
+mutate "the server started without checking its digest" "$MAIN" \
+  's@"echo .\${local\.server_sha}  \${local\.staged_dir}/turbo-cache-server\.py. | sha256sum -c - >/dev/null || exit 1\\n",@@' \
+  reads_the_pool_before_building
+
+mutate "the server copied into the module" "$MAIN" \
+  's@\.\./ci-runner-host-pool/scripts/turbo-cache-server\.py"))@scripts/turbo-cache-server.py"))@' \
+  reads_the_pool_before_building
+
+mutate "the snapshot publish allowed to fail too" "$MAIN" \
+  's@id     = "publish-snapshot"@&\n      allow_failure = true@' \
+  snapshot_failure_still_red
+
+mutate "a stale archive from the checkout no longer removed" "$MAIN" \
+  's@rm -f \${local\.snapshot_archive}@true@' \
+  snapshot_failure_still_red
+
+mutate "a served directory from the checkout no longer emptied" "$MAIN" \
+  's@rm -rf \${local\.served_dir}@true@' \
+  snapshot_failure_still_red
+
+mutate "the two phases name different archives" "$MAIN" \
+  's@"CACHE_ARCHIVE_IN=\${local\.snapshot_archive}"@"CACHE_ARCHIVE_IN=/workspace/other.tar.gz"@' \
+  snapshot_failure_still_red
+
+mutate "the publisher accepts a missing archive" "$SHARED" \
+  's@\[ -f "\$CACHE_ARCHIVE_IN" \] || die@true || die@' \
+  publisher_refuses_a_missing_archive
+
+mutate "a served hash checked against the bucket anyway" "$TURBO" \
+  's@\[ -f "\$WARM_SERVED_DIR/\$hash" \]@false@' \
+  publishes_incrementally
+
+mutate "the uploads run one at a time again" "$TURBO" \
+  's@^PUBLISH_PARALLEL=16$@PUBLISH_PARALLEL=1@' \
+  publishes_incrementally
+
+mutate "the concurrency bound removed" "$TURBO" \
+  's@^    wait -n$@    :@' \
+  publishes_incrementally
+
+mutate "a truncated artifact published" "$TURBO" \
+  's@\[ "\$magic" = "28b52ffd" \] || return 1@:@' \
+  publishes_incrementally
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

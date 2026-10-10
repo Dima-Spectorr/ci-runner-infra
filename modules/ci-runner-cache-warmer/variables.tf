@@ -114,6 +114,11 @@ variable "schedule" {
     early enough that the first working-hours build reads a cache warmed against
     the branch as it stands.
 
+    Recommended: "*/15 * * * *" (or hourly). The warm reads the pool before it
+    builds, so a run with nothing changed is a replay plus a few metadata reads,
+    and overlapping runs are safe: uploads are write-once and a 412 counts as
+    already present.
+
     There is no "off" value. A warmer that never runs is the cold cache this
     module exists to end, and it would look exactly like a healthy one — which
     is the observable that hid the fault this whole layer answers. Use

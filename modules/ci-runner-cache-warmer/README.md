@@ -53,7 +53,8 @@ pull-request job runs outside turbo. An explicit `turbo_tasks` also ignores
 `turbo_tasks_exclude`. A task the warm does not run is never published, so the job
 that runs it is cold on every pull request.
 
-The rest of the defaults: nightly at 04:00 UTC, `node:22`, `E2_HIGHCPU_8`, a
+The rest of the defaults: nightly at 04:00 UTC (a faster cadence is recommended —
+see [Cadence](#cadence)), `node:22`, `E2_HIGHCPU_8`, a
 one-hour timeout. `build_command = "true"` gives you the dependency snapshot and
 no build artifacts, which is the right setting for a repository with no turbo
 pipeline.
@@ -191,6 +192,50 @@ replaces used, for the same reason.
 Step 3 also refuses to publish what the host-side server would refuse to serve:
 a name that is not a hash, an artifact over `max_artifact_bytes`, or a prefix
 missing its trailing slash. Publishing those costs storage and answers no read.
+It also refuses an artifact that is not a complete zstd frame (magic bytes always,
+`zstd -t` when the image has or can install zstd): a truncated `.tar.zst` is
+write-once and every pull request would unpack it.
+
+### Incremental: the build reads the pool before it builds
+
+The build step starts the host pool's own read-only cache server
+(`modules/ci-runner-host-pool/scripts/turbo-cache-server.py` — the same file,
+staged and digest-checked, never a copy) on `127.0.0.1` and points turbo at it
+with `TURBO_API`/`TURBO_TOKEN`/`TURBO_TEAM`. Turbo replays every task whose hash
+is already in `turbo/<owner>/<repo>/` and rebuilds only what changed. Measured
+before this (build 6e721cc4): 0 of 956 tasks cached, ~12 minutes of build and
+~16 minutes of publish, every run.
+
+Trust: what the warm reads back is exactly what a pull request on a pool host
+reads — same server, same prefix, same read-only token — so a replayed artifact
+is no less trustworthy than a PR's hit, and it is not re-published.
+
+No python3 (and none installable), or a server that does not answer its status
+probe, is a logged **cold** build — every task rebuilt and published, as before —
+never a failed one. The log line `[warm] read-only cache: N artifacts replayed
+from the store, M fetch errors` reports what was read.
+
+Step 3 skips every hash the server served without asking the bucket, checks the
+rest with one metadata GET each and uploads with `ifGenerationMatch=0`, **16 at a
+time** (bounded with `wait -n`), instead of one `gcloud storage objects describe`
+per artifact in sequence.
+
+### A refused snapshot keeps the turbo warm, and still turns red
+
+`dependencies` is `allow_failure = true`, so a snapshot the credential scan
+refuses no longer stops the build and the turbo publish. The warm still ends
+**ERROR** and the alert still fires: the install phase writes the archive only
+after its scan passes, stage-scripts deletes any archive the checkout brought,
+and `publish-snapshot` (not allowed to fail) dies on a missing archive. The
+self-test holds those together.
+
+### Cadence
+
+Because a warm with nothing changed is now a replay plus a few metadata reads,
+it can run far more often than nightly. Recommended: `schedule = "*/15 * * * *"`
+(or hourly, `"0 * * * *"`) so `main`'s newest hashes are in the pool within
+minutes of a merge. Overlapping warms are safe — uploads are write-once and a
+412 counts as already present — and the scheduler does not retry a missed fire.
 
 ## Migrating off `ci-runner-cache-publisher`
 

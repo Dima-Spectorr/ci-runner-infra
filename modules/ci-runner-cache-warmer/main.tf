@@ -205,6 +205,12 @@ locals {
   scan_gz    = base64gzip(file("${path.module}/../../scripts/ci/scan-cache-credentials.sh"))
   turbo_gz   = base64gzip(file("${path.module}/scripts/warm-turbo.sh"))
   derive_gz  = base64gzip(file("${path.module}/scripts/derive-turbo-tasks.cjs"))
+  # THE HOST POOL'S OWN READ-ONLY CACHE SERVER, NOT A COPY OF IT. The build step
+  # reads the store through the exact code a pull request reads it through, so
+  # an artifact the warm replays is no less trustworthy than one a PR replays —
+  # and no more: one file, one set of checks (hash charset, size bound, atomic
+  # disk write), and the same read-only API that discards every PUT.
+  server_gz = base64gzip(file("${path.module}/../ci-runner-host-pool/scripts/turbo-cache-server.py"))
 
   # THE CREDENTIAL-SCAN LIBRARY IS STAGED AS A SIBLING, NOT CONCATENATED.
   #
@@ -236,6 +242,11 @@ locals {
     base64 -d <<'DERIVE_GZ_EOF' | gzip -d > ${local.staged_dir}/derive-turbo-tasks.cjs
     ${local.derive_gz}
     DERIVE_GZ_EOF
+    base64 -d <<'SERVER_GZ_EOF' | gzip -d > ${local.staged_dir}/turbo-cache-server.py
+    ${local.server_gz}
+    SERVER_GZ_EOF
+    rm -f ${local.snapshot_archive}
+    rm -rf ${local.served_dir}
     chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
     ${local.stage_scan_allow}
   EOT
@@ -265,6 +276,13 @@ locals {
   scan_sha    = filesha256("${path.module}/../../scripts/ci/scan-cache-credentials.sh")
   turbo_sha   = filesha256("${path.module}/scripts/warm-turbo.sh")
   derive_sha  = filesha256("${path.module}/scripts/derive-turbo-tasks.cjs")
+  server_sha  = filesha256("${path.module}/../ci-runner-host-pool/scripts/turbo-cache-server.py")
+
+  # The archive the dependencies step hands to publish-snapshot. One local, so
+  # the path written, the path read and the path cleared in stage-scripts cannot
+  # drift — the "a failed dependencies step still ends red" argument below rests
+  # on all three being the same file.
+  snapshot_archive = "/workspace/ci-cache-snapshot.tar.gz"
 
   # AND getcap HAS TO BE IN THE IMAGE, WHICH IN A NODE IMAGE IT IS NOT.
   #
@@ -368,7 +386,67 @@ locals {
   ])
 
   run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
-  run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\nexec ${local.staged_dir}/warm-turbo.sh\n"
+  run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh\n"
+
+  # zstd, so warm-turbo.sh can decode every artifact before it uploads it and
+  # refuse a truncated one. Best effort, like getcap above, and safe to be: with
+  # no zstd the uploader still refuses anything without a zstd frame header, and
+  # says once that it is checking by magic only.
+  ensure_zstd = "command -v zstd >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends zstd >/dev/null 2>&1; } || apk add --no-cache zstd >/dev/null 2>&1 || echo '[warm] zstd unavailable; artifacts are checked by frame header only' >&2\n"
+
+  # INCREMENTAL: THE BUILD READS THE STORE BEFORE IT BUILDS.
+  #
+  # Measured on build 6e721cc4 (2026-10-10): `0 cached, 956 total`, twelve
+  # minutes of rebuilding hashes the previous hour's warm had already published,
+  # because the build step had no remote cache at all. So the host pool's own
+  # read-only server is started on loopback inside the step, pointed at this
+  # repository's prefix, and turbo is given TURBO_API for it — the same three
+  # variables a pool slot gets. A task whose hash is published is replayed; only
+  # changed hashes are rebuilt, and only those reach the publishing step.
+  #
+  # Trust: identical to a pull request's read. Same server file (digest-checked
+  # like every staged script), same prefix, same write-once store that only this
+  # identity can create objects in. The server discards every PUT, so it adds no
+  # write path — the build step's only one is the metadata-server token the
+  # header above already accepts. Bound to 127.0.0.1, so nothing else on the
+  # Cloud Build network can reach it. Replaying means one bad stored artifact can
+  # feed later hashes; a periodic cold warm is what rebuilds every chain.
+  #
+  # Cold, never broken: no python3 that can be installed, or a server that does
+  # not answer its status probe, is a logged cold build — every task rebuilt and
+  # published, exactly as before — never a failed one. The served artifacts stay
+  # in `served_dir`, which the publishing step reads to skip them unasked.
+  served_dir = "${local.staged_dir}/turbo-served"
+  serve_port = 8082
+  serve_log  = "${local.staged_dir}/turbo-cache-server.log"
+  serve_step = join("", [
+    "echo '${local.server_sha}  ${local.staged_dir}/turbo-cache-server.py' | sha256sum -c - >/dev/null || exit 1\n",
+    "WARM_SERVER_PID=\n",
+    "command -v python3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends python3 >/dev/null 2>&1; } || apk add --no-cache python3 >/dev/null 2>&1 || true\n",
+    "if command -v python3 >/dev/null 2>&1; then\n",
+    "  WARM_CACHE_TOKEN=$(node -e 'process.stdout.write(require(\"crypto\").randomBytes(24).toString(\"hex\"))')\n",
+    "  CI_TURBO_BUCKET='${var.cache_bucket}' CI_TURBO_PREFIX='${local.turbo_prefix}' CI_TURBO_HOST=127.0.0.1 CI_TURBO_PORT=${local.serve_port} CI_TURBO_TOKEN=\"$WARM_CACHE_TOKEN\" CI_TURBO_DISK_DIR='${local.served_dir}' CI_TURBO_MAX_ARTIFACT_BYTES=${var.max_artifact_bytes} python3 ${local.staged_dir}/turbo-cache-server.py 2>'${local.serve_log}' &\n",
+    "  WARM_SERVER_PID=$!\n",
+    "  WARM_CACHE_UP=0\n",
+    "  for _ in $(seq 1 40); do if node -e \"fetch('http://127.0.0.1:${local.serve_port}/v8/artifacts/status').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))\"; then WARM_CACHE_UP=1; break; fi; sleep 0.5; done\n",
+    "  if [ \"$WARM_CACHE_UP\" = 1 ]; then\n",
+    "    export TURBO_API=http://127.0.0.1:${local.serve_port} TURBO_TOKEN=\"$WARM_CACHE_TOKEN\" TURBO_TEAM='team_${var.pool_name}'\n",
+    "    echo '[warm] reading gs://${var.cache_bucket}/${local.turbo_prefix} through the read-only cache server before building; only changed hashes are rebuilt'\n",
+    "  else\n",
+    "    echo '[warm] the read-only cache server did not answer; building cold, every task is rebuilt' >&2\n",
+    "    cat '${local.serve_log}' >&2\n",
+    "  fi\n",
+    "else\n",
+    "  echo '[warm] no python3 in the build image and none could be installed; building cold, every task is rebuilt' >&2\n",
+    "fi\n",
+  ])
+  serve_summary = join("", [
+    "if [ -n \"$WARM_SERVER_PID\" ]; then\n",
+    "  echo \"[warm] read-only cache: $(find '${local.served_dir}' -maxdepth 1 -type f ! -name '*.tmp' 2>/dev/null | wc -l) artifacts replayed from the store, $(grep -c 'fetch ' '${local.serve_log}' 2>/dev/null || true) fetch errors\"\n",
+    "  grep 'fetch ' '${local.serve_log}' 2>/dev/null | head -5 >&2\n",
+    "  kill \"$WARM_SERVER_PID\" 2>/dev/null || true\n",
+    "fi\n",
+  ])
 
   # HOW THE REPOSITORY IS INSTALLED AND BUILT — WORKED OUT AT WARM TIME, FROM THE
   # REPOSITORY, RATHER THAN STATED BY WHOEVER WIRES THE WARMER UP.
@@ -546,7 +624,7 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\n${local.derive_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+  build_step_script = "#!/usr/bin/env bash\n${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
@@ -772,13 +850,25 @@ resource "google_cloudbuild_trigger" "warm" {
     #    steps — weaker here, because every step in a build can still reach the
     #    metadata server, but the ordering costs nothing and the day Cloud Build
     #    can scope a step's identity this is already the right shape.
+    #
+    #    ALLOWED TO FAIL, AND THE BUILD STILL ENDS RED. A snapshot refusal here
+    #    (a credential-scan hit, a getcap gap) used to stop the whole build, so
+    #    one dependency-tree problem also threw away the turbo warm — which needs
+    #    nothing from this step; the build step re-installs on its own. Now the
+    #    build and publish-turbo still run, and the outcome is still a failure:
+    #    this step writes `snapshot_archive` only after its scan passes,
+    #    stage-scripts deletes any copy the checkout brought, and publish-snapshot
+    #    (NOT allowed to fail) dies on a missing archive. So the MAIN outcome is
+    #    ERROR, the outcome metric counts a non-DONE, and the warmer's alert fires
+    #    exactly as before. The self-test holds all four of those together.
     step {
-      id     = "dependencies"
-      name   = var.build_image
-      script = local.run_publish
+      id            = "dependencies"
+      name          = var.build_image
+      script        = local.run_publish
+      allow_failure = true
       env = [
         "CACHE_PREPARE=${local.prepare_command}",
-        "CACHE_ARCHIVE_OUT=/workspace/ci-cache-snapshot.tar.gz",
+        "CACHE_ARCHIVE_OUT=${local.snapshot_archive}",
         "CACHE_MAX_BYTES=${var.snapshot_max_bytes}",
       ]
     }
@@ -829,6 +919,7 @@ resource "google_cloudbuild_trigger" "warm" {
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",
         "WARM_TURBO_DIR=${var.turbo_cache_dir}",
         "WARM_MAX_BYTES=${var.max_artifact_bytes}",
+        "WARM_SERVED_DIR=${local.served_dir}",
       ]
     }
 
@@ -841,7 +932,7 @@ resource "google_cloudbuild_trigger" "warm" {
       name   = var.gcloud_image
       script = local.run_publish
       env = [
-        "CACHE_ARCHIVE_IN=/workspace/ci-cache-snapshot.tar.gz",
+        "CACHE_ARCHIVE_IN=${local.snapshot_archive}",
         "CACHE_POOL=${var.pool_name}",
         "CACHE_BUCKET=${var.cache_bucket}",
         "CACHE_MAX_BYTES=${var.snapshot_max_bytes}",
