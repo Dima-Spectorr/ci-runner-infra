@@ -246,6 +246,7 @@ locals {
     ${local.server_gz}
     SERVER_GZ_EOF
     rm -f ${local.snapshot_archive}
+    rm -rf ${local.served_dir}
     chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
     ${local.stage_scan_allow}
   EOT
@@ -405,9 +406,11 @@ locals {
   #
   # Trust: identical to a pull request's read. Same server file (digest-checked
   # like every staged script), same prefix, same write-once store that only this
-  # identity can create objects in. The server discards every PUT, so the build
-  # step gains no write path by it. Bound to 127.0.0.1, so nothing else on the
-  # Cloud Build network can reach it.
+  # identity can create objects in. The server discards every PUT, so it adds no
+  # write path — the build step's only one is the metadata-server token the
+  # header above already accepts. Bound to 127.0.0.1, so nothing else on the
+  # Cloud Build network can reach it. Replaying means one bad stored artifact can
+  # feed later hashes; a periodic cold warm is what rebuilds every chain.
   #
   # Cold, never broken: no python3 that can be installed, or a server that does
   # not answer its status probe, is a logged cold build — every task rebuilt and

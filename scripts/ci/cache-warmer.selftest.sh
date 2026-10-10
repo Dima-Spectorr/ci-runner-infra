@@ -702,7 +702,8 @@ snapshot_failure_still_red() { # <main.tf>
   ! matches "$stage" 'allow_failure' || return 1
   matches "$deps" '"CACHE_ARCHIVE_OUT=\$\{local\.snapshot_archive\}"' || return 1
   matches "$pub" '"CACHE_ARCHIVE_IN=\$\{local\.snapshot_archive\}"' || return 1
-  matches "$code" 'rm -f \$\{local\.snapshot_archive\}'
+  matches "$code" 'rm -f \$\{local\.snapshot_archive\}' || return 1
+  matches "$code" 'rm -rf \$\{local\.served_dir\}'
 }
 
 publisher_refuses_a_missing_archive() { # <publish-cache-snapshot.sh>
@@ -1124,6 +1125,10 @@ mutate "the snapshot publish allowed to fail too" "$MAIN" \
 
 mutate "a stale archive from the checkout no longer removed" "$MAIN" \
   's@rm -f \${local\.snapshot_archive}@true@' \
+  snapshot_failure_still_red
+
+mutate "a served directory from the checkout no longer emptied" "$MAIN" \
+  's@rm -rf \${local\.served_dir}@true@' \
   snapshot_failure_still_red
 
 mutate "the two phases name different archives" "$MAIN" \

@@ -50,8 +50,10 @@
 #   leaves that artifact in its local directory like any other. The server keeps
 #   every artifact it served in WARM_SERVED_DIR, under the bare hash, so a hash
 #   found there was READ FROM THIS PREFIX a few minutes ago and is skipped with
-#   no request at all. The worst a forged file there can do is make this step
-#   skip a hash: that is a miss for the next build, never content in the store.
+#   no request at all. The directory is emptied before every build, so a file
+#   there was written by this run's server; one planted by the build itself would
+#   be replayed into the build and skipped here, which needs code that already
+#   holds the warmer's token.
 #
 # PARALLEL, BOUNDED
 #   The existence check and the upload run PUBLISH_PARALLEL artifacts at a time.
