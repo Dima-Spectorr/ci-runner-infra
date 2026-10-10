@@ -83,6 +83,8 @@
 #   google_cloudbuild_trigger         — the build, manual-only, fired by the job
 #   google_cloud_scheduler_job        — the schedule
 #   google_storage_bucket_iam_member  — the four grants above
+#   google_logging_metric             — each build's final outcome (alert.tf)
+#   google_monitoring_alert_policy    — failing or stale warm, in this project (alert.tf)
 
 locals {
   # Both prefixes are written the same way in three modules — here, the host

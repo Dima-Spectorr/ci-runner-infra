@@ -186,6 +186,9 @@ module "ci_cache_warmer" {
   github_owner = "<org>"
   github_repo  = "<repo>"
 
+  # Required: who hears about a failing or stale warm (nothing else turns red).
+  alert_notification_channels = [var.ci_alert_channel]
+
   github_connection = var.cloudbuild_github_connection # gen2 projects only
 }
 ```
