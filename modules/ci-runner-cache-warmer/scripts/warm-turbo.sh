@@ -39,7 +39,32 @@
 #   WARM_TURBO_PREFIX  object prefix, `turbo/<owner>/<repo>/`    (required)
 #   WARM_TURBO_DIR     turbo's local cache directory             (required)
 #   WARM_MAX_BYTES     refuse to publish an artifact over this   (default 512Mi)
+#   WARM_SERVED_DIR    where the build step's read-only cache server kept the
+#                      artifacts it SERVED from the store        (optional)
 #   WARM_DRY_RUN       1 = say what would be uploaded, upload nothing
+#
+# INCREMENTAL, AND WHY A SERVED HASH IS SKIPPED WITHOUT A REQUEST
+#   The build step reads this same store before it builds (turbo-cache-server.py,
+#   the host pool's own read-only server, bound to loopback), so a task whose
+#   hash is already published is replayed rather than rebuilt — and turbo then
+#   leaves that artifact in its local directory like any other. The server keeps
+#   every artifact it served in WARM_SERVED_DIR, under the bare hash, so a hash
+#   found there was READ FROM THIS PREFIX a few minutes ago and is skipped with
+#   no request at all. The worst a forged file there can do is make this step
+#   skip a hash: that is a miss for the next build, never content in the store.
+#
+# PARALLEL, BOUNDED
+#   The existence check and the upload run PUBLISH_PARALLEL artifacts at a time.
+#   One `gcloud storage objects describe` per artifact, in sequence, was ~1 s
+#   each and 16 minutes for a 956-artifact warm (build 6e721cc4, 2026-10-10).
+#   Bounded rather than unbounded because a cold warm offers thousands at once.
+#
+# NEVER A TRUNCATED ARTIFACT
+#   Every upload is checked first: the zstd frame magic always, and a full
+#   `zstd -t` decode when the image has zstd (the wrapper installs it best
+#   effort). A cut-off `.tar.zst` is counted `refused`, never published —
+#   write-once means a corrupt object would be served for the bucket's whole
+#   age bound.
 #
 # EXIT
 #   0 even when it published nothing. A warmer that fails the build because a
@@ -110,18 +135,26 @@ gcs_token() {
   [ -n "$GCS_TOKEN" ]
 }
 
-BODY=$(mktemp) || { log "the response buffer could not be staged"; exit 2; }
-trap 'rm -f "$BODY"' EXIT
+WARM_SERVED_DIR="${WARM_SERVED_DIR:-}"
+
+# How many artifacts are checked and uploaded at once. A constant, not an
+# input: it bounds this step's own sockets and memory, and nothing about a
+# repository changes what it should be.
+PUBLISH_PARALLEL=16
+
+RESULTS=$(mktemp -d) || { log "the result directory could not be staged"; exit 2; }
+trap 'rm -rf "$RESULTS"' EXIT
 
 # Sets HTTP_CODE and err_detail; never returns non-zero, because every outcome
-# including "no credential" is a per-artifact count the caller reports.
+# including "no credential" is a per-artifact count the caller reports. <body>
+# is per artifact: these run in parallel and must not share a buffer.
 HTTP_CODE=""
 err_detail=""
-gcs_upload() { # <file> <percent-encoded object name>
-  local file="$1" name="$2"
+gcs_upload() { # <file> <percent-encoded object name> <body>
+  local file="$1" name="$2" body="$3"
   err_detail=""
   HTTP_CODE=""
-  if ! gcs_token; then
+  if [ -z "$GCS_TOKEN" ]; then
     err_detail="this step authenticated to nothing"
     return 0
   fi
@@ -136,7 +169,7 @@ gcs_upload() { # <file> <percent-encoded object name>
     --speed-limit 1024 --speed-time 120 \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$GCS_TOKEN") \
     -X POST -H 'Content-Type: application/octet-stream' \
-    --data-binary "@$file" -o "$BODY" -w '%{http_code}' \
+    --data-binary "@$file" -o "$body" -w '%{http_code}' \
     "https://storage.googleapis.com/upload/storage/v1/b/${WARM_BUCKET}/o?uploadType=media&ifGenerationMatch=0&name=${name}" \
     2>/dev/null)
   case "$HTTP_CODE" in
@@ -144,7 +177,79 @@ gcs_upload() { # <file> <percent-encoded object name>
     # The API's own message, trimmed to one line. It names the refused
     # permission on a 403, which is the single most useful thing this step can
     # say and the thing it could not say before.
-    *) err_detail=$(tr '\n' ' ' <"$BODY" | cut -c1-200) ;;
+    *) err_detail=$(tr '\n' ' ' <"$body" | cut -c1-200) ;;
+  esac
+  return 0
+}
+
+# The object's METADATA, by name — `storage.objects.get` against that one
+# object, so the prefix condition on the grant matches. Same request
+# `gcloud storage objects describe` made, without starting a Python interpreter
+# per artifact. Prints 200 (there), 404 (not there) or anything else (unknown —
+# the upload decides, and `ifGenerationMatch=0` keeps that safe).
+gcs_exists() { # <percent-encoded object name> <body>
+  [ -n "$GCS_TOKEN" ] || { printf 'none'; return 0; }
+  curl -sS --proto '=https' --connect-timeout 10 --max-time 60 \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$GCS_TOKEN") \
+    -o "$2" -w '%{http_code}' \
+    "https://storage.googleapis.com/storage/v1/b/${WARM_BUCKET}/o/${1}?fields=name" \
+    2>/dev/null || true
+}
+
+# A `.tar.zst` that was cut off — a build killed mid-write, a full disk — still
+# has a hash-shaped name and a plausible size. Published, it is a write-once
+# object every pull request would unpack into its output tree until the age
+# bound expires it. The frame magic is checked always; a full decode when the
+# image has zstd.
+is_whole_zstd() { # <file>
+  local magic
+  magic=$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  [ "$magic" = "28b52ffd" ] || return 1
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -tq -- "$1" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# One artifact, in a background subshell: the outcome is written as one word to
+# a file named for the hash, because a subshell's counters die with it.
+publish_one() { # <artifact> <hash> <size>
+  local artifact="$1" hash="$2" size="$3" body code
+  body="$RESULTS/$hash.body"
+
+  code=$(gcs_exists "${ENC_PREFIX}${hash}" "$body")
+  if [ "$code" = "200" ]; then
+    echo skipped >"$RESULTS/$hash"
+    return 0
+  fi
+
+  if ! is_whole_zstd "$artifact"; then
+    log "refusing '$hash': not a complete zstd frame — a truncated artifact is never published"
+    echo refused >"$RESULTS/$hash"
+    return 0
+  fi
+
+  if [ "$WARM_DRY_RUN" = "1" ]; then
+    log "would publish $hash (${size}B)"
+    echo published >"$RESULTS/$hash"
+    return 0
+  fi
+
+  gcs_upload "$artifact" "${ENC_PREFIX}${hash}" "$body"
+  case "$HTTP_CODE" in
+    200 | 201) echo published >"$RESULTS/$hash" ;;
+    # `ifGenerationMatch=0` refused it: something wrote that name between the
+    # check above and this request — an overlapping warm. Whatever is there was
+    # written by this same identity from this same branch, under a name that is
+    # a digest of the task's inputs, so it is the same artifact.
+    412) echo skipped >"$RESULTS/$hash" ;;
+    *)
+      # The reason, not just the count. This step reported `failed=291` with no
+      # other output for months of nightly runs, and the cause — one refused
+      # permission, the same one for all 291 — was not recoverable from the log.
+      log "could not publish $hash: HTTP ${HTTP_CODE:-none}${err_detail:+ — $err_detail}"
+      echo failed >"$RESULTS/$hash"
+      ;;
   esac
   return 0
 }
@@ -157,24 +262,16 @@ if [ ! -d "$WARM_TURBO_DIR" ]; then
   exit 0
 fi
 
-published=0
-skipped=0
 refused=0
-failed=0
+served=0
+running=0
 
 # `find` rather than a glob: a monorepo's cache directory routinely holds more
-# entries than a command line can carry, and the failure mode of the glob is an
-# "argument list too long" that aborts the publish after an arbitrary prefix of
-# it. -maxdepth 1 because only the top level holds artifacts; turbo keeps its
-# own bookkeeping in subdirectories.
+# entries than a command line can carry. -maxdepth 1 because only the top level
+# holds artifacts; turbo keeps its own bookkeeping in subdirectories.
 #
-# STREAMED through process substitution, not a here-document. A here-doc fed by
-# `$(find ...)` collects every path into one shell string first, which is the
-# same "hold the whole list in memory at once" the glob was rejected for, only
-# without the hard limit that would announce it. Process substitution also keeps
-# the loop in THIS shell — a pipe would run it in a subshell and every counter
-# below would be discarded at the end, reporting `published=0` on a run that
-# published everything.
+# STREAMED through process substitution, not a pipe: a pipe would run the loop in
+# a subshell and `wait` below would have no children to wait for.
 while IFS= read -r artifact; do
   [ -n "$artifact" ] || continue
   base=$(basename "$artifact")
@@ -192,6 +289,12 @@ while IFS= read -r artifact; do
       ;;
   esac
 
+  # Served from this prefix by the build step's read-only server: already there.
+  if [ -n "$WARM_SERVED_DIR" ] && [ -f "$WARM_SERVED_DIR/$hash" ]; then
+    served=$((served + 1))
+    continue
+  fi
+
   size=$(stat -c %s "$artifact" 2>/dev/null || echo 0)
   if [ "$size" -gt "$WARM_MAX_BYTES" ]; then
     # The host-side server treats anything over its bound as a miss, so
@@ -201,46 +304,27 @@ while IFS= read -r artifact; do
     continue
   fi
 
-  object="gs://${WARM_BUCKET}/${WARM_TURBO_PREFIX}${hash}"
+  # Minted (or re-used) HERE, in the parent, so every child inherits the same
+  # token as a shell variable — never as an argument.
+  gcs_token || GCS_TOKEN=""
 
-  # `objects describe` names the object, so it is authorised as
-  # `storage.objects.get` against THAT object and the prefix condition on the
-  # grant matches. This is the one gcloud storage call in the loop that a
-  # prefix-scoped identity can make; see the upload below for the one it cannot.
-  if gcloud storage objects describe "$object" >/dev/null 2>&1; then
-    skipped=$((skipped + 1))
-    continue
+  # The bound. `wait -n` returns as soon as any one child finishes.
+  if [ "$running" -ge "$PUBLISH_PARALLEL" ]; then
+    wait -n
+    running=$((running - 1))
   fi
-
-  if [ "$WARM_DRY_RUN" = "1" ]; then
-    log "would publish $hash (${size}B)"
-    published=$((published + 1))
-    continue
-  fi
-
-  gcs_upload "$artifact" "${ENC_PREFIX}${hash}"
-  case "$HTTP_CODE" in
-    200 | 201)
-      published=$((published + 1))
-      ;;
-    412)
-      # `ifGenerationMatch=0` refused it: something wrote that name between the
-      # describe above and this request. Whatever is there was written by this
-      # same identity from this same branch, under a name that is a digest of
-      # the task's inputs, so it is the same artifact. Lost the race, not failed.
-      skipped=$((skipped + 1))
-      ;;
-    *)
-      # The reason, not just the count. This step reported `failed=291` with no
-      # other output for months of nightly runs, and the cause — one refused
-      # permission, the same one for all 291 — was not recoverable from the log.
-      log "could not publish $hash: HTTP ${HTTP_CODE:-none}${err_detail:+ — $err_detail}"
-      failed=$((failed + 1))
-      ;;
-  esac
+  publish_one "$artifact" "$hash" "$size" &
+  running=$((running + 1))
 done < <(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
+wait
 
-log "published=$published already-present=$skipped refused=$refused failed=$failed"
+count_of() { find "$RESULTS" -maxdepth 1 -type f ! -name '*.body' -exec cat {} + 2>/dev/null | grep -cx "$1"; }
+published=$(count_of published)
+skipped=$(count_of skipped)
+failed=$(count_of failed)
+refused=$((refused + $(count_of refused)))
+
+log "published=$published already-present=$((skipped + served)) served-by-the-store=$served refused=$refused failed=$failed"
 
 # A failed upload is not a failed warm. The next scheduled run republishes it,
 # and every build in between simply misses on that one task — which is what it
