@@ -397,6 +397,15 @@ self_caller_serialises_at_the_job() { serialised_at_the_job "$(cat "$1")"; }
 self_caller_hears_no_review_directly() { hears_no_review_directly "$(cat "$1")"; }
 self_caller_hears_reviews_through_the_relay() { hears_reviews_through_the_relay "$(cat "$1")"; }
 self_relay_holds_nothing() { relay_holds_nothing "$(cat "$1")"; }
+# The callee's `recover` job asks for `actions: write`; a caller that grants
+# less makes every run a startup_failure, so the lane merges nothing at all.
+self_caller_grants_what_recover_needs() {
+  local code
+  code=$(grep -vE '^[[:space:]]*#' "$1")
+  matches "$code" '^      actions: write$' || return 1
+  matches "$code" '^      recover-workflow: merge-lane-self\.yml$' || return 1
+  matches "$code" '^      recovered:$' || return 1
+}
 
 # Both documented lane files are one lane: the job-level group, no review
 # heard directly, the exact operator switch, and the markers the consumer
@@ -1963,6 +1972,7 @@ check passes_the_app_credentials "$CALLER" "the caller does not pass App credent
 check waits_for_the_app_to_exist "$CALLER" "the caller runs before an operator confirms the App exists, so it goes red on every CI completion and that red stops meaning anything"
 check self_caller_hears_no_review_directly "$CALLER" "the caller listens to pull_request_review itself, so a bot review runs the pull request's own copy of the lane holding the merge App key"
 check self_caller_hears_reviews_through_the_relay "$CALLER" "the caller does not hear the review relay, so an approval or a bot review after the green waits for the sweep"
+check self_caller_grants_what_recover_needs "$CALLER" "the caller grants the lane less than its recover job asks for, or names no recover target it can dispatch, so every lane run fails to start"
 check self_caller_serialises_at_the_job "$CALLER" "the caller does not serialise on the lane job, or keeps a constant workflow-level group, so a run whose job skips can evict a real pending pass"
 check self_relay_holds_nothing "$RELAY" "the review relay holds a secret, a permission, an action or a pool label, or can skip its only job — and it runs whatever the pull request under review put in it"
 check documented_pool_caller_listens_to_ci_only "$DOC" "the documented pool-label caller answers something other than a CI completion, so a timer, a label or a review starts a self-hosted host on its own"
