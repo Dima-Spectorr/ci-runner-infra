@@ -386,3 +386,36 @@ variable "disabled" {
   type        = bool
   default     = false
 }
+
+variable "alert_notification_channels" {
+  description = <<-EOT
+    Notification channels the warmer's own alert policy notifies, as full
+    resource names (`projects/<project>/notificationChannels/<id>`), in this
+    module's project. Required and non-empty: a failing warm raises nothing
+    else, and an alert nobody receives is the incident this policy exists to
+    end.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.alert_notification_channels) > 0 && alltrue([for c in var.alert_notification_channels : can(regex("^projects/[^/]+/notificationChannels/[^/]+$", c))])
+    error_message = "alert_notification_channels must name at least one channel, each as projects/<project>/notificationChannels/<id>. A warmer alert with no recipient is silent."
+  }
+}
+
+variable "alert_stale_after_hours" {
+  description = <<-EOT
+    The alert fires when no warm has succeeded for this many hours. 36 by
+    default: one missed nightly run plus margin. This condition — absence of
+    success — is the guarantee; it catches a build refused at fire time, a
+    schedule that stopped firing and a timeout alike, none of which needs to
+    log anything. Raise it with a less frequent `schedule`.
+  EOT
+  type        = number
+  default     = 36
+
+  validation {
+    condition     = var.alert_stale_after_hours >= 2 && var.alert_stale_after_hours <= 720 && floor(var.alert_stale_after_hours) == var.alert_stale_after_hours
+    error_message = "alert_stale_after_hours must be a whole number of hours between 2 and 720."
+  }
+}

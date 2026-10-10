@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.112.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.115.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -28,12 +28,15 @@ module "ci_cache_warmer" {
   github_owner = "my-org"
   github_repo  = "myrepo"
 
+  # Required, non-empty: who is told when a warm fails or goes stale.
+  alert_notification_channels = [var.ci_alert_channel]
+
   # 2nd-generation projects only; omit on a project using gen1 triggers.
   github_connection = var.cloudbuild_github_connection
 }
 ```
 
-Those six values plus a bucket are the whole configuration, and every one of
+Those six values, a bucket and an alert recipient are the whole configuration, and every one of
 them is a fact the root already knows. **Nothing here describes the repository's
 build**, and that is deliberate: the warm reads the repository.
 
@@ -228,6 +231,43 @@ one. That is why `scripts/ci/cache-warmer.selftest.sh` asserts the structure
 (the prefixes, the write-once grants, the pointer condition, the schedule and
 the account allowed to fire it) with a mutation proof behind each one, and why
 `schedule` has no "off" value: use `disabled`, which at least shows up in a plan.
+
+### The warmer's own alert
+
+The structure can be right and the build can still fail every night: measured
+2026-10-10, one consumer's warm ended in `ERROR` on at least eight consecutive
+nights and nobody was told. The fleet's stale-cache policy lives in the POOL's
+project and is installed by that project's apply trigger, which had never run
+there. So the module now creates its own alarm, in its own project, in the same
+apply as the trigger (`alert.tf`):
+
+- a log-based metric `<trigger name>-outcome`, counting each build's final MAIN
+  log line (`DONE` on success, `ERROR` on failure) by `outcome`;
+- one alert policy, `CI cache warmer / <trigger name> failing or stale`, with two
+  conditions:
+  - **failed**: any outcome other than `DONE` in the last hour;
+  - **stale**: no `DONE` within `alert_stale_after_hours` (36 by default).
+
+**The stale condition is the guarantee, not the failed one.** A build refused at
+fire time writes no log line at all, a schedule that stopped firing writes
+nothing, and what a timed-out build logs is deliberately not assumed. Absence of
+success catches every one of them; the failed condition only gets there sooner
+when the build did log. Directly after the first apply the stale condition fires
+until the first warm succeeds, so fire the trigger once by hand (`trigger_id`
+output). With `disabled = true` the policy is created disabled.
+
+`alert_notification_channels` is required and must name at least one channel
+(`projects/<project>/notificationChannels/<id>`) in this module's project: an
+alert nobody receives is the incident it replaces.
+
+**The applying identity needs two more permissions** than before, in this
+module's project: `logging.logMetrics.create/get/update/delete` (a custom role
+holding only these — not `roles/logging.configWriter`, which also lets its
+holder create sinks and exclusions, i.e. export or drop the build logs) and `monitoring.alertPolicies.create/update/delete`
+(`roles/monitoring.alertPolicyEditor`), plus read on the notification channels
+it names (`roles/monitoring.notificationChannelViewer`). The plan also refuses
+a channel that is not in this module's project. Without them the apply
+fails at this module; it does not silently skip the alarm.
 
 ### Three refusals that all happen at FIRE time, and the last one says nothing
 

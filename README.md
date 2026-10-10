@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.112.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.115.0"
   # ...
 }
 ```
@@ -1176,6 +1176,10 @@ docs/ci-optimization-catalog.md  the fleet audit behind that contract
 packer/warm-cache/                optional baked caches, chosen per pool
 .github/actions/playwright-ui/   the steps a repo's browser suite runs
 docs/ui-testing-on-the-fleet.md  running Playwright UI tests on the fleet
+.github/actions/release-image-signing/
+                                 sign and verify a product's release images
+                                 from its own release job
+docs/release-image-signing.md    its inputs, why composite, pinning
 ```
 
 ## The CI lane model

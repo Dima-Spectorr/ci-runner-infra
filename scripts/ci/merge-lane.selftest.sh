@@ -3507,6 +3507,89 @@ while IFS= read -r _rf_line; do
   esac
 done <<<"$_rf_out"
 
+# ---------------------------------------------------------------------------
+# BEHAVIOURAL CASES: THE HOLD IS RE-READ BEFORE THE MERGE CALL (#1514).
+#
+# `lane_take_action` run with `gh` stubbed: the fresh pull-request read answers
+# per case, and the merge PUT is recorded instead of sent. The property is that
+# NO merge call goes out when the fresh read shows the label gone, a draft, a
+# moved head or a closed pull request — PR #1513 merged three minutes after its
+# label came off. Removing the fresh read from the merge arm fails every
+# "held" case below, because the stubbed PUT then succeeds.
+# ---------------------------------------------------------------------------
+behavioural_premerge_cases() {
+  local fix
+  fix="$(mktemp -d)"
+  # shellcheck disable=SC2034  # read by the evalled driver functions.
+  local R="owner/repo" LANE_MERGED_THIS_RUN=0 LANE_BASE=main
+  # shellcheck disable=SC2034
+  declare -A LANE_LABEL_WAIVED=()
+  local fn
+  eval "$(sed -n "/^lane_premerge_verdict() {/,/^}/p" "$DECISION")"
+  eval "$(sed -n "/^lane_take_action() {/,/^}/p" "$DRIVER")"
+  for fn in lane_premerge_verdict lane_take_action; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      echo "FAIL $fn could not be lifted, so no pre-merge case ran"
+      rm -rf "$fix"
+      return
+    fi
+  done
+  # shellcheck disable=SC2317  # reached through the evalled functions.
+  gh() {
+    case "$*" in
+      *'-X PUT'*'/merge'*) printf '%s\n' "$*" >>"$fix/merged" ;;
+      *'repos/owner/repo/pulls/7 '*'--jq'*)
+        [ -f "$fix/fresh" ] || return 1
+        cat "$fix/fresh"
+        ;;
+      *) echo "premerge stub: unexpected gh call '$*'" >&2; return 1 ;;
+    esac
+  }
+  local V=aaaaaaaa1111
+  # `--jq` prints an empty line for an unlabelled pull request, so the fixture
+  # does too: four lines, the last one empty.
+  local UNLABELLED=$'open\nfalse\n'"$V"$'\n\n'
+  _pm_case() { # <label> <want: merged|held> <require_label> <fresh-lines or __none__>
+    rm -f "$fix/merged" "$fix/fresh"
+    [ "$4" = "__none__" ] || printf '%s' "$4" >"$fix/fresh"
+    local rc=0
+    REQUIRE_LABEL="$3" lane_take_action 7 "$V" "merge:ready green=3 total=3" >/dev/null 2>&1 || rc=$?
+    local got=held
+    [ -s "$fix/merged" ] && got=merged
+    if [ "$got" = "$2" ] && { [ "$got" = merged ] || [ "$rc" = 2 ]; }; then
+      printf 'PASS %s\n' "$1"
+    else
+      printf 'FAIL %s — %s (rc=%s), want %s\n' "$1" "$got" "$rc" "$2"
+    fi
+  }
+  _pm_case "#1514: label removed after the walk — no merge call" held ready-to-merge "$UNLABELLED"
+  _pm_case "flipped to draft after the walk — no merge call" held ready-to-merge $'open\ntrue\n'"$V"$'\nready-to-merge\n'
+  _pm_case "head moved after the walk — no merge call" held ready-to-merge $'open\nfalse\nbbbbbbbb2222\nready-to-merge\n'
+  _pm_case "closed after the walk — no merge call" held ready-to-merge $'closed\nfalse\n'"$V"$'\nready-to-merge\n'
+  _pm_case "an unreadable fresh read — no merge call" held ready-to-merge __none__
+  _pm_case "still labelled, open, same head — merges" merged ready-to-merge $'open\nfalse\n'"$V"$'\nready-to-merge\n'
+  _pm_case "no label gate — the label is not a hold, so it merges" merged '' "$UNLABELLED"
+  if [ -f "$fix/merged" ] && ! grep -q -- "sha=$V" "$fix/merged"; then
+    echo "FAIL the merge call does not pin the verified sha"
+  else
+    echo "PASS the merge call pins the verified sha"
+  fi
+  # shellcheck disable=SC2034  # read by the evalled lane_take_action.
+  LANE_LABEL_WAIVED[7]="$V"
+  _pm_case "a pin-bump waiver for this head waives the label" merged ready-to-merge "$UNLABELLED"
+  rm -rf "$fix"
+}
+
+_pm_out="$(behavioural_premerge_cases)"
+while IFS= read -r _pm_line; do
+  case "$_pm_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural pre-merge re-read: ${_pm_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural pre-merge re-read: unparseable result line '$_pm_line'" ;;
+  esac
+done <<<"$_pm_out"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane: $FAIL failed, $PASS passed"
   exit 1

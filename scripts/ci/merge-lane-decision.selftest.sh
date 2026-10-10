@@ -575,6 +575,33 @@ batch 1 "a strict base acts once and re-reads" 1 4 0 ""
 batch 1 "a spent budget still allows the pass its one action" 0 4 4 ""
 batch 1 "a garbled budget acts once" 0 x 0 ""
 
+# --- lane_premerge_verdict: the fresh read right before the merge call (#1514) --
+# args: require_label waived_sha verified_sha state draft head_sha labels
+premerge() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_premerge_verdict "$@")
+  if [[ "$got" == "$want"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  args: %s\n  want: %s*\n  got:  %s\n' "$desc" "$*" "$want" "$got"
+  fi
+}
+PM=aaaaaaaa1111
+premerge ok "labelled, open, not draft, same head merges" ready-to-merge '' "$PM" open false "$PM" "x,ready-to-merge"
+premerge skip:label-removed "#1514: the label removed after the walk read it is not merged" ready-to-merge '' "$PM" open false "$PM" ""
+premerge skip:label-removed "a different label left behind is still no label" ready-to-merge '' "$PM" open false "$PM" "ready-to-merge-later"
+premerge skip:draft "flipped to draft after the walk read it" ready-to-merge '' "$PM" open true "$PM" "ready-to-merge"
+premerge skip:draft "draft holds without a label gate too" '' '' "$PM" open true "$PM" ""
+premerge skip:head-moved "a push after the checks were read" ready-to-merge '' "$PM" open false bbbbbbbb2222 "ready-to-merge"
+premerge skip:not-open "closed meanwhile" ready-to-merge '' "$PM" closed false "$PM" "ready-to-merge"
+premerge skip:fresh-read-unreadable "an empty read fails closed" ready-to-merge '' "$PM" '' '' '' ''
+premerge skip:fresh-read-unreadable "a garbled draft field fails closed" '' '' "$PM" open null "$PM" ''
+premerge ok "no label gate: an unlabelled pull request is not held by the label" '' '' "$PM" open false "$PM" ""
+premerge ok "a pin-bump waiver for THIS head still waives the label" ready-to-merge "$PM" "$PM" open false "$PM" ""
+premerge skip:label-removed "a waiver granted for another head does not" ready-to-merge bbbbbbbb2222 "$PM" open false "$PM" ""
+
 # --- lane_settled_red: which heads may skip the rest of the reads --------------
 # args: green missing failed pending
 settled() {

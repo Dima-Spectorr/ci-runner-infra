@@ -365,6 +365,10 @@ CLOCK_WALK_FLOOR=30
 # still shows that sha. Never written anywhere, so it ends with the run. See
 # `lane_settled_red` and the walk in `one_pass`.
 declare -A LANE_SETTLED=()
+# The head sha a pin-bump waiver was granted for, keyed by pull request number,
+# so the fresh read before the merge call (`lane_premerge_verdict`, #1514) waives
+# the label for that head only. Ends with the run, like the map above.
+declare -A LANE_LABEL_WAIVED=()
 LANE_PASS_NO=0
 
 # HOW LONG A LATER, UNFINISHED SUITE OF THE SAME APP MAY HOLD A REQUIRED CHECK
@@ -2019,6 +2023,7 @@ lane_walk() {
     if [ -n "$REQUIRE_LABEL" ] && [[ ",$list_labels," != *",$REQUIRE_LABEL,"* ]]; then
       if lane_is_pin_bump "$num" "$list_author"; then
         pin_waiver=1
+        LANE_LABEL_WAIVED[$num]="$sha"
         echo "lane: #$num label waived — $list_author, and the diff moves nothing but $PIN_BUMP_REPO pins"
       else
         echo "lane: #$num skip:no-label ($REQUIRE_LABEL)"
@@ -2864,6 +2869,26 @@ lane_take_action() {
       # queue, and it has to be closed explicitly now that we do.
       # stderr is captured rather than left to the log: it is the only place
       # GitHub says WHY, and a refusal the lane cannot explain costs hours.
+      #
+      # AND THE PULL REQUEST IS READ AGAIN FIRST, NOW (#1514). The walk read
+      # every candidate before the batch acts, so the read this merge rests on
+      # can be the whole walk old. A label removed or a draft flipped inside
+      # that window is a hold the lane must honour, and `sha=` cannot see either.
+      # One call per merge, never per candidate. Anything but `ok` skips this
+      # pull request for the pass (return 2) and the batch goes on.
+      local fresh=() premerge
+      mapfile -t fresh < <(gh api "repos/$R/pulls/$action_num" \
+        --jq '.state, (.draft|tostring), .head.sha, ((.labels // []) | map(.name) | join(","))' 2>/dev/null)
+      if [ "${#fresh[@]}" -ne 4 ]; then
+        premerge="skip:fresh-read-unreadable"
+      else
+        premerge="$(lane_premerge_verdict "$REQUIRE_LABEL" "${LANE_LABEL_WAIVED[$action_num]:-}" \
+          "$action_sha" "${fresh[0]}" "${fresh[1]}" "${fresh[2]}" "${fresh[3]}")"
+      fi
+      if [ "$premerge" != "ok" ]; then
+        echo "::warning::lane: #$action_num NOT merged — $premerge on a fresh read immediately before the merge call (the walk had ranked it $action_verdict). Skipped for this pass; nothing else in the batch changes."
+        return 2
+      fi
       local merge_err
       if merge_err="$(gh api -X PUT "repos/$R/pulls/$action_num/merge" \
         -f merge_method=squash -f sha="$action_sha" --silent 2>&1)"; then

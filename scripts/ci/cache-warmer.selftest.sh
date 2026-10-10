@@ -33,6 +33,7 @@ MAIN="$ROOT/modules/ci-runner-cache-warmer/main.tf"
 VARS="$ROOT/modules/ci-runner-cache-warmer/variables.tf"
 TURBO="$ROOT/modules/ci-runner-cache-warmer/scripts/warm-turbo.sh"
 DERIVE="$ROOT/modules/ci-runner-cache-warmer/scripts/derive-turbo-tasks.cjs"
+ALERT="$ROOT/modules/ci-runner-cache-warmer/alert.tf"
 SHARED="$ROOT/scripts/ci/publish-cache-snapshot.sh"
 SHAREDSCAN="$ROOT/scripts/ci/scan-cache-credentials.sh"
 
@@ -41,7 +42,7 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$1"; }
 
-for f in "$MAIN" "$VARS" "$TURBO" "$DERIVE"; do
+for f in "$MAIN" "$VARS" "$TURBO" "$DERIVE" "$ALERT"; do
   [ -f "$f" ] || { echo "FAIL: missing $f"; exit 1; }
 done
 
@@ -601,6 +602,48 @@ if derivation_is_safe "$DERIVE"; then ok; else
   bad "derive-turbo-tasks.cjs no longer leaves out persistent / cache:false tasks, checks names, logs both lists, or refuses an empty result — a watcher hangs the warm, or a guess hides a broken config"
 fi
 
+# 18. THE WARMER OWNS ITS ALARM, AND THE ALARM CANNOT BE SILENT. Measured
+#     2026-10-10: a consumer's warm ended in ERROR on at least eight nights in a
+#     row and nobody was told, because the only stale-cache policy lived in the
+#     pool's project and had never been installed there. The properties that make
+#     the module's own policy real, each a plausible later edit:
+#       the metric counts THIS trigger's builds, from the MAIN outcome line;
+#       the stale condition reads absence of DONE (the guarantee — a refused build
+#       logs nothing), and keeps `or vector(0)`, without which "no DONE at all"
+#       is an empty comparison and therefore silence;
+#       the failure condition counts anything that is not DONE;
+#       the policy notifies the declared channels, and the channels are required.
+owns_its_alarm() { # <alert.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'resource "google_logging_metric" "warm_outcome"' || return 1
+  matches "$code" 'resource\.labels\.build_trigger_id=\\"\$\{google_cloudbuild_trigger\.warm\.trigger_id\}\\"' || return 1
+  matches "$code" 'labels\.build_step=\\"MAIN\\"' || return 1
+  matches "$code" 'outcome[[:space:]]*=[[:space:]]*"EXTRACT\(textPayload\)"' || return 1
+  matches "$code" 'outcome!=\\"DONE\\"\}\[1h\]\)\) > 0' || return 1
+  matches "$code" 'outcome=\\"DONE\\"\}\[\$\{var\.alert_stale_after_hours\}h\]\)\) or vector\(0\)\) < 1' || return 1
+  matches "$code" 'notification_channels[[:space:]]*=[[:space:]]*var\.alert_notification_channels' || return 1
+  matches "$code" 'combiner[[:space:]]*=[[:space:]]*"OR"'
+}
+
+requires_alert_channels() { # <variables.tf>
+  local blk
+  blk=$(block_of "$1" alert_notification_channels)
+  [ -n "$blk" ] || return 1
+  ! matches "$blk" '^[[:space:]]*default[[:space:]]*=' || return 1
+  matches "$blk" 'length\(var\.alert_notification_channels\) > 0 && alltrue' || return 1
+  blk=$(block_of "$1" alert_stale_after_hours)
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*36[[:space:]]*$'
+}
+
+if owns_its_alarm "$ALERT"; then ok; else
+  bad "the warmer's own alert policy lost a property that makes it fire — a failing or never-run warm is a cold pool and nothing else turns red"
+fi
+
+if requires_alert_channels "$VARS"; then ok; else
+  bad "alert_notification_channels is no longer required and non-empty (or the stale default moved) — an alert nobody receives repeats the incident"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -883,6 +926,33 @@ mutate "an unsafe task name passed to the shell" "$DERIVE" \
 mutate "nothing derived falls back to build" "$DERIVE" \
   's@  process\.exit(5);@  process.stdout.write("build\n"); process.exit(0);@' \
   derivation_is_safe
+mutate "the outcome metric counts every trigger's builds" "$ALERT" \
+  's|    "resource\.labels\.build_trigger_id=.*||' \
+  owns_its_alarm
+
+mutate "the stale condition loses vector(0) and goes silent with no DONE at all" "$ALERT" \
+  's| or vector(0))|)|' \
+  owns_its_alarm
+
+mutate "the failure condition counts only ERROR" "$ALERT" \
+  's|outcome!=\\"DONE\\"|outcome=\\"ERROR\\"|' \
+  owns_its_alarm
+
+mutate "the policy notifies nobody" "$ALERT" \
+  's|notification_channels = var\.alert_notification_channels|notification_channels = []|' \
+  owns_its_alarm
+
+mutate "the conditions combined with AND" "$ALERT" \
+  's|combiner     = "OR"|combiner     = "AND"|' \
+  owns_its_alarm
+
+mutate "the alert channels given an empty default" "$VARS" \
+  's|^  type        = list(string)$|&\n  default     = []|' \
+  requires_alert_channels
+
+mutate "the empty channel list accepted" "$VARS" \
+  's|length(var\.alert_notification_channels) > 0 \&\& alltrue|alltrue|' \
+  requires_alert_channels
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
