@@ -354,7 +354,13 @@ locals {
   # And the publisher reads the CAPTURE, never the checkout. The path is
   # validated, along with the quote that would end the string it is pasted
   # into — a `$` in it is now harmless, but a `'` still is not.
+  #
+  # CACHE_SCAN_ALLOW_SOURCE is set whether or not the file exists yet: it is the
+  # REPOSITORY path a refusal tells the consumer to edit (or create). The staged
+  # copy is a build-local path nobody can commit to.
   ensure_scan_allow = local.scan_allow_path == "" ? "" : join("", [
+    "CACHE_SCAN_ALLOW_SOURCE='${local.scan_allow_rel}'\n",
+    "export CACHE_SCAN_ALLOW_SOURCE\n",
     "if [ -f '${local.scan_allow_staged}' ]; then\n",
     "  CACHE_SCAN_ALLOW_FILE='${local.scan_allow_staged}'\n",
     "  export CACHE_SCAN_ALLOW_FILE\n",
