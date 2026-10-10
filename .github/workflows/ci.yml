@@ -636,6 +636,14 @@ jobs:
       - name: host-os guard self-test
         run: bash scripts/ci/host-os-guard.selftest.sh
 
+      # The shared release image-signing action holds every product's signer
+      # identity, so its two refusals are what this pins: a required release
+      # with a missing input fails, and an attestation that does not verify
+      # against the committed key for THAT digest fails. A stub gcloud signs
+      # with throwaway keys so the verify pass runs real openssl checks.
+      - name: release-image-signing self-test
+        run: bash scripts/ci/release-image-signing.selftest.sh
+
   shell-cache:
     name: Shell — dependency cache
     runs-on: ubuntu-latest
