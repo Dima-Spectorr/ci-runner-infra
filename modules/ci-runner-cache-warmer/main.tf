@@ -789,9 +789,11 @@ resource "google_cloudbuild_trigger" "warm" {
     #    carries the same value to a build_command a repository overrode, which
     #    turbo honours without a flag.
     step {
-      id     = "build"
-      name   = var.build_image
-      script = "#!/usr/bin/env bash\n${local.build_command} || echo '[warm] build failed; publishing what it produced'\n"
+      id   = "build"
+      name = var.build_image
+      #    The script the size budget measures IS the script that runs; a step
+      #    that inlined its own copy dropped the derive step and warmed nothing.
+      script = local.build_step_script
       #    NODE_OPTIONS raises V8's heap ceiling only when a root asks for it.
       #    Node sizes its default heap from system RAM, so a type-aware lint or a
       #    large bundle that passes on a 16 GB runner can abort on this machine

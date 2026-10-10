@@ -232,13 +232,15 @@ variable "turbo_tasks_exclude" {
     from turbo.json. Applied to the derived list only; an explicit
     `turbo_tasks` overrides it. Matched against the name after any `pkg#`.
 
-    `["test*", "e2e*"]` by default: a test task that needs a database, a
+    `["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]`
+    by default. Side-effecting tasks (deploy, release, publish, migrate, clean)
+    must never run with the warmer's credentials. A test task that needs a database, a
     browser or another service fails on every warm (a failed task is never
     cached), and a slow one can push a shared warm past `build_timeout`. Set
     `[]` to warm every cacheable task, test tasks included.
   EOT
   type        = list(string)
-  default     = ["test*", "e2e*"]
+  default     = ["test*", "e2e*", "deploy*", "release*", "publish*", "*migrate*", "clean*"]
 
   validation {
     condition     = alltrue([for g in var.turbo_tasks_exclude : can(regex("^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$", g))])

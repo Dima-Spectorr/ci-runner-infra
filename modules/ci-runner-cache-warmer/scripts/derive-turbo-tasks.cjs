@@ -86,7 +86,7 @@ try {
 
 // turbo 2 says `tasks`, turbo 1 said `pipeline`.
 const declared = cfg.tasks || cfg.pipeline;
-if (!declared || typeof declared !== "object") {
+if (!declared || typeof declared !== "object" || Array.isArray(declared)) {
   say(file + " declares no `tasks` (or `pipeline`). Set turbo_tasks explicitly.");
   process.exit(4);
 }

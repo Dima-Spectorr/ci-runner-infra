@@ -556,6 +556,8 @@ derives_tasks_by_default() { # <main.tf>
   local code
   code=$(code_of "$1")
   matches "$code" 'derive_tasks    = var\.build_command == null && var\.turbo_tasks == null' || return 1
+  # The step must RUN the measured script, not an inline copy without the derive.
+  matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
   # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
   # `\n` in an ERE is not that, and matched nothing.
   matches "$code" 'build_step_script = "#!/usr/bin/env bash\\n\$\{local\.derive_step\}\$\{local\.build_command\}' || return 1
@@ -567,7 +569,7 @@ excludes_by_default() { # <variables.tf>
   local blk
   blk=$(block_of "$1" turbo_tasks_exclude)
   [ -n "$blk" ] || return 1
-  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*\["test\*", "e2e\*"\]' || return 1
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*\["test\*", "e2e\*", "deploy\*", "release\*", "publish\*", "\*migrate\*", "clean\*"\]' || return 1
   # Validated to a glob character set with no quote in it: each entry is pasted
   # between single quotes on the build step's command line.
   printf '%s\n' "$blk" | grep -qF '"^[A-Za-z0-9*?][A-Za-z0-9*?:#@._/-]{0,127}$"'
@@ -582,6 +584,7 @@ derivation_is_safe() { # <derive-turbo-tasks.cjs>
   matches "$code" 'if \(d\.persistent === true\) cur\.persistent = true;' || return 1
   printf '%s\n' "$code" | grep -qF 'const SAFE = /^[A-Za-z0-9][A-Za-z0-9:#@._\/-]{0,127}$/;' || return 1
   matches "$code" 'else if \(!SAFE\.test\(name\)\) why = "not a safe task name";' || return 1
+  matches "$code" 'typeof declared !== "object" \|\| Array\.isArray\(declared\)' || return 1
   matches "$code" 'say\("tasks derived from "' || return 1
   matches "$code" 'say\("excluded: "' || return 1
   matches "$code" 'process\.exit\(5\);' || return 1
@@ -833,6 +836,14 @@ mutate "the task list run with a bare --continue" "$MAIN" \
   's@ --continue=dependencies-successful --cache-dir=@ --continue --cache-dir=@' \
   runs_declared_tasks
 
+mutate "the build step inlines its own script and skips the derive" "$MAIN" \
+  's@script = local\.build_step_script$@script = local.build_command@' \
+  derives_tasks_by_default
+
+mutate "side-effecting tasks warmed by default" "$VARS" \
+  's@, "deploy\*", "release\*", "publish\*", "\*migrate\*", "clean\*"\]@]@' \
+  excludes_by_default
+
 mutate "derivation runs even when a list is given" "$MAIN" \
   's@derive_tasks    = var\.build_command == null && var\.turbo_tasks == null@derive_tasks    = var.build_command == null@' \
   derives_tasks_by_default
@@ -850,7 +861,7 @@ mutate "the exclude globs dropped from the derivation" "$MAIN" \
   derives_tasks_by_default
 
 mutate "test tasks warmed by default" "$VARS" \
-  's@default     = \["test\*", "e2e\*"\]@default     = []@' \
+  's@default     = \["test\*", "e2e\*", @default     = [@' \
   excludes_by_default
 
 mutate "a quote allowed into an exclude glob" "$VARS" \
