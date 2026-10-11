@@ -299,10 +299,14 @@ on:
         type: string
       inflight-budget-seconds:
         description: >-
-          How long the lane waits on a pull request whose checks are still
-          running or missing before releasing it and saying so. This is
-          Mergify's `checks_timeout`, kept, and for the same reason: without it
-          a re-run that never reports holds a serial lane forever.
+          How long a pull request's checks may sit SILENT — no check-run
+          started or finished, no status updated, no check_suite created on
+          its head — while a required one is still running or missing, before
+          the lane releases it and says so. This is Mergify's
+          `checks_timeout`, kept, and for the same reason: without it a re-run
+          that never reports holds a serial lane forever. It is not the age of
+          the commit: a pull request whose CI is still moving is never
+          released, however long that CI takes.
         required: false
         default: 1800
         type: number
@@ -565,11 +569,6 @@ jobs:
       # workflow, which is the failure this whole design turns on.
       contents: read
 
-    # When the merge App's quota window reopens, read by the last step only
-    # when the pass FAILED. The `recover` job waits for it.
-    outputs:
-      app-reset: ${{ steps.quota.outputs.reset }}
-
     steps:
       # THE IMPLEMENTATION REPOSITORY, NOT THE CALLER'S.
       #
@@ -642,17 +641,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry-run }}
         run: bash scripts/ci/merge-lane.sh
 
-      # Only on a failed pass, and only once the token exists: `rate_limit` is
-      # free, and it is the one fact the `recover` job cannot read itself — it
-      # holds the repository's token, not the App's.
-      - name: Read when the merge App's quota window reopens
-        id: quota
-        if: ${{ failure() && steps.token.outputs.token != '' }}
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: bash scripts/ci/merge-lane-recover.sh read-reset
-
-  # A FAILED PASS IS FOLLOWED BY ONE MORE, AFTER THE APP'S WINDOW REOPENS.
+  # A FAILED PASS IS FOLLOWED BY ONE MORE, AS SOON AS THE APP'S QUOTA ANSWERS.
   #
   # Without it, every pull request that went green during a failed pass waits
   # for the next CI completion anywhere in the repository, or the consumer's
@@ -677,6 +666,14 @@ jobs:
   # for the wait. A deleted fork reads as a fork (null != this repository), so
   # that arm fails closed.
   #
+  # The job mints its OWN merge-App token and uses it only to PROBE: after 30s
+  # it makes one real read, and dispatches the moment that read is not a
+  # rate-limit refusal. While refused it waits for the refusal's own
+  # `x-ratelimit-reset`, but asks again at least every 60s, for at most 900s.
+  # It does not trust `GET /rate_limit`: on IntegrateIT 2026-10-11 a pass was
+  # refused while that endpoint reported 3390 left, and the old job slept its
+  # 900s cap twice on that number (the measurement is in the script).
+  #
   # The dispatch uses the run's GITHUB_TOKEN, not the App: the App's budget is
   # what just ran out, and GITHUB_TOKEN draws on the repository's own. That is
   # the one write this token makes, so it arrives as DISPATCH_TOKEN and never as
@@ -686,15 +683,17 @@ jobs:
   #
   # Outside this file's `merge-lane-<base>` group, but inside the CALLER job's
   # concurrency group, which covers the whole called workflow: other passes
-  # queue behind the wait. That is intended — a pass started before the App's
-  # window reopens would fail the same way.
+  # queue behind the wait. That is intended, and the probing keeps it short —
+  # the group is held while the quota is really refusing, plus at most one
+  # 60s probe interval, and a pass started inside that time would be refused
+  # the same way.
   recover:
     name: Recover a failed lane pass
     needs: [lane]
     if: ${{ always() && needs.lane.result == 'failure' && github.event_name != 'workflow_dispatch' && github.event.inputs.recovered != 'true' && github.event.workflow_run.event != 'workflow_dispatch' && !(github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) }}
     # dynamic-runner-allowed(recover, #402): the same caller-scoped label as the lane job
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
-    # The wait is capped at 900s; the rest is the checkout and one POST.
+    # The wait is capped at 900s; the rest is the checkout, the token and one POST.
     timeout-minutes: 20
     permissions:
       actions: write
@@ -707,10 +706,19 @@ jobs:
           ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
           persist-credentials: false
 
-      - name: Wait for the App's window, then dispatch one more pass
+      # Minting is not an API call against the installation's quota, so it
+      # works while the quota is refusing; the token is what the probe asks with.
+      - name: Mint the merge App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
+      - name: Probe the App's quota, then dispatch one more pass
         env:
+          APP_TOKEN: ${{ steps.token.outputs.token }}
           DISPATCH_TOKEN: ${{ github.token }}
           RECOVER_WORKFLOW: ${{ inputs.recover-workflow }}
-          APP_RESET: ${{ needs.lane.outputs.app-reset }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: bash scripts/ci/merge-lane-recover.sh dispatch

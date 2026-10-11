@@ -93,9 +93,10 @@
 # failed           how many of them failed, timed out or were cancelled
 # pending          how many are still running
 # behind           commits the base has that this branch does not
-# inflight_age     seconds since this entry was last updated onto the base,
-#                  or "" if it is not in flight
-# inflight_budget  seconds an in-flight entry may take before it is dropped
+# inflight_age     seconds since this head's checks last moved (newest
+#                  check-run start or finish, status, or check_suite), or ""
+#                  when nothing has reported on it at all
+# inflight_budget  seconds an entry's checks may stay silent before it is dropped
 # strict           1 if this base requires a branch to be UP TO DATE before it
 #                  may merge, 0 if it does not. Defaults to 1, which is the
 #                  behaviour this rule had before the argument existed.
@@ -185,14 +186,14 @@ lane_verdict() {
   # decision nobody is going to make. This is `checks_timeout`, kept.
   #
   # `pending + missing > 0` is the load-bearing half of the condition, not a
-  # refinement of it. The caller measures `inflight_age` from the head commit's
-  # timestamp, because that is the only in-flight clock available without
-  # storing state anywhere — and by that clock a pull request that was pushed
-  # last week and is green today is very old indeed. Without this term the lane
-  # would drop exactly the entries it should merge, and the older and more
-  # patient the pull request, the more certainly it would be dropped. The budget
-  # bounds WAITING, so it may only fire while something is still being waited
-  # on.
+  # refinement of it. The caller measures `inflight_age` as the time since the
+  # head's checks last MOVED — the newest check-run start or finish, status
+  # update or check_suite creation — so a pull request whose CI is still
+  # starting and finishing shards is never "in flight too long", however old
+  # its commit. By that clock a pull request that went green last week is
+  # still old, so without this term the lane would drop exactly the entries it
+  # should merge. The budget bounds SILENT WAITING, so it may only fire while
+  # something is still being waited on.
   if [ -n "$inflight_age" ] && [ -n "$inflight_budget" ] && [ $((pending + missing)) -gt 0 ]; then
     if [[ "$inflight_age" =~ ^[0-9]+$ ]] && [[ "$inflight_budget" =~ ^[0-9]+$ ]]; then
       if [ "$inflight_age" -gt "$inflight_budget" ]; then
