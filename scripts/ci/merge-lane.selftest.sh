@@ -1260,7 +1260,7 @@ STUB
     && [ "$(grep -c 'api.test/repos/o/r$' "$d/curl")" = 1 ]
   rc=$?
   : >"$d/probes"
-  for i in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
+  for _ in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
   rrun DEFAULT_BRANCH=
   [ "$rc" -eq 0 ] && grep -qF -- '-d {"ref":"trunk","inputs":{"recovered":"true"}}' "$d/curl"
   res recover-reads-the-default-branch $?
