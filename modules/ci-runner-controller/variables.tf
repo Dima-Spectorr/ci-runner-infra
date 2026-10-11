@@ -49,6 +49,9 @@ variable "pools" {
     # Per pool, not per controller (#948): this arms a mechanism that stops
     # runner agents, and it is rolled out one pool at a time.
     recycle_cordon_stops_agents = optional(bool)
+    # The autoscaler's single_instance_assignment, so a recycling host can be
+    # published as exactly one host's worth of demand. pool_descriptor carries it.
+    jobs_per_host = optional(number)
   }))
 
   # EMPTY MEANS "THE `repos` TABLE IS IN USE", and only that. "At least one pool"
@@ -241,6 +244,7 @@ variable "repos" {
         beacon_interval             = optional(number)
         pin_orphan_grace_seconds    = optional(number)
         recycle_cordon_stops_agents = optional(bool)
+        jobs_per_host               = optional(number)
       }))
     })
   )

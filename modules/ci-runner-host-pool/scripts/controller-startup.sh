@@ -477,6 +477,7 @@ if [ -z "${POOLS_JSON:-}" ]; then
     --arg ticks "$(md "instance/attributes/ci-orphan-confirm-ticks")" \
     --arg recycle "$(md "instance/attributes/ci-recycle-max-unavailable")" \
     --arg cordonstop "$(md "instance/attributes/ci-recycle-cordon-stops-agents")" \
+    --arg jph "$(md "instance/attributes/ci-jobs-per-host")" \
     --arg hostos "$(md "instance/attributes/ci-host-os")" \
     --arg mint "$(md "instance/attributes/ci-mint-registration-token")" \
     --arg beacon "$(md "instance/attributes/ci-beacon-interval")" \
@@ -495,6 +496,7 @@ if [ -z "${POOLS_JSON:-}" ]; then
          # key is a controller whose HOSTS are too old to have the sweep that
          # reads it, so false is the only answer that is not a lie.
          recycle_cordon_stops_agents: ($cordonstop | nz),
+         jobs_per_host: ($jph | nz),
          host_os: ($hostos | nz),
          mints_registration_token: ($mint | nz),
          beacon_interval: ($beacon | nz),
@@ -504,7 +506,7 @@ fi
 
 POOLS=()
 declare -A P_MIG=() P_REGION=() P_SLOTS=() P_MIN=() P_MAX=() P_GRACE=()
-declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_CORDON_STOP=() P_HOST_OS=() P_MINT=()
+declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_CORDON_STOP=() P_HOST_OS=() P_MINT=() P_JPH=()
 declare -A P_ROLE=() P_BEACON=() P_PIN=() P_LABELS=() P_LABELS_JSON=()
 declare -A P_MATCH_JSON=() P_MATCH_CSV=()
 
@@ -537,7 +539,7 @@ POOL_TABLE_REJECTED=0
 # collapse. See the note in pool-table.sh.
 while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   p_reggrace p_ticks p_recycle p_hostos p_mint p_role p_beacon p_pin p_labels \
-  p_cordonstop; do
+  p_cordonstop p_jph; do
   [ -n "$p_name" ] || continue
   POOLS+=("$p_name")
   P_MIG["$p_name"]="$p_mig"
@@ -550,6 +552,7 @@ while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   P_TICKS["$p_name"]="$p_ticks"
   P_RECYCLE["$p_name"]="$p_recycle"
   P_CORDON_STOP["$p_name"]="$p_cordonstop"
+  P_JPH["$p_name"]="$p_jph"
   P_HOST_OS["$p_name"]="$p_hostos"
   P_MINT["$p_name"]="$p_mint"
   P_ROLE["$p_name"]="$p_role"
@@ -636,6 +639,7 @@ pool_select() {
   ORPHAN_CONFIRM_TICKS="${P_TICKS[$POOL]}"
   RECYCLE_MAX_UNAVAILABLE="${P_RECYCLE[$POOL]}"
   RECYCLE_CORDON_STOPS_AGENTS="${P_CORDON_STOP[$POOL]}"
+  JOBS_PER_HOST="${P_JPH[$POOL]}"
   CONTROLLER_HOST_OS="${P_HOST_OS[$POOL]}"
   MINT_REG="${P_MINT[$POOL]}"
   POOL_ROLE="${P_ROLE[$POOL]}"
@@ -674,6 +678,7 @@ RECYCLE_MAX_UNAVAILABLE=0
 # other pre-select default here points: a read before the first select must not
 # be able to take an agent down.
 RECYCLE_CORDON_STOPS_AGENTS=false
+JOBS_PER_HOST=1
 CONTROLLER_HOST_OS="unknown"
 MINT_REG=false
 # Read in tick_pool: the role is what decides whether a pool publishes the
@@ -4509,6 +4514,32 @@ cordon_seconds() {
   echo "$gap"
 }
 
+# reserve_seconds <host> — how long this host has been RESERVED: the first phase
+# of a make-before-break recycle, where it keeps serving while the surge demand
+# buys its replacement (see recycle-decision.sh). -1 when it is not reserved.
+#
+# The marker is `reserve-<host>`, its body the epoch of the first `reserve:`
+# verdict. A body that is not a plain integer is restamped to now and read as 0
+# — the same direction cordon_seconds() errs in: a garbled clock costs one more
+# reservation window, never a cordon issued before the replacement can exist.
+reserve_seconds() {
+  local f="$STATE_DIR/reserve-$1"
+  local now since gap
+  [ -f "$f" ] || { echo -1; return 0; }
+  now=$(date +%s)
+  since=$(cat "$f" 2>/dev/null)
+  case "$since" in
+    "" | *[!0-9]*)
+      echo "$now" >"$f"
+      echo 0
+      return 0
+      ;;
+  esac
+  gap=$((now - since))
+  [ "$gap" -lt 0 ] && gap=0
+  echo "$gap"
+}
+
 cordon_host() {
   local host="$1" uri="${2:-}"
   local ids id gone=0 held=0 failed=0 zone
@@ -4725,6 +4756,8 @@ tick_pool() {
   DRAIN_ERRORS=0
   REAPED=0
   CORDONED=0
+  # Hosts that entered the make-before-break reserve phase this tick.
+  RESERVED=0
   # Per-tick cordon accounting, reset with the rest. `held` and `errors` are not
   # the same event and used to be the same counter: see cordon_host().
   CORDON_HELD=0
@@ -4775,7 +4808,7 @@ tick_pool() {
   # about. slots_known is the denominator that goes with it: without it a blind
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
-  local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for
+  local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for reserved_for
   local skip_reason
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
@@ -4814,7 +4847,7 @@ tick_pool() {
   # live registration token is sitting in another pool's instance metadata. Only
   # markers whose host name this pool's MIG could have created are considered,
   # and if the MIG's base name could not be read, nothing is swept at all.
-  for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
+  for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/reserve-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
     "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-* \
     "$STATE_DIR"/pinveto-* "$STATE_DIR"/pinerr-* "$STATE_DIR"/beaconerr-*; do
     [ -n "$live_hosts" ] || break
@@ -4822,6 +4855,7 @@ tick_pool() {
     [ -e "$f" ] || continue
     mname=$(basename "$f")
     mname=${mname#cordon-}
+    mname=${mname#reserve-}
     mname=${mname#regtoken-}
     mname=${mname#regkey-}
     mname=${mname#regfail-}
@@ -4841,18 +4875,50 @@ tick_pool() {
   # would let one pool's rollout stop every other pool from rolling out at all.
   # With no base name to scope by, the budget reads as fully spent — a pool that
   # cannot count its own cordons must not start new ones.
+  #
+  # A RESERVED host is in the recycle set as much as a cordoned one: its
+  # replacement is being bought on its account. A host carries one marker or the
+  # other, never both — the cordon arm removes the reserve marker — so the sum
+  # counts each host once.
   if [ -n "$MIG_BASE" ]; then
-    recycling=$(find "$STATE_DIR" -maxdepth 1 -name "cordon-$MIG_BASE-*" 2>/dev/null | wc -l)
+    recycling=$(find "$STATE_DIR" -maxdepth 1 \( -name "cordon-$MIG_BASE-*" -o -name "reserve-$MIG_BASE-*" \) 2>/dev/null | wc -l)
   else
     recycling="$RECYCLE_MAX_UNAVAILABLE"
   fi
+
+  # THE RECYCLE SET AS DEMAND (make before break). recycle_hosts / recycle_busy
+  # are the RUNNING hosts already reserved or cordoned at the start of the tick
+  # and the jobs they carry; the walk below adds the hosts that enter the set
+  # this tick and takes out the ones it retires. They feed recycle_surge_demand
+  # at publish, and — read here, before any drain — the idle-drain floor.
+  local recycle_hosts=0 recycle_busy=0 surge_floor="$MIN_HOSTS" in_set
 
   # `IFS=,` on both walks, and it is not cosmetic — see collect_hosts.
   while IFS=, read -r host status host_tpl host_uri host_action; do
     [ -n "$host" ] || continue
     [ "$status" = "RUNNING" ] && pool_size=$((pool_size + 1))
     [ "$(template_state "$host_tpl")" = "stale" ] && stale_hosts=$((stale_hosts + 1))
+    if [ "$status" = "RUNNING" ] &&
+      { [ -f "$STATE_DIR/reserve-$host" ] || [ -f "$STATE_DIR/cordon-$host" ]; }; then
+      host_facts "$host"
+      recycle_hosts=$((recycle_hosts + 1))
+      recycle_busy=$((recycle_busy + HOST_BUSY))
+    fi
   done <<<"$HOSTS"
+
+  # THE CHURN GUARD. The replacement a reserved host buys boots IDLE, and stays
+  # idle until the old host is cordoned and work stops landing there — on a pool
+  # that is not saturated, often longer than the drain grace. drain_decision
+  # would then delete it as surplus while the surge that bought it is still
+  # being published, and the autoscaler would buy it straight back on the next
+  # tick: one wasted boot per grace window, for the whole recycle. So while the
+  # recycle set is non-empty the drain floor is the pool size the surge asks for
+  # rather than min_hosts. It lifts the moment the set empties.
+  if [ "$recycle_hosts" -gt 0 ]; then
+    surge_floor=$(recycle_surge_floor \
+      "$(recycle_surge_demand "$DEMAND_TOTAL" "$recycle_hosts" "$recycle_busy" "$MAX_HOSTS" "$JOBS_PER_HOST" "$MIN_HOSTS")" \
+      "$JOBS_PER_HOST" "$MIN_HOSTS")
+  fi
 
   while IFS=, read -r host status host_tpl host_uri host_action; do
     [ -n "$host" ] || continue
@@ -4937,16 +5003,29 @@ tick_pool() {
     # `cordoned` is read further up, with the slot accounting that also needs it.
 
     partial_for=$(partial_seconds "$host" "$HOST_REG")
+    reserved_for=$(reserve_seconds "$host")
+    # Whether the pre-walk already counted this host into the recycle set, so
+    # the arms below add a host entering it exactly once and take out exactly
+    # the hosts that were in it.
+    in_set=0
+    if [ "$status" = "RUNNING" ] && { [ "$cordoned" -eq 1 ] || [ "$reserved_for" -ge 0 ]; }; then
+      in_set=1
+    fi
 
     verdict=$(recycle_decision "$status" "$tpl" "$busy" "$HOST_REG" \
       "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned" \
-      "$partial_for")
+      "$partial_for" "$reserved_for")
 
     # THE PIN HOLD VETO, first half. A cordon is not "less than" a delete here:
     # it deregisters the host's idle agents, and a cordoned host stops answering
     # its own affinity label while the run pinned to it still has jobs to place.
     # A hold wired only into the drain path would be bypassed entirely by a
     # stale-template recycle.
+    #
+    # A `reserve:` verdict is deliberately NOT vetoed: reserving deregisters
+    # nothing and deletes nothing, so the pinned run keeps its host either way,
+    # and letting the reservation proceed means the replacement is already
+    # bought by the time the hold lifts and the cordon is allowed through.
     case "$verdict" in
       cordon:* | retire:*)
         hold=$(pin_hold_gate "$host" "$host_uri")
@@ -4963,10 +5042,37 @@ tick_pool() {
     esac
 
     case "$verdict" in
+      reserve:*)
+        # MAKE BEFORE BREAK. The host keeps every slot and keeps taking work;
+        # all that changes is that it now counts as one host of surge demand,
+        # which buys its replacement. Nothing is deregistered and nothing is
+        # deleted, so there is nothing here that can fail half-way. The marker's
+        # body is the clock recycle_decision reads: cordon once it is
+        # register_grace old, by which time the replacement has registered.
+        event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
+        if [ "$reserved_for" -lt 0 ]; then
+          date +%s >"$STATE_DIR/reserve-$host"
+          recycling=$((recycling + 1))
+          RESERVED=$((RESERVED + 1))
+        fi
+        if [ "$in_set" -eq 0 ] && [ "$status" = "RUNNING" ]; then
+          recycle_hosts=$((recycle_hosts + 1))
+          recycle_busy=$((recycle_busy + busy))
+        fi
+        continue
+        ;;
       cordon:*)
         event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
-        if [ "$cordoned" -eq 0 ]; then
+        # The reservation ends here: the host is now cordoned, and the cordon
+        # marker below takes over its place in the recycle budget. Removed
+        # first so the two markers never both count the same host.
+        if [ "$cordoned" -eq 0 ] && [ "$reserved_for" -lt 0 ]; then
           recycling=$((recycling + 1))
+        fi
+        rm -f "$STATE_DIR/reserve-$host"
+        if [ "$in_set" -eq 0 ] && [ "$status" = "RUNNING" ]; then
+          recycle_hosts=$((recycle_hosts + 1))
+          recycle_busy=$((recycle_busy + busy))
         fi
         # `|| log` is load-bearing, not defensive noise: the controller runs
         # under `set -e`, and cordon_host returns 1 when no token could be
@@ -4985,10 +5091,18 @@ tick_pool() {
       retire:*)
         event INFO drain-decision "$host" "$host: $verdict" verdict="$verdict"
         draining=$((draining + 1))
-        if [ "$cordoned" -eq 0 ]; then
+        if [ "$cordoned" -eq 0 ] && [ "$reserved_for" -lt 0 ]; then
           recycling=$((recycling + 1))
         fi
         if drain_host "$host"; then
+          # Gone, so no longer surge demand. Left in, it would be published as
+          # one more host of demand for this tick — and the autoscaler is ONLY_UP,
+          # so that one tick would buy a host nobody needs.
+          if [ "$in_set" -eq 1 ]; then
+            recycle_hosts=$((recycle_hosts - 1))
+            recycle_busy=$((recycle_busy - busy))
+          fi
+          rm -f "$STATE_DIR/reserve-$host"
           # ONLY a host this tick actually COUNTED may be discounted. pool_size
           # was built from the RUNNING hosts alone in the walk above, so
           # subtracting for a host in any other state removes a host that was
@@ -5003,6 +5117,24 @@ tick_pool() {
         continue
         ;;
       skip:*)
+        # A RESERVATION WHOSE REASON IS GONE ENDS. The template went current, the
+        # lost capacity came back, or recycling was switched off: the host is
+        # not being replaced, so it must stop being published as surge demand —
+        # a stale marker would hold one extra host for as long as it lived. A
+        # transient skip (booting, registration-unknown, not-running) keeps it.
+        if [ "$reserved_for" -ge 0 ]; then
+          case "$verdict" in
+            skip:template* | skip:partial-grace* | skip:disabled*)
+              rm -f "$STATE_DIR/reserve-$host"
+              recycling=$((recycling - 1))
+              if [ "$in_set" -eq 1 ]; then
+                recycle_hosts=$((recycle_hosts - 1))
+                recycle_busy=$((recycle_busy - busy))
+              fi
+              event INFO drain-decision "$host" "$host: reservation released: $verdict" verdict="$verdict"
+              ;;
+          esac
+        fi
         # WHY A SKIP IS COUNTED AT ALL. Until now only `cordoned` and `retired`
         # were published, so a recycle mechanism that skipped every host on
         # every tick produced exactly the same telemetry as one with nothing to
@@ -5038,7 +5170,7 @@ tick_pool() {
       *) : ;;
     esac
 
-    verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$MIN_HOSTS" "$HOST_REG" \
+    verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$surge_floor" "$HOST_REG" \
       "$age" "$REGISTER_GRACE" "$RUNNER_ROSTER")
 
     # THE PIN HOLD VETO, second half. Same gate, same cache, the other path.
@@ -5098,7 +5230,17 @@ tick_pool() {
   # Terraform's `max_hosts` and nothing else, which is what every pool in the
   # fleet has actually been running on since `.mergify.yml` was deleted — the
   # derivation failed open to exactly that and had been dead ever since.
-  local demand_published="$DEMAND_TOTAL"
+  #
+  # And the controller now ENFORCES that ceiling itself, because the
+  # autoscaler's max_replicas is max_hosts + recycle_max_unavailable: the
+  # headroom a make-before-break recycle buys replacements in. The shared demand
+  # is capped at max_hosts hosts' worth, and each host in the recycle set adds
+  # one host's worth on top — see recycle_surge_demand. With nothing recycling
+  # the pool still never asks for more than max_hosts.
+  local demand_published
+  demand_published=$(recycle_surge_demand "$DEMAND_TOTAL" "$recycle_hosts" "$recycle_busy" \
+    "$MAX_HOSTS" "$JOBS_PER_HOST" "$MIN_HOSTS")
+  queue_series "ci_recycle_surge_hosts" "$recycle_hosts"
 
   # Still published, and still only for a merge-queue pool: this one is
   # OBSERVED from real runs rather than read from any configuration, so it
@@ -5230,6 +5372,7 @@ tick_pool() {
   # Per-tick deltas, like ci_drain_verdicts. `cordoned` climbing while `retired`
   # stays flat is a pool whose jobs never end — the recycle is working and the
   # hosts are not leaving.
+  queue_series "ci_recycle_verdicts" "$RESERVED" '"outcome":"reserved"'
   queue_series "ci_recycle_verdicts" "$CORDONED" '"outcome":"cordoned"'
   queue_series "ci_recycle_verdicts" "$RETIRED" '"outcome":"retired"'
   # The three that separate a cordon that is WORKING from one that is not, and

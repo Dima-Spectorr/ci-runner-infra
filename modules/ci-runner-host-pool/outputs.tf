@@ -65,6 +65,11 @@ output "pool_descriptor" {
     recycle_max_unavailable = var.recycle_max_unavailable
     host_os                 = var.host_os
 
+    # The autoscaler's single_instance_assignment. Carried, not defaulted: the
+    # parser's default (slots) is right only for a pool with no headroom, and a
+    # wrong value makes every recycling host buy the wrong number of hosts.
+    jobs_per_host = local.jobs_per_host
+
     # Carried rather than left to the parser's default for the same reason
     # `role` is: the parser defaults it to false, and false is right for a pool
     # that says nothing — but a pool that has been switched ON must not be
@@ -245,6 +250,11 @@ output "metric_names" {
       # window. `cordoned` climbing while `retired` stays flat means the recycle
       # is working and the hosts are not leaving — jobs that never end.
       "ci_recycle_verdicts",
+      # Hosts in the make-before-break recycle set (reserved or cordoned, still
+      # RUNNING) this tick: each is one host of surge demand added to ci_demand
+      # on top of the max_hosts cap. Non-zero only during a rollout; stuck
+      # non-zero with ci_hosts_stale_template at 0 is a leaked reservation.
+      "ci_recycle_surge_hosts",
       "ci_poller_heartbeat",
       # Pools the controller's own table refused at boot. A rejected pool has no
       # series of its own — it is simply never ticked — so there is nothing to

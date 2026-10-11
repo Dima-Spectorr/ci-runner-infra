@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.119.1"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.120.0"
   # ...
 }
 ```
@@ -114,8 +114,16 @@ not the question anyone was asking.
 `recycle_decision()`
 (`modules/ci-runner-host-pool/scripts/recycle-decision.sh`, pure and
 self-tested like the other two) closes that gap, and it never interrupts a job.
-It is two-phase, and the phases are ticks apart:
+It is three-phase, and the phases are ticks apart:
 
+* **reserve** (busy hosts only) — **make before break**. The host keeps every
+  slot and keeps taking work; the controller now publishes it as one extra host
+  of demand, so the autoscaler buys its replacement while it still stands. It
+  moves to cordon once it has been reserved for `register_grace_seconds` (600s on
+  Linux, at least 1200s on Windows), by which time the replacement has
+  registered. An idle host skips straight to retire. While the reservation
+  lives, the idle-drain floor is the pool size the surge asks for, so the
+  replacement is not drained as idle and bought back on the next tick.
 * **cordon** — deregister the stale host's **idle** agents. GitHub refuses to
   deregister an agent that is executing a job, and that refusal is the guard: the
   working slot survives and its job runs to completion, while every idle slot
@@ -133,6 +141,20 @@ at once. A cordoned host's idle slots leave the pool immediately, so cordoning
 every stale host at once would remove the fleet's whole spare capacity in one
 tick and leave every queued job waiting on a boot. **The default is `1`: a pool
 upgrades itself, one host at a time, and never interrupts a job.**
+
+The same number is the **surge**. While N hosts are reserved or cordoned the
+pool may run up to `max_hosts + N` hosts, so capacity never dips during a
+rollout. The autoscaler's `max_replicas` is set statically to
+`max_hosts + recycle_max_unavailable`, and the controller enforces `max_hosts`
+itself: it publishes `ci_demand` as
+`min(demand − recycling_busy, max_hosts × jobs_per_host) + recycling_hosts × jobs_per_host`,
+where `jobs_per_host = max(1, slots_per_host − autoscaler_headroom_slots)` and
+cordoned slots are never counted as available. When the old hosts retire the
+surge term goes to zero and the pool is back to `≤ max_hosts`. A static ceiling
+and not one the controller patches at runtime: a runtime patch fights the next
+`terraform apply`, and is left raised for good if the controller dies mid-rollout.
+`ci_recycle_surge_hosts` shows how many hosts are in the set. Windows pools take
+the same path, through the same Linux controller.
 
 It defaulted to `0` — off — until 2026-08-27, so that a rule which deletes
 machines on nobody's trigger had a switch that stopped it without a rollback.

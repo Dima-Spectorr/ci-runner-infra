@@ -57,7 +57,7 @@ select_out=$(
 
   declare -A P_MIG P_REGION P_SLOTS P_MIN P_MAX P_GRACE P_REGGRACE P_TICKS
   declare -A P_RECYCLE P_HOST_OS P_MINT P_ROLE P_BEACON P_PIN P_LABELS
-  declare -A P_CORDON_STOP
+  declare -A P_CORDON_STOP P_JPH
   # D_EXPIRED is declared even though pool_select reads it as `${...:-0}`: an
   # associative subscript on a variable bash has never seen is parsed as
   # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
@@ -99,6 +99,9 @@ select_out=$(
   # belong to cordons one.
   P_CORDON_STOP[a]=true
   P_CORDON_STOP[b]=false
+  # Carried over, pool b would publish each recycling host as pool a's host size.
+  P_JPH[a]=3
+  P_JPH[b]=1
   P_MINT[a]=false
   P_MINT[b]=true
   D_TOTAL[a]=7
@@ -120,11 +123,11 @@ select_out=$(
   MIG_TEMPLATE="ci-lin-tpl-v5"
 
   pool_select b
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_MATCH_LABELS" \
     "$MIG_BASE" "$MIG_TARGET" "$MIG_TEMPLATE" \
     "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX" "$POOL_JOBS_PER_CHECK" \
-    "$RECYCLE_CORDON_STOPS_AGENTS"
+    "$RECYCLE_CORDON_STOPS_AGENTS" "$JOBS_PER_HOST"
 )
 check "pool_select: the second pool's own fields are all in place" \
   "b|mig-b|windows|true|b,self-hosted,x64" \
@@ -156,6 +159,10 @@ check "pool_select: jobs-per-check is this pool's, not the previous pool's" \
 check "pool_select: the host-side cordon flag is this pool's" \
   "false" \
   "$(printf '%s' "$select_out" | cut -d'|' -f13)"
+
+check "pool_select: jobs_per_host is this pool's" \
+  "1" \
+  "$(printf '%s' "$select_out" | cut -d'|' -f14)"
 
 # --- 2. the marker sweep cannot reach another pool's markers ------------------
 #
