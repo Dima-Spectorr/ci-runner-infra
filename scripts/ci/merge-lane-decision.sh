@@ -913,3 +913,41 @@ lane_clock_wait() {
   echo "wait:clock seconds=$wait"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# lane_quota_verdict — may a pass spend the merge App's shared quota (#1543)?
+#
+#   lane_quota_verdict <remaining> <reset> <floor> <now>
+#
+# `remaining` and `reset` come from the `x-ratelimit-remaining` /
+# `x-ratelimit-reset` headers of the lane's newest real API answer, "" when no
+# answer has carried them. Never from `GET /rate_limit`, which reported a fresh
+# window while the same token's real calls were refused.
+#
+#   allow:no-floor       the floor is 0 — the guard is off
+#   hold:unknown         no answer has said what the window is. Conservative:
+#                        a pass is not started on a guess about a shared quota
+#   allow:window-reset   the window that answer described has reset since, so
+#                        its `remaining` describes a window that is gone
+#   hold:below-floor     under the floor
+#   allow:above-floor    at or over it
+# ---------------------------------------------------------------------------
+lane_quota_verdict() {
+  local remaining="${1:-}" reset="${2:-}" floor="${3:-}" now="${4:-}"
+  if [ "$floor" = 0 ]; then
+    echo "allow:no-floor"
+    return 0
+  fi
+  if ! [[ "$remaining" =~ ^[0-9]+$ ]] || ! [[ "$reset" =~ ^[0-9]+$ ]] \
+    || ! [[ "$floor" =~ ^[0-9]+$ ]] || ! [[ "$now" =~ ^[0-9]+$ ]]; then
+    echo "hold:unknown"
+    return 0
+  fi
+  if [ "$reset" -le "$now" ]; then
+    echo "allow:window-reset"
+  elif [ "$remaining" -lt "$floor" ]; then
+    echo "hold:below-floor"
+  else
+    echo "allow:above-floor"
+  fi
+}

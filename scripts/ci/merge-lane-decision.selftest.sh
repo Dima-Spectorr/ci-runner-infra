@@ -467,6 +467,34 @@ clock "nowait:over-budget seconds=40 spent=400 walk=200 budget=600" \
   "the walk estimate, not the halted pass, decides whether the wait fits" \
   $((T + 39)) "$T" $((T - 400)) 600 "$(lane_walk_estimate 2 200 30)" 180 0 3
 
+# lane_quota_verdict: the quota guard decides from the headers of the lane's own
+# newest answer (#1543). args: remaining reset floor now
+quota() {
+  local want="$1" desc="$2" got
+  shift 2
+  got=$(lane_quota_verdict "$@")
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s
+  args: %s
+  want: %s
+  got:  %s
+' "$desc" "$*" "$want" "$got"
+  fi
+}
+Q=1767400000
+quota hold:below-floor "the headers say the window is exhausted: the guard stops" 0 $((Q + 1800)) 500 "$Q"
+quota hold:below-floor "one under the floor stops too" 499 $((Q + 1800)) 500 "$Q"
+quota allow:above-floor "the headers say there is plenty: the guard continues" 4990 $((Q + 1800)) 500 "$Q"
+quota allow:above-floor "exactly the floor is not under it" 500 $((Q + 1800)) 500 "$Q"
+quota hold:unknown "no answer has carried the headers yet: conservative, never read as plenty" "" "" 500 "$Q"
+quota hold:unknown "a remaining with no reset is not a window" 4990 "" 500 "$Q"
+quota hold:unknown "garbled headers are not a window either" x y 500 "$Q"
+quota allow:window-reset "an exhausted window that has reset since does not hold the next one" 0 $((Q - 1)) 500 "$Q"
+quota allow:no-floor "a floor of 0 turns the guard off, headers or none" "" "" 0 "$Q"
+
 # ---------------------------------------------------------------------------
 # #1443 — A RED BASE ADMITS ITS OWN FIX, AND NOTHING ELSE.
 # args: verdict behind fixed failing. Every wait arm starts `wait:base-red`, so

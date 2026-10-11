@@ -78,11 +78,16 @@ cat >"$WORK/bin/gh" <<'STUB'
 set -u
 [ "${1:-}" = api ] || exit 2
 shift
-url='' prog=''
+url='' prog='' include=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) prog="$2"; shift 2 ;;
     --paginate) shift ;;
+    # `-i`: the answer's header block first, in `gh`'s own shape — a status line,
+    # CR LF header lines, a lone CR LF. The window it reports is set by the case
+    # (GH_STUB_REMAINING / _RESET / _RESOURCE); GH_STUB_NO_HEADERS answers with
+    # none, the way an API that is not answering at all would.
+    -i) include=1; shift ;;
     # A write is logged and refused. With GH_STUB_RATE_LIMIT_WRITES it is
     # refused the way a drained installation quota refuses it, to show the
     # retry does not repeat it.
@@ -99,16 +104,22 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   rate_limit)
-    # The retry asks for the core window's used count and reset; everything
-    # else asks for the whole line.
+    # Only the retry's wait asks `rate_limit` (core used + reset). The quota
+    # guard never does (#1543): anything else asking is refused, so a guard that
+    # went back to it would read nothing and the cases below would say so.
     if [ "$prog" = '"\(.resources.core.used) \(.resources.core.reset)"' ]; then
       echo "${GH_STUB_USED:-10} ${GH_STUB_RESET:-1}"
-    else
-      echo '5000 4990 10 1900000000'
+      exit 0
     fi
-    exit 0
+    printf 'RATE_LIMIT %s\n' "$prog" >>"$GH_STUB_LOG"
+    exit 3
     ;;
 esac
+if [ -n "$include" ] && [ -z "${GH_STUB_NO_HEADERS:-}" ]; then
+  printf 'HTTP/2.0 200 OK\n'
+  printf 'X-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: %s\r\nX-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: %s\r\nX-Ratelimit-Used: 10\r\n\r\n' \
+    "${GH_STUB_REMAINING:-4990}" "${GH_STUB_QUOTA_RESET:-1900000000}" "${GH_STUB_RESOURCE:-core}"
+fi
 printf '%s\n' "$url" >>"$GH_STUB_LOG"
 # The one read that moves the clock, for the pass that runs out of time: see
 # the clock below.
@@ -860,6 +871,39 @@ cases_retry() { # <fetch-file>
 # ---------------------------------------------------------------------------
 # Running them.
 # ---------------------------------------------------------------------------
+# THE QUOTA IS NOTED FROM THE LANE'S OWN ANSWERS (#1543). Every real `gh api`
+# goes out with `-i`; the caller gets the body alone, and LANE_QUOTA holds the
+# newest core window an answer carried — a refusal's included.
+# shellcheck disable=SC2034
+cases_quota() { # <fetch-file>
+  (
+    # shellcheck source=/dev/null
+    source "$1"
+    d="$(mktemp -d "$WORK/quota.XXXXXX")"
+    LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota"
+    unset LANE_STARTED PASS_BUDGET GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
+    : >"$GH_STUB_LOG"
+
+    out="$(lane_gh_retry api ok/q1)"; rc=$?
+    [ "$rc" -eq 0 ] && [ "$out" = 'out:ok/q1' ]
+    say quota-headers-never-reach-the-caller $?
+    [ "$(cat "$d/quota" 2>/dev/null)" = '5000 4990 10 1900000000' ]
+    say quota-noted-from-the-answer $?
+
+    GH_STUB_REMAINING=0 GH_STUB_QUOTA_RESET=1900000123 lane_gh_retry api forbidden/q >/dev/null 2>&1
+    [ "$(cat "$d/quota" 2>/dev/null)" = '5000 0 10 1900000123' ]
+    say quota-noted-from-a-refusal $?
+
+    GH_STUB_RESOURCE=graphql lane_gh_retry api ok/q2 >/dev/null
+    GH_STUB_NO_HEADERS=1 lane_gh_retry api ok/q3 >/dev/null
+    [ "$(cat "$d/quota" 2>/dev/null)" = '5000 0 10 1900000123' ]
+    say quota-kept-over-another-bucket-and-a-bare-answer $?
+
+    [ "$(grep -c '^RATE_LIMIT' "$GH_STUB_LOG")" -eq 0 ]
+    say quota-never-asks-rate-limit $?
+  )
+}
+
 tally_lines() { # <output> <how-many-expected> <group>
   local line n=0
   while IFS= read -r line; do
@@ -904,6 +948,12 @@ tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 tally_lines "$(cases_retry "$FETCH" 2>&1)" 10 retry
+tally_lines "$(cases_quota "$FETCH" 2>&1)" 5 quota
+
+mutant "the header block reaches the caller" cases_quota "$FETCH"   's|^    inh { if ([$]0 == "[\]r" [|][|] [$]0 == "") { inh = 0 } else { print > hdr }; next }$|    inh { print; if (length($0) < 2) inh = 0; next }|' quota-headers-never-reach-the-caller
+mutant "a call goes out without its headers" cases_quota "$FETCH"   's|command gh api -i "\${@:2}"|command gh api "${@:2}"|' quota-noted-from-the-answer
+mutant "a refusal's headers are dropped" cases_quota "$FETCH"   's|^  lane_quota_note "\$d/hdr"$|  [ "$rc" -ne 0 ] \|\| lane_quota_note "$d/hdr"|' quota-noted-from-a-refusal
+mutant "another bucket's window is taken for the REST quota" cases_quota "$FETCH"   's/(res == "" || res == "core")/1/' quota-kept-over-another-bucket-and-a-bare-answer
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
@@ -1138,6 +1188,67 @@ wait_mutant "the run is asked about where there is no run" \
   's|^  \[ -n "\${GITHUB_RUN_ID:-}" \] \|\| return 0$|  :|' wait-is-not-asked-outside-a-run
 wait_mutant "a wait that cannot be read ends the run" \
   's|^    echo "lane: could not read how long |    exit 1; echo "lane: could not read how long |' wait-unreadable-changes-nothing
+
+# --- the quota guard, end to end (#1543) -------------------------------------
+#
+# The guard decides from the headers of the lane's own newest answer. The first
+# pass has none, so it makes ONE real read and decides from that. Three runs of
+# the whole driver: the serial run above, where the answers report plenty; one
+# whose answers report 10 left; and one whose answers carry no headers at all.
+guard_runs() { # <scripts-dir> <tag-suffix>
+  GH_STUB_REMAINING=10 lane_run "$1" 1 "exhausted$2"
+  GH_STUB_NO_HEADERS=1 lane_run "$1" 1 "noheaders$2"
+}
+
+# <plenty-run-tag> <exhausted-run-tag> <no-headers-run-tag>
+cases_guard() {
+  local rc p="$WORK/run.$1" x="$WORK/run.$2" n="$WORK/run.$3"
+  grep -q '^lane: quota at pass start: remaining=4990 of limit=5000 used=10 resets=.*, from the lane.s newest API answer (allow:above-floor' "$p/log" \
+    && ! grep -q 'SKIPPED, not idle' "$p/log" && [ "$(grep -cx "repos/$REPO" "$p/calls")" -eq 1 ]
+  say guard-plenty-continues $?
+  grep -q "SKIPPED, not idle — the merge App's shared API quota is at 10 of 5000, under the floor of 500" "$x/log" \
+    && [ "$(grep -vc '^$' "$x/calls")" -eq 1 ] && [ "$(grep -cx "repos/$REPO" "$x/calls")" -eq 1 ]
+  say guard-exhausted-stops $?
+  grep -q "SKIPPED, not idle — no answer from the GitHub API carried the merge App's quota headers" "$n/log" \
+    && grep -q '^lane: quota at pass start: unknown' "$n/log" && [ "$(grep -vc '^$' "$n/calls")" -eq 1 ]
+  say guard-no-header-holds $?
+  if grep -q '^RATE_LIMIT' "$p/calls" "$x/calls" "$n/calls"; then rc=1; else rc=0; fi
+  say guard-never-asks-rate-limit "$rc"
+}
+
+guard_runs "$real" ''
+tally_lines "$(cases_guard serial exhausted noheaders 2>&1)" 4 "quota guard"
+if [ "$FAIL" -gt 0 ]; then
+  echo '--- run on an exhausted quota ---'
+  cat "$WORK/run.exhausted/log"
+  echo '--- run with no quota headers ---'
+  cat "$WORK/run.noheaders/log"
+fi
+
+# <description> <file-name> <sed-program> <id>
+guard_mutant() {
+  local desc="$1" name="$2" prog="$3" id="$4" dir out
+  dir="$(scripts_copy guard)"
+  if ! sed "$prog" "$dir/$name" >"$dir/$name.m" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+    return
+  fi
+  if cmp -s "$dir/$name.m" "$dir/$name"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+    return
+  fi
+  mv "$dir/$name.m" "$dir/$name"
+  lane_run "$dir" 1 plenty.m
+  guard_runs "$dir" .m
+  out="$(cases_guard plenty.m exhausted.m noheaders.m 2>/dev/null)"
+  if [ "$(printf '%s\n' "$out" | grep -cxF -- "FAIL $id")" -eq 1 ]; then ok; else bad "mutation not detected by '$id': $desc"; fi
+}
+guard_mutant "the first pass starts without a real answer to decide from" merge-lane.sh \
+  's|^    gh api "repos/\$R" --jq .\.id. >/dev/null 2>\&1 [|][|] true$|    :|' guard-plenty-continues
+guard_mutant "an exhausted window does not stop the pass" merge-lane-decision.sh \
+  's|^  elif \[ "\$remaining" -lt "\$floor" \]; then$|  elif false; then|' guard-exhausted-stops
+guard_mutant "no headers is read as plenty" merge-lane.sh \
+  's|^    hold:\*)$|    hold:never)|' guard-no-header-holds
 
 echo
 if [ "$FAIL" -gt 0 ]; then
