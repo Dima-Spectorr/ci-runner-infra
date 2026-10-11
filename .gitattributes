@@ -11,6 +11,16 @@
 # identity: checked out with CRLF on one machine and LF on another, the same
 # commit produces two different templates, and the pool recycles every host to
 # adopt a change nobody made.
+# EVERY text file, not a list of extensions. The list used to stop at the shell
+# and Terraform types, so job-metadata-broker.py, turbo-cache-server.py and
+# derive-turbo-tasks.cjs - embedded into host metadata by file() exactly like the
+# .sh scripts - were checked out CRLF on Windows. An apply from Windows then wrote
+# CRLF into all 11 host templates, and the next apply from Linux (the apply
+# trigger) planned to replace every one of them back. Measured 2026-10-11:
+# 11 to add, 11 to change, 11 to destroy, for a change nobody made.
+# A new script type must not need a new line here to be safe.
+* text=auto eol=lf
+
 *.sh   text eol=lf
 *.ps1  text eol=lf
 *.tf   text eol=lf
