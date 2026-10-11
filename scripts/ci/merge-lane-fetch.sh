@@ -82,7 +82,7 @@ LANE_RETRY_MAX_WAIT=90
 # <stderr-file> — the seconds to wait before the call is worth making again,
 # or a failure when the error is not a rate limit at all.
 lane_rate_limit_wait() {
-  local err="$1" now reset
+  local err="$1" now core used reset
   if grep -q 'HTTP 429' "$err"; then
     :
   elif grep -q 'HTTP 403' "$err" && grep -qi 'rate limit' "$err"; then
@@ -95,8 +95,18 @@ lane_rate_limit_wait() {
     return 0
   fi
   now="$(date -u +%s)"
-  reset="$(command gh api rate_limit --jq '.resources.core.reset' 2>/dev/null)" || reset=''
-  if [[ "$reset" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
+  core="$(command gh api rate_limit --jq '"\(.resources.core.used) \(.resources.core.reset)"' 2>/dev/null)" || core=''
+  read -r used reset <<<"$core"
+  if [ "${used:-}" = 0 ]; then
+    # A FRESH WINDOW DID NOT REFUSE THIS CALL. `rate_limit` reporting nothing
+    # used, resetting an hour out, is a window that opened after the refusal —
+    # or one that is not the window refusing. Measured on IntegrateIT
+    # 2026-10-11: pass 38115253421 was refused at 05:35:37 and one second later
+    # `rate_limit` said `remaining=5450 used=0`, reset 06:35. Waiting for that
+    # reset is waiting an hour for a window that is already open, so the call
+    # is made once more after the minute GitHub asks for.
+    printf 60
+  elif [[ "${reset:-}" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
     printf '%s' "$((reset - now + 1))"
   else
     # The core bucket is not what refused it — a limit `rate_limit` does not

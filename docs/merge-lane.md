@@ -87,7 +87,7 @@ does not, up to `max-actions` of them, for the reasons under
 |---|---|
 | `merge:ready` | green, current with the base — squash it |
 | `update:behind` | green, but the base moved — update it in place, let its own CI re-run |
-| `drop:budget-exceeded` | checks never concluded within the budget — release it and say so |
+| `drop:budget-exceeded` | a required check is still outstanding and nothing on the head has moved for the budget — release it and say so |
 | `wait:*` | the answer is not known yet — leave it alone |
 | `skip:*` | not a candidate |
 
@@ -662,7 +662,7 @@ Every clock-based hold, and what wakes the lane when it clears:
 |---|---|---|
 | `wait:review` (`review-grace-seconds`) | 60s | a review arriving (relay). Silence: the in-run wait while ≤180s is left, otherwise only the daily backstop, so keep the grace short |
 | base-health halt (`base-health-grace-seconds`) | 900s | the health workflow's completion, whatever its conclusion, **if you list it in `merge-lane.yml`'s `workflow_run`**. A job that never reports: the in-run wait covers only the last 180s of the grace, otherwise only the backstop (#1373) |
-| `drop:budget-exceeded` (`inflight-budget-seconds`) | 1800s | nothing, and nothing needs to: a drop releases a pull request that cannot merge yet, and its next CI completion wakes the lane |
+| `drop:budget-exceeded` (`inflight-budget-seconds`) | 1800s of SILENCE — no check-run started or finished, no status, no check_suite on the head — while a required check is outstanding | nothing, and nothing needs to: a drop releases a pull request that cannot merge yet, and its next CI completion wakes the lane. CI that is still moving is never dropped, however old the commit |
 | newer-incomplete hold (`newer-incomplete-max-staleness-seconds`) | 3600s | the later suite's completion, if its workflow is in your `workflow_run` list. The expiry itself: only the backstop |
 | `wait:mergeability-unknown` | not a clock | the next event, or the backstop |
 
@@ -1109,15 +1109,29 @@ run, at once. `merge-lane.yml` has a second job, `recover`, which runs only
 when the `lane` job's result is `failure` and the run was not itself started by
 `workflow_dispatch`:
 
-1. The failed `lane` job reads, for free, when the merge App's quota window
-   reopens (`rate_limit`, `scripts/ci/merge-lane-recover.sh read-reset`).
-2. `recover` waits until then — never less than 60s, never more than 900s.
+1. `recover` mints its own merge-App token and, after 30s, PROBES the App's
+   quota with one real read (`GET repos/<repo>`).
+2. An answer that is not a rate-limit refusal ends the wait at once. While the
+   probe is refused, `recover` waits until the `x-ratelimit-reset` header of
+   that refusal, but asks again at least every 60s, and stops waiting after
+   900s in total.
 3. It dispatches `recover-workflow` (default `merge-lane-events.yml`) on the
    repository's default branch, ONCE.
 
 Measured on IntegrateIT 2026-10-10: two passes failed on `API rate limit exceeded
 for installation ID ...` within a minute, and a green pull request sat for 824s
 until an unrelated CI completion started another pass.
+
+**It probes rather than trusting `GET /rate_limit`.** The job used to sleep until
+the `core.reset` that `rate_limit` reported, capped at 900s. That number is not
+the throttle's: on IntegrateIT 2026-10-11 pass 38115253421 was refused `API rate
+limit exceeded for installation ID ...` at 05:35:37 while `rate_limit` on the same
+token had just said `remaining=3390`, and one second later said `used=0`,
+resetting an hour out. The old job slept its 900s cap twice on that number,
+holding the lane's lock, and five green pull requests waited 26-47 minutes. A
+probe answers the only question that matters — would a pass be refused now — and
+the 60s re-probe bounds how wrong a refusal's own header can be. Script and
+measurement: `scripts/ci/merge-lane-recover.sh`.
 
 **The dispatch uses the run's `GITHUB_TOKEN`, not the App.** The App's
 installation budget is what just ran out; `GITHUB_TOKEN` draws on the
@@ -1159,18 +1173,22 @@ event whose head repository is not this one (`github.event.pull_request.head.rep
 != github.repository`; a deleted fork reads as a fork). Without it an outside
 contributor could toggle their own pull request between draft and ready to start
 lane runs, and each failing one would hold the repository-wide `merge-lane`
-concurrency group through the wait of up to 900s. The pass itself still runs
+concurrency group through a wait of up to 900s. The pass itself still runs
 and its failure is still red; only the recovery is skipped, and the watchdog
 and the next CI completion cover it.
 
 **The wait holds the caller's lock.** The caller job's `concurrency` group
 covers the whole called workflow, `recover` included, so other passes queue
-behind the wait. That is the point rather than a cost: a pass started before the
-App's window reopens would fail the same way.
+behind the wait. That is the point rather than a cost: a pass started while the
+App's quota is refusing would fail the same way, and the probing keeps the hold
+to the refusal itself plus at most one 60s interval.
 
 **Inside a pass, a rate-limited call is made once more** when the window
 reopens soon: a secondary limit (asks for a minute), or a primary one whose
-reset is under 90s away and inside the pass budget. Every `gh` call goes
+reset is under 90s away and inside the pass budget. When `rate_limit` reports
+a FRESH window (`used` 0, reset an hour out) the refusal did not come from that
+window, so the call is made once more after a minute instead of being refused
+for an hour. Every `gh` call goes
 through `lane_gh_retry` in `merge-lane-fetch.sh`, but only a READ is made again.
 A write (`gh api -X ...`, `-f`, `--input`: `PUT pulls/N/merge` above all) is
 attempted once, because the wait can be up to 90s and what the lane decided on

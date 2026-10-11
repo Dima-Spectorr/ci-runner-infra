@@ -99,9 +99,13 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   rate_limit)
-    # The retry asks for the core window's reset alone; everything else asks
-    # for the whole line.
-    if [ "$prog" = .resources.core.reset ]; then echo "${GH_STUB_RESET:-1}"; else echo '5000 4990 10 1900000000'; fi
+    # The retry asks for the core window's used count and reset; everything
+    # else asks for the whole line.
+    if [ "$prog" = '"\(.resources.core.used) \(.resources.core.reset)"' ]; then
+      echo "${GH_STUB_USED:-10} ${GH_STUB_RESET:-1}"
+    else
+      echo '5000 4990 10 1900000000'
+    fi
     exit 0
     ;;
 esac
@@ -773,7 +777,7 @@ cases_retry() { # <fetch-file>
     source "$1"
     d="$(mktemp -d "$WORK/retry.XXXXXX")"
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY=''
-    unset LANE_STARTED PASS_BUDGET GH_STUB_RESET
+    unset LANE_STARTED PASS_BUDGET GH_STUB_RESET GH_STUB_USED
     # Every mutant runs this group again: each URL must be refused afresh.
     rm -f "$GH_STUB_STATE"/retry_*
     # Not `$d`: the retry has a local `d` of its own, and bash scoping is dynamic.
@@ -807,6 +811,14 @@ cases_retry() { # <fetch-file>
     GH_STUB_RESET=$((now + 600)) lane_gh_retry api limit/b >/dev/null 2>"$d/err"
     [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(calls limit/b)" -eq 1 ] && grep -q 'not retried' "$d/err"
     say retry-not-past-the-cap $?
+
+    # A refusal while `rate_limit` reports a FRESH window (used=0, reset an hour
+    # out) did not come from that window: waiting for its reset would hold the
+    # pass an hour for a window already open. One more call after a minute.
+    fresh
+    out="$(GH_STUB_USED=0 GH_STUB_RESET=$((now + 3600)) lane_gh_retry api limit/c 2>"$d/err")"
+    [ $? -eq 0 ] && [ "$out" = 'out:limit/c' ] && [ "$(slept)" = 60 ] && [ "$(calls limit/c)" -eq 2 ]
+    say retry-a-fresh-window-after-a-minute $?
 
     fresh
     lane_gh_retry api forbidden/a >/dev/null 2>"$d/err"
@@ -891,7 +903,7 @@ tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
-tally_lines "$(cases_retry "$FETCH" 2>&1)" 9 retry
+tally_lines "$(cases_retry "$FETCH" 2>&1)" 10 retry
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
@@ -899,6 +911,7 @@ mutant "a secondary limit is retried at once" cases_retry "$FETCH" \
   '/secondary rate limit/,/return 0/s|printf 60|printf 0|' retry-secondary-once-after-a-minute
 mutant "a primary limit ignores the reset" cases_retry "$FETCH" \
   's|^    printf .%s. "\$((reset - now + 1))"$|    printf 60|' retry-primary-waits-for-the-reset
+mutant "a fresh window is waited out to its reset" cases_retry "$FETCH"   's|^  if \[ "\${used:-}" = 0 \]; then$|  if false; then|' retry-a-fresh-window-after-a-minute
 mutant "every 403 is retried" cases_retry "$FETCH" \
   "s|grep -q 'HTTP 403' \"\\\$err\" && grep -qi 'rate limit' \"\\\$err\"|grep -q 'HTTP 403' \"\$err\"|" retry-only-a-rate-limit
 mutant "a 429 is not retried" cases_retry "$FETCH" \

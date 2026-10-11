@@ -1125,8 +1125,9 @@ required_checks_all_exist_in_ci() {
 # A FAILED PASS IS FOLLOWED BY ONE MORE. The `recover` job runs only on a
 # `failure` (never `cancelled`, an evicted pending pass), never after a pass
 # that was itself dispatched (that is the loop guard), dispatches with the
-# repository's token under a name the lane's steps never read, and waits for the
-# window the failed job read with the App's token.
+# repository's token under a name the lane's steps never read, and probes the
+# App's quota with a token it mints itself — never with a number the failed job
+# read from `/rate_limit`, which is the number that was wrong.
 recovers_a_failed_pass() {
   local code
   code=$(code_of "$1")
@@ -1143,10 +1144,12 @@ recovers_a_failed_pass() {
   matches "$code" '^      actions: write$' || return 1
   matches "$code" '^          DISPATCH_TOKEN: \$\{\{ github\.token \}\}$' || return 1
   matches "$code" '^          RECOVER_WORKFLOW: \$\{\{ inputs\.recover-workflow \}\}$' || return 1
-  matches "$code" '^          APP_RESET: \$\{\{ needs\.lane\.outputs\.app-reset \}\}$' || return 1
-  matches "$code" '^      app-reset: \$\{\{ steps\.quota\.outputs\.reset \}\}$' || return 1
-  matches "$code" "^        if: \\$\{\{ failure\(\) && steps\.token\.outputs\.token != '' \}\}$" || return 1
-  matches "$code" '^        run: bash scripts/ci/merge-lane-recover\.sh read-reset$' || return 1
+  # The probe's token is minted IN the recover job: a token passed from the lane
+  # job would be a job output, and GitHub masks a secret output to nothing.
+  matches "$code" '^          APP_TOKEN: \$\{\{ steps\.token\.outputs\.token \}\}$' || return 1
+  [ "$(printf '%s\n' "$code" | sed -n '/^  recover:$/,$p' | grep -c '^        uses: actions/create-github-app-token@[0-9a-f]\{40\} # v')" -eq 1 ] || return 1
+  # The window the failed job used to read is gone, and nothing reads it.
+  ! matches "$code" 'APP_RESET|app-reset|read-reset' || return 1
   matches "$code" '^        run: bash scripts/ci/merge-lane-recover\.sh dispatch$' || return 1
   matches "$code" '^        default: merge-lane-events\.yml$'
 }
@@ -1159,27 +1162,45 @@ documented_callers_grant_the_dispatch() {
 }
 
 # The recovery script, run for real against a stand-in `curl` and `sleep`.
-# Prints `PASS <id>` / `FAIL <id>`.
+# The stand-in answers the App-token probes from `$STUB_DIR/probes`, one line
+# per probe — `200`, `403 <reset-epoch>` (a rate-limit refusal, with that
+# `x-ratelimit-reset` header) or `403plain` (a 403 that is not one) — and `200`
+# once the list runs out. Prints `PASS <id>` / `FAIL <id>`.
 recover_cases() { # <script>
-  local s="$1" d now rc
+  local s="$1" d now rc w i
   d=$(mktemp -d)
   mkdir "$d/bin"
   printf '#!/bin/sh\necho "$1" >>"$STUB_DIR/slept"\n' >"$d/bin/sleep"
   cat >"$d/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-out='' url=''
+out='' hdr='' url='' cfg='' answer=''
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   [ "${args[i]}" = -o ] && out="${args[i+1]}"
+  [ "${args[i]}" = -D ] && hdr="${args[i+1]}"
   url="${args[i]}"
 done
 printf '%s\n' "$*" >>"$STUB_DIR/curl"
 # What arrives on stdin (`--config -`) is kept apart from argv.
-[ -t 0 ] || cat >>"$STUB_DIR/stdin"
+[ -t 0 ] || cfg="$(cat)"
+printf '%s\n' "$cfg" >>"$STUB_DIR/stdin"
+[ -z "$hdr" ] || : >"$hdr"
 case "$url" in
-  */dispatches) : >"$out"; printf '%s' "${STUB_DISPATCH_CODE:-204}" ;;
-  */repos/*) printf '{"name":"r","default_branch":"trunk"}' >"$out"; printf 200 ;;
-  *) printf 404 ;;
+  */dispatches) : >"$out"; printf '%s' "${STUB_DISPATCH_CODE:-204}"; exit 0 ;;
+  */repos/*) ;;
+  *) printf 404; exit 0 ;;
+esac
+if [[ "$cfg" == *app-SECRET-77c1* ]] && [ -s "$STUB_DIR/probes" ]; then
+  answer="$(head -n 1 "$STUB_DIR/probes")"
+  tail -n +2 "$STUB_DIR/probes" >"$STUB_DIR/probes.next"
+  mv "$STUB_DIR/probes.next" "$STUB_DIR/probes"
+fi
+case "$answer" in
+  '403 '*)
+    printf 'HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: %s\r\n\r\n' "${answer#403 }" >"$hdr"
+    printf '{"message":"API rate limit exceeded for installation ID 1."}' >"$out"; printf 403 ;;
+  403plain) printf '{"message":"Resource not accessible by integration"}' >"$out"; printf 403 ;;
+  *) printf '{"name":"r","default_branch":"trunk"}' >"$out"; printf 200 ;;
 esac
 STUB
   chmod +x "$d/bin/sleep" "$d/bin/curl"
@@ -1188,35 +1209,63 @@ STUB
     (
       export STUB_DIR="$d" PATH="$d/bin:$PATH" GITHUB_REPOSITORY=o/r \
         GITHUB_API_URL=https://api.test DISPATCH_TOKEN=tok-SECRET-9f3a \
-        RECOVER_WORKFLOW=merge-lane-events.yml DEFAULT_BRANCH=main APP_RESET='' \
-        STUB_DISPATCH_CODE=204
+        APP_TOKEN=app-SECRET-77c1 RECOVER_WORKFLOW=merge-lane-events.yml \
+        DEFAULT_BRANCH=main STUB_DISPATCH_CODE=204
       for kv in "$@"; do export "${kv?}"; done
       bash "$s" dispatch
     ) >/dev/null 2>&1
   }
+  probes() { printf '%s\n' "$@" >"$d/probes"; } # <answer>... — the next run's probe answers
+  slept() { tr '\n' ' ' <"$d/slept" 2>/dev/null; }
+  dispatched() { grep -c '/dispatches' "$d/curl" 2>/dev/null; }
   res() { if [ "$2" -eq 0 ]; then echo "PASS $1"; else echo "FAIL $1"; fi; }
   now=$(date -u +%s)
 
-  rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(cat "$d/slept" 2>/dev/null)" = 60 ] \
+  # The quota answers at once: the floor, one probe, one dispatch.
+  : >"$d/probes"; rrun; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ] \
     && grep -q 'repos/o/r/actions/workflows/merge-lane-events.yml/dispatches' "$d/curl" \
     && grep -qF -- '-d {"ref":"main","inputs":{"recovered":"true"}}' "$d/curl"
   res recover-floor-then-one-dispatch $?
 
-  rrun "APP_RESET=$((now + 300))"; rc=$?
-  w=$(cat "$d/slept" 2>/dev/null)
-  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 300 ] && [ "${w:-0}" -le 320 ]
-  res recover-waits-for-the-window $?
+  # A refusal whose reset is an hour off is asked again every 60s — its header
+  # can be as wrong as `/rate_limit` was — and the dispatch goes the moment a
+  # probe answers.
+  probes "403 $((now + 3600))" "403 $((now + 3600))" 200; rrun; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 60 60 ' ] && [ "$(dispatched)" = 1 ]
+  res recover-reprobes-until-answered $?
 
-  rrun "APP_RESET=$((now + 5000))"
-  [ "$(cat "$d/slept" 2>/dev/null)" = 900 ]
+  # A refusal whose own reset is sooner than the interval is waited out to it.
+  probes "403 $((now + 10))" 200; rrun; rc=$?
+  w=$(sed -n 2p "$d/slept" 2>/dev/null)
+  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 1 ] && [ "${w:-0}" -le 15 ] && [ "$(dispatched)" = 1 ]
+  res recover-follows-the-refusals-reset $?
+
+  # Refused throughout: 900s in all, then the dispatch is made anyway.
+  : >"$d/probes"
+  for i in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
+  rrun; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]
   res recover-wait-is-capped $?
 
+  # A refusal that is not a rate limit ends the wait: waiting would not change it.
+  probes 403plain; rrun; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ]
+  res recover-other-refusal-ends-the-wait $?
+
+  # An unset default branch is read: from the probe's own answer when it had
+  # one, else with the repository's token after a wait that never got one.
+  : >"$d/probes"; rrun DEFAULT_BRANCH=
+  grep -qF -- '-d {"ref":"trunk","inputs":{"recovered":"true"}}' "$d/curl" \
+    && [ "$(grep -c 'api.test/repos/o/r$' "$d/curl")" = 1 ]
+  rc=$?
+  : >"$d/probes"
+  for i in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
   rrun DEFAULT_BRANCH=
-  grep -qF -- '-d {"ref":"trunk","inputs":{"recovered":"true"}}' "$d/curl"
+  [ "$rc" -eq 0 ] && grep -qF -- '-d {"ref":"trunk","inputs":{"recovered":"true"}}' "$d/curl"
   res recover-reads-the-default-branch $?
 
-  rrun STUB_DISPATCH_CODE=403; rc=$?
+  : >"$d/probes"; rrun STUB_DISPATCH_CODE=403; rc=$?
   [ "$rc" -ne 0 ]
   res recover-refusal-is-red $?
 
@@ -1224,11 +1273,17 @@ STUB
   [ "$rc" -ne 0 ] && [ ! -e "$d/curl" ]
   res recover-workflow-name-checked $?
 
-  # The token reaches curl on stdin, never in argv where `ps` shows it.
-  rrun
-  ! grep -qF -- tok-SECRET-9f3a "$d/curl" && grep -qF -- tok-SECRET-9f3a "$d/stdin" \
-    && grep -qF -- 'Authorization: Bearer tok-SECRET-9f3a' "$d/stdin"
-  res recover-token-not-in-argv $?
+  rrun APP_TOKEN=; rc=$?
+  [ "$rc" -ne 0 ] && [ ! -e "$d/curl" ]
+  res recover-needs-the-app-token $?
+
+  # Both tokens reach curl on stdin, never in argv where `ps` shows them; the
+  # probe asks with the App's, the dispatch writes with the repository's.
+  : >"$d/probes"; rrun
+  ! grep -qF -- SECRET "$d/curl" \
+    && [ "$(grep -m1 'Authorization' "$d/stdin")" = 'header = "Authorization: Bearer app-SECRET-77c1"' ] \
+    && [ "$(grep 'Authorization' "$d/stdin" | tail -n 1)" = 'header = "Authorization: Bearer tok-SECRET-9f3a"' ]
+  res recover-tokens-not-in-argv $?
 
   rm -rf "$d"
 }
@@ -2511,7 +2566,7 @@ counts_the_checks_before_the_detail_read() {
   code="$(code_of "$1")"
   matches "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' || return 1
   before "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' 'mapfile -t detail_lines' || return 1
-  before "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' 'commits/\$sha" --jq .\.commit\.committer\.date' || return 1
+  before "$code" '^    if lane_settled_red "\$green" "\$missing" "\$failed" "\$pending"; then$' '^      age=\$\(\(now - activity\)\)$' || return 1
   before "$code" 'counted_sha="\$sha"$' '^    if lane_settled_red '
 }
 dismisses_only_what_the_rule_refuses() {
@@ -3009,6 +3064,9 @@ behavioural_check_counts_cases() {
     # shellcheck disable=SC2034  # Read (and set) by the evalled `check_counts`.
     LANE_FATAL=0
     got="$(check_counts 0000000000000000000000000000000000000000 2>"$fix/err.txt")"
+    # A four-field want asserts the counts alone; the fifth field, the in-flight
+    # clock, is asserted by the cases that spell it out.
+    if [ "$(wc -w <<<"$want")" -eq 4 ]; then got="${got% *}"; fi
     if [ "$got" = "$want" ]; then
       printf 'PASS %s\n' "$desc"
     else
@@ -3239,6 +3297,15 @@ behavioural_check_counts_cases() {
     'CI summary (rollup)' \
     "{\"check_suites\":[$(_bh_suite 60 github-actions completed 2026-09-01T06:00:00Z)]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 60)]}"
+
+  # THE IN-FLIGHT CLOCK (the fifth field): the newest thing that happened to the
+  # head's checks. A run's finish is newer than its suite's creation...
+  case_ "the in-flight clock is the newest check-run event on the head"     "1 0 0 0 $(date -u -d 2026-09-01T07:00:00Z +%s)"     'CI summary (rollup)'     "{\"check_suites\":[$(_bh_suite 60 github-actions completed 2026-09-01T06:00:00Z)]}"     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 60)]}"
+  # ...and a suite created later still moves it, even one that holds nothing:
+  # a re-run that has just been asked for is activity, not silence.
+  case_ "a check_suite created after the last run moves the in-flight clock"     "1 0 0 0 $(date -u -d 2026-09-01T09:00:00Z +%s)"     'CI summary (rollup)'     "{\"check_suites\":[$(_bh_suite 60 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 61 google-cloud-build queued 2026-09-01T09:00:00Z)]}"     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T07:00:00Z"' github-actions 60)]}"
+  # A head nothing ever reported on has no clock at all, and is never dropped.
+  case_ "a head with no check activity has no in-flight clock"     "0 1 0 0 -"     'CI summary (rollup)'     '{"check_suites":[]}'     '{"check_runs":[]}'
 
   # 12. THE DEAD FALLBACK ITSELF (ci-runner-infra#961 follow-up, Copilot
   #     review). `.app.id | tostring` on a null id is the literal string
@@ -3634,7 +3701,7 @@ mutate "the wait no longer sleeps" "$DRIVER" \
 mutate "the cap grows past the default budget" "$DRIVER" \
   's@^CLOCK_WAIT_CAP=.*@CLOCK_WAIT_CAP=900@' cap_fits_the_default_budget
 
-check recovers_a_failed_pass "$CALLEE" "a failed lane pass is not followed by exactly one dispatched pass after the App's window, so every pull request that went green during it waits for an unrelated CI completion"
+check recovers_a_failed_pass "$CALLEE" "a failed lane pass is not followed by exactly one dispatched pass as soon as a probe with its own App token stops being rate limited, so every pull request that went green during it waits for an unrelated CI completion"
 check documented_callers_grant_the_dispatch "$DOC" "the documented callers do not grant actions: write, so a consumer who copies them gets a recover job that is refused with a 403"
 mutate "a cancelled (evicted) lane run is recovered" "$CALLEE" \
   "s@needs\.lane\.result == 'failure'@needs.lane.result != 'success'@" recovers_a_failed_pass
@@ -3652,26 +3719,36 @@ mutate "the dispatch is made with the App's exhausted token" "$CALLEE" \
   's@DISPATCH_TOKEN: \${{ github\.token }}@DISPATCH_TOKEN: ${{ secrets.app-private-key }}@' recovers_a_failed_pass
 mutate "the recover job may not dispatch" "$CALLEE" \
   's@^      actions: write$@      actions: read@' recovers_a_failed_pass
-mutate "the window is never read" "$CALLEE" \
-  's@^          APP_RESET: .*@          APP_RESET: ""@' recovers_a_failed_pass
+mutate "the probe is made with the repository's token, whose quota is not the App's" "$CALLEE" \
+  's@^          APP_TOKEN: .*@          APP_TOKEN: ${{ github.token }}@' recovers_a_failed_pass
+mutate "the recover job mints no App token" "$CALLEE" \
+  '/^  recover:$/,$s|^        uses: actions/create-github-app-token@.*|        uses: actions/github-script@v7|' recovers_a_failed_pass
+mutate "the lane job reads the /rate_limit window again" "$CALLEE" \
+  's@^        run: bash scripts/ci/merge-lane\.sh$@        run: bash scripts/ci/merge-lane.sh \&\& bash scripts/ci/merge-lane-recover.sh read-reset@' recovers_a_failed_pass
 mutate "the recover-workflow input is ignored" "$CALLEE" \
   's@^          RECOVER_WORKFLOW: .*@          RECOVER_WORKFLOW: merge-lane-events.yml@' recovers_a_failed_pass
 mutate "a caller example drops the grant" "$DOC" \
   '0,/^      actions: write$/{/^      actions: write$/d}' documented_callers_grant_the_dispatch
 
 _rc_out="$(recover_cases "$RECOVER")"
-[ "$(printf '%s\n' "$_rc_out" | grep -c '^PASS ')" -eq 7 ] || bad "recover cases: expected 7 PASS lines, got: $(printf '%s' "$_rc_out" | tr '\n' ' ')"
+[ "$(printf '%s\n' "$_rc_out" | grep -c '^PASS ')" -eq 10 ] || bad "recover cases: expected 10 PASS lines, got: $(printf '%s' "$_rc_out" | tr '\n' ' ')"
 while IFS= read -r _rc_line; do
   case "$_rc_line" in
     PASS\ *) ok ;;
     FAIL\ *) bad "behavioural merge-lane-recover: ${_rc_line#FAIL }" ;;
   esac
 done <<<"$_rc_out"
-recover_mutant "the wait has no floor" 's@^RECOVER_MIN_WAIT=60$@RECOVER_MIN_WAIT=0@' recover-floor-then-one-dispatch
-recover_mutant "the window is ignored" 's@^    w=\$((reset - now + 5))$@    :@' recover-waits-for-the-window
+recover_mutant "the wait has no floor" 's@^RECOVER_MIN_WAIT=30$@RECOVER_MIN_WAIT=0@' recover-floor-then-one-dispatch
+recover_mutant "a refusal is not asked again for 15 minutes" 's@^RECOVER_PROBE_EVERY=60$@RECOVER_PROBE_EVERY=900@' recover-reprobes-until-answered
+recover_mutant "the refusal's own reset is ignored" 's@^    w=\$((reset - now + 1))$@    :@' recover-follows-the-refusals-reset
 recover_mutant "the wait is uncapped" 's@^RECOVER_MAX_WAIT=900$@RECOVER_MAX_WAIT=99999@' recover-wait-is-capped
-recover_mutant "an unset default branch is not looked up" 's@^  if \[ -z "\$ref" \]; then$@  ref="${ref:-main}"; if false; then@' recover-reads-the-default-branch
-recover_mutant "the token goes back into curl argv" 's@-X "$method" --config -$@-X "$method" -H "Authorization: Bearer $DISPATCH_TOKEN"@' recover-token-not-in-argv
+recover_mutant "every 403 is read as a rate limit" "s@^    403) grep -qi 'rate limit' \"\\\$RECOVER_BODY\" ;;\$@    403) return 0 ;;@" recover-other-refusal-ends-the-wait
+recover_mutant "every answer is read as a rate limit" 's@^    \*) return 1 ;;$@    *) return 0 ;;@' recover-floor-then-one-dispatch
+recover_mutant "the probe's answer is not used for the default branch" 's@^  if \[ -z "\$ref" \] && \[ "\$code" = 200 \]; then ref=.*@  :@' recover-reads-the-default-branch
+recover_mutant "an unset default branch is not looked up after a refused wait" 's@^  if \[ -z "\$ref" \]; then$@  ref="${ref:-main}"; if false; then@' recover-reads-the-default-branch
+recover_mutant "the probe asks with the repository's token" 's@^    code="\$(api "\$APP_TOKEN" GET@    code="$(api "$DISPATCH_TOKEN" GET@' recover-tokens-not-in-argv
+recover_mutant "the token goes back into curl argv" 's@-X "$method" --config -$@-X "$method" -H "Authorization: Bearer $token" --config -@' recover-tokens-not-in-argv
+recover_mutant "the recovery runs without an App token" 's@^  \[ -n "\${APP_TOKEN:-}" \] || die .*@  :@' recover-needs-the-app-token
 recover_mutant "the dispatch no longer marks its pass" 's@,\\"inputs\\":{\\"recovered\\":\\"true\\"}@@' recover-floor-then-one-dispatch
 recover_mutant "a refused dispatch ends green" 's@^  if \[ "\$code" != 204 \]; then$@  if false; then@' recover-refusal-is-red
 recover_mutant "any workflow name is posted" 's@^  \[\[ "\$wf" =~ .*@  :@' recover-workflow-name-checked

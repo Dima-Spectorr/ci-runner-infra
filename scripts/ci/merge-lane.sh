@@ -501,7 +501,11 @@ lane_report_wait || true
 # ---------------------------------------------------------------------------
 # check_counts <sha> — how the required checks stand on exactly this commit.
 #
-# Prints "green missing failed pending".
+# Prints "green missing failed pending activity". `activity` is the epoch of the
+# newest thing that happened to this commit's checks — a check-run started or
+# finished, a status updated, a check_suite created — or `-` when nothing ever
+# did. It is the in-flight clock: see "THE IN-FLIGHT CLOCK" where the walk reads
+# it. Read from the same three answers as the counts, so it costs no call.
 #
 # Both surfaces are read. GitHub Actions reports check-runs, but a required
 # context can equally be a legacy commit STATUS, and a lane that only knew about
@@ -540,7 +544,7 @@ lane_report_wait || true
 # `mergify-nudge` documents the same truncation for the same endpoint.
 check_counts() {
   local sha="$1"
-  local runs statuses suites suites_json all name_auth auth_filtered
+  local runs statuses suites suites_json all name_auth auth_filtered activity
 
   # `|| true` DOES NOT MEAN "NO DATA". `gh api` writes the error BODY to
   # STDOUT on a non-2xx, so a swallowed failure does not leave the stream
@@ -1092,7 +1096,16 @@ check_counts() {
     echo "lane: $sha — required and SKIPPED, counted as passing: $(
       IFS=', '; echo "${were_skipped[*]}")" >&2
   fi
-  echo "$green $missing $failed $pending"
+  # ISO-8601 in GitHub's one shape (`...Z`, no fraction) sorts as text, so the
+  # newest is the lexicographic max. `try` because a malformed date must cost the
+  # clock, never the counts.
+  activity="$(printf '%s
+%s
+' "$runs" "$statuses" | jq -rs --argjson suites "${suites_json:-[]}"     '[(.[] | select(type == "object") | .at // ""), ($suites[] | .created_at // "")]
+     | map(select(type == "string" and . != "")) | max // empty
+     | try fromdateiso8601 catch empty' 2>/dev/null)" || activity=''
+  [[ "$activity" =~ ^[0-9]+$ ]] || activity='-'
+  echo "$green $missing $failed $pending $activity"
 }
 
 # ---------------------------------------------------------------------------
@@ -1481,7 +1494,7 @@ lane_base_is_broken() {
   local LANE_STATE_SINK="$LANE_BASE_STATES"
   : >"$LANE_BASE_STATES"
   counts="$(check_counts "$base_sha")"
-  read -r green missing failed pending <<<"$counts"
+  read -r green missing failed pending _ <<<"$counts"
   # Classified from the same counts, and ordered by which fact outranks which.
   # A failure outranks everything. A check still running outranks a green one,
   # because the question is about the tip as a whole and one unanswered name
@@ -2074,12 +2087,12 @@ lane_walk() {
       continue
     fi
 
-    local counts green missing failed pending head_states="$LANE_TMP/head-states" counted_sha="$sha"
+    local counts green missing failed pending activity head_states="$LANE_TMP/head-states" counted_sha="$sha"
     : >"$head_states"
     # On a red base the same read also records each name's state, so the
     # base-fix test reuses it instead of reading the head again (#1443).
     counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
-    read -r green missing failed pending <<<"$counts"
+    read -r green missing failed pending activity <<<"$counts"
 
     if lane_settled_red "$green" "$missing" "$failed" "$pending"; then
       # Asked of the rule itself rather than spelled here, with the unread
@@ -2121,7 +2134,7 @@ lane_walk() {
     # removed, or a commit pushed, in the seconds between the list and this
     # point should be seen. The list copies are the CHEAP filter above; these
     # are the authoritative ones.
-    local detail_lines=() mergeable labels title behind age headdate
+    local detail_lines=() mergeable labels title behind age
     mapfile -t detail_lines < <(gh api "repos/$R/pulls/$num" \
       --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha, .title')
     if [ "${#detail_lines[@]}" -ne 4 ]; then
@@ -2237,18 +2250,6 @@ lane_walk() {
       behind_cell="$behind"
     fi
 
-    # The in-flight clock, and the only one available without storing state:
-    # when this head commit was written. `lane_verdict` only allows it to expire
-    # an entry that still has something outstanding, precisely because by this
-    # clock a patient pull request looks ancient.
-    headdate="$(gh api "repos/$R/commits/$sha" --jq '.commit.committer.date' 2>/dev/null || echo '')"
-    if [ -n "$headdate" ]; then
-      age=$((now - $(date -u -d "$headdate" +%s)))
-      [ "$age" -ge 0 ] || age=0
-    else
-      age=''
-    fi
-
     # THE MERGE IS DECIDED ON THE HEAD THE DETAIL READ RETURNED. The checks were
     # counted above on the list's copy of the head sha; if a commit was pushed
     # in the seconds between the two reads, those counts describe a head that
@@ -2257,7 +2258,30 @@ lane_walk() {
       echo "lane: #$num head moved since the list read (${counted_sha:0:8} → ${sha:0:8}) — counting its checks again on the new head"
       : >"$head_states"
       counts="$(LANE_STATE_SINK="${LANE_BASE_RED:+$head_states}" check_counts "$sha")"
-      read -r green missing failed pending <<<"$counts"
+      read -r green missing failed pending activity <<<"$counts"
+    fi
+
+    # THE IN-FLIGHT CLOCK: SECONDS SINCE THIS HEAD'S CHECKS LAST MOVED.
+    #
+    # It was the head commit's committer date, which measures how old the
+    # COMMIT is, not how long its checks have been stuck — and it cost a call
+    # per pull request per pass. Measured on IntegrateIT 2026-10-09..11: 33
+    # `drop:budget-exceeded` notices in 48h, 27 of them at 2402-2837s against a
+    # 2400s budget, on pull requests whose CI was still running. #25450 was
+    # pushed 06:37, waited 27 minutes for a runner, went green at 07:20 and was
+    # dropped at 07:18. A pull request whose shards are still starting and
+    # finishing is not stuck, however old its commit is. What the budget exists
+    # for — a re-run that never reports, a lost runner — is SILENCE, so the
+    # clock is the time since the newest check-run start or finish, status
+    # update or check_suite creation on this head (`activity`, read by
+    # `check_counts` from the answers it already had). A commit with nothing
+    # at all on it has no clock and is never dropped; it shows `missing` in
+    # the queue instead.
+    if [[ "$activity" =~ ^[0-9]+$ ]]; then
+      age=$((now - activity))
+      [ "$age" -ge 0 ] || age=0
+    else
+      age=''
     fi
 
     local isdraft=0
