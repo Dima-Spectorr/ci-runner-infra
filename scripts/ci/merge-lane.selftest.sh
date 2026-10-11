@@ -1167,7 +1167,7 @@ documented_callers_grant_the_dispatch() {
 # `x-ratelimit-reset` header) or `403plain` (a 403 that is not one) — and `200`
 # once the list runs out. Prints `PASS <id>` / `FAIL <id>`.
 recover_cases() { # <script>
-  local s="$1" d now rc w i
+  local s="$1" d now rc w
   d=$(mktemp -d)
   mkdir "$d/bin"
   printf '#!/bin/sh\necho "$1" >>"$STUB_DIR/slept"\n' >"$d/bin/sleep"
