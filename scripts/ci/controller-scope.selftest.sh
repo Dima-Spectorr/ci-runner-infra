@@ -1878,6 +1878,7 @@ check "adopt mutation: not adopting is the incident again" \
 _tick=$(fn tick_pool)
 _n() { printf '%s\n' "$_tick" | grep -n "$1" | head -1 | cut -d: -f1; }
 _fgt=$(_n '^  forget_restarted_hosts$'); _adp=$(_n '^  adopt_flagged_cordons$')
+# shellcheck disable=SC2016
 _cnt=$(_n 'recycling=\$(find ')
 if [ -n "$_fgt" ] && [ -n "$_adp" ] && [ -n "$_cnt" ] && [ "$_fgt" -lt "$_adp" ] && [ "$_adp" -lt "$_cnt" ]; then r=yes
 else r="forget=$_fgt adopt=$_adp count=$_cnt"; fi
@@ -1929,11 +1930,15 @@ check "skips: one event with every reason, zeros included" \
   "$(skips_event)"
 # Emitted once, after the walk, and fed by EVERY skip — not only the ones the
 # ci_recycle_verdicts series counts (those are gated on a non-current template).
+# shellcheck disable=SC2016
 _walk_end=$(printf '%s\n' "$_tick" | grep -n '^  done <<<"\$HOSTS"$' | tail -1 | cut -d: -f1)
+# shellcheck disable=SC2016
 _emit=$(_n '^  recycle_skips_event "\$walked" skip_tally$')
 [ -n "$_walk_end" ] && [ -n "$_emit" ] && [ "$_emit" -gt "$_walk_end" ] && r=yes || r="walk_end=$_walk_end emit=$_emit"
 check "skips: the summary is emitted once per pool, after the walk" yes "$r"
+# shellcheck disable=SC2016
 _tally=$(printf '%s\n' "$_tick" | grep -n 'skip_tally\["\$skip_reason"\]=' | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016
 _gate=$(printf '%s\n' "$_tick" | grep -n 'if \[ "\$tpl" != "current" \] || \[ "\$HOST_REG" = "partial" \]; then' | head -1 | cut -d: -f1)
 [ -n "$_tally" ] && [ -n "$_gate" ] && [ "$_tally" -lt "$_gate" ] && r=yes || r="tally=$_tally gate=$_gate"
 check "skips: every skip is tallied, outside the template gate" yes "$r"
@@ -1941,9 +1946,9 @@ check "skips: every skip is tallied, outside the template gate" yes "$r"
 # gh_token's hour-long cache only survives if the tick primes it in the parent
 # shell — every caller reads it in a `$(...)` subshell (#1537).
 _tk=$(fn tick)
-printf '%s\n' "$_tk" | grep -q '^  gh_token_prime$' && r=yes || r=no
+printf '%s\n' "$_tk" | grep -c '^  gh_token_prime$' >/dev/null && r=yes || r=no
 check "token: tick primes the cache in the parent shell" yes "$r"
-printf '%s\n' "$_tick" | grep -q '^  gh_token_prime$' && r=yes || r=no
+printf '%s\n' "$_tick" | grep -c '^  gh_token_prime$' >/dev/null && r=yes || r=no
 check "token: tick_pool re-primes it" yes "$r"
 _prime() {
   bash -c "
