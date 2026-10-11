@@ -235,11 +235,11 @@ check "sweep: the controller really carries the scoping guard" yes "$r"
 
 # --- 3. the recycle budget is this pool's, not the controller's ---------------
 #
-# `find -name 'cordon-*'` counts every pool's cordons. With four pools rolling
-# out at once and a budget of one, three of them never start.
-grep -qF "find \"\$STATE_DIR\" -maxdepth 1 -name \"cordon-\$MIG_BASE-*\"" "$CTRL" &&
+# `find -name 'cordon-*'` counts every pool's cordons and reservations. With
+# four pools rolling out at once and a budget of one, three of them never start.
+grep -qF "find \"\$STATE_DIR\" -maxdepth 1 \\( -name \"cordon-\$MIG_BASE-*\" -o -name \"reserve-\$MIG_BASE-*\" \\)" "$CTRL" &&
   r=yes || r=no
-check "recycle: the cordon count is scoped to this pool's MIG" yes "$r"
+check "recycle: the cordon and reserve count is scoped to this pool's MIG" yes "$r"
 
 # No base name means the budget reads FULLY SPENT. A pool that cannot count its
 # own cordons must not start new ones — the failure mode of the opposite choice
@@ -285,7 +285,7 @@ legacy=$(
   printf '%s' "$POOLS_JSON" | pool_table_parse 2>/dev/null | tr '\t' '|'
 )
 check "legacy: one row, and every absent key took its default" \
-  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false" \
+  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false|3" \
   "$legacy"
 
 # --- 5. `background` is in the LINUX pool's match set only (#1533) ------------
