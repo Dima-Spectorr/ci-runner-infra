@@ -99,7 +99,7 @@ columns=$(
       tr -d '(. ='
   } | sort -u
 )
-check "the parser still declares seventeen columns" 17 \
+check "the parser still declares eighteen columns" 18 \
   "$(printf '%s\n' "$columns" | grep -c .)"
 
 # `value = {` inside the pool_descriptor output, keys only.
