@@ -52,6 +52,13 @@ variable "name" {
     condition     = !startswith(var.name, "ci-shared-infra-")
     error_message = "name must not start with \"ci-shared-infra-\" — that prefix is reserved for the tags shared_infra_id mints, and a pool wearing one joins that pair's firewall rules as a source or a target."
   }
+
+  validation {
+    # The pool name is always published as a runner label (main.tf
+    # `runner_labels`), so this name would put the reserved label on every slot.
+    condition     = lower(var.name) != "background"
+    error_message = "name may not be `background`: the pool name is added as a runner label on every slot, and `background` is reserved for the lower slots that push runs use."
+  }
 }
 
 variable "instance_base_name" {
@@ -775,6 +782,14 @@ variable "runner_labels" {
   validation {
     condition     = alltrue([for l in var.runner_labels : lower(l) != "background"])
     error_message = "runner_labels may not contain `background`: the host adds that label to its lower slots only, so pull-request jobs keep the top slots. Configured on the pool it would reach every slot and push runs would take the slots PR jobs are waiting for."
+  }
+
+  validation {
+    # The list is joined with commas into ONE `config.sh --labels` argument, so
+    # an entry like "x,background" would smuggle a reserved label past the
+    # per-entry checks above.
+    condition     = alltrue([for l in var.runner_labels : !strcontains(l, ",") && trimspace(l) == l && l != ""])
+    error_message = "runner_labels entries may not be empty or contain commas or surrounding whitespace: the list is joined with commas into one label argument, so a comma would split one entry into several labels."
   }
 }
 

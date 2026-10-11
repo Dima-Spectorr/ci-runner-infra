@@ -172,7 +172,9 @@ case "$SLOTS" in
   '' | *[!0-9]*) die "ci-slots metadata is '$SLOTS', not a whole number" ;;
 esac
 [ "$INTERACTIVE_SLOTS" -lt "$SLOTS" ]   || die "ci-interactive-slots ($INTERACTIVE_SLOTS) leaves none of this host's $SLOTS slot(s) for background work -- push runs would queue forever"
-BACKGROUND_SLOTS=$((SLOTS - INTERACTIVE_SLOTS))
+# Base 10 explicitly: a hand-edited `010` passes the digit check above and
+# bash arithmetic would otherwise read it as octal.
+BACKGROUND_SLOTS=$((10#$SLOTS - 10#$INTERACTIVE_SLOTS))
 
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   die "missing ci-github-owner/ci-github-repo metadata"
