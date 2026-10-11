@@ -52,6 +52,13 @@ locals {
   # dashboard can group by either without per-repo dashboard code.
   repo_full = "${var.github_owner}/${var.github_repo}"
 
+  # How many jobs the autoscaler buys ONE host for — its
+  # single_instance_assignment. Floored at 1 (see the autoscaler). Carried to the
+  # controller in the pool table, because recycle_surge_demand() must speak the
+  # autoscaler's unit exactly: a recycling host is published as one host's worth
+  # of demand, and the max_hosts cap is max_hosts of these.
+  jobs_per_host = max(1, var.slots_per_host - var.autoscaler_headroom_slots)
+
   common_labels = merge(var.labels, {
     component = "ci-runner-host-pool"
     pool      = var.name
@@ -803,8 +810,32 @@ resource "google_compute_region_autoscaler" "hosts" {
   target  = google_compute_region_instance_group_manager.hosts.id
 
   autoscaling_policy {
-    min_replicas    = var.min_hosts
-    max_replicas    = var.max_hosts
+    min_replicas = var.min_hosts
+
+    # max_hosts PLUS THE RECYCLE SURGE, and the controller — not this number —
+    # is what holds normal operation at max_hosts.
+    #
+    # A host being replaced (stale template, lost capacity) is RESERVED and then
+    # cordoned: from the moment it is reserved it is worth one host carrying its
+    # own jobs and nothing more, so the controller's ci_demand asks for its
+    # replacement at once (recycle_surge_demand in recycle-decision.sh). With
+    # this ceiling at max_hosts, a pool already AT max_hosts — the one with the
+    # backlog, the one that needs it most — could buy nothing: measured
+    # 2026-10-11, a 20-host pool ran a two-hour rollout with four hosts' worth
+    # of slots missing while runs queued.
+    #
+    # Why a static ceiling and not one the controller raises at runtime: a
+    # runtime patch is state Terraform fights on the next apply, and one that a
+    # controller dying mid-rollout leaves raised for ever. A static ceiling of
+    # max_hosts + recycle_max_unavailable cannot be stranded, and it cannot be
+    # used outside a recycle either: the controller caps the shared part of
+    # ci_demand at max_hosts hosts, so only hosts in the recycle set — at most
+    # recycle_max_unavailable of them — ever take the pool above max_hosts, and
+    # each retire lowers the MIG's target again. A controller that stops
+    # publishing leaves an ONLY_UP autoscaler holding its size, as before.
+    #
+    # recycle_max_unavailable = 0 still means no recycling and no surge.
+    max_replicas    = var.max_hosts + var.recycle_max_unavailable
     cooldown_period = var.cooldown_period_sec
 
     # ONLY_UP is deliberate and is NOT the mistake that pinned an earlier pool
@@ -836,7 +867,10 @@ resource "google_compute_region_autoscaler" "hosts" {
       # Floored at 1: headroom at or above slots_per_host would tell the
       # autoscaler a host serves no jobs, and an assignment of 0 is a division
       # by zero the API rejects — a pool that then has no scaling policy at all.
-      single_instance_assignment = max(1, var.slots_per_host - var.autoscaler_headroom_slots)
+      #
+      # Named once in locals: the controller needs the SAME number to express a
+      # recycling host as one host's worth of demand.
+      single_instance_assignment = local.jobs_per_host
     }
 
     dynamic "scaling_schedules" {
@@ -967,6 +1001,9 @@ resource "google_compute_instance_template" "controller" {
     "ci-register-grace-seconds"  = tostring(var.register_grace_seconds)
     "ci-orphan-confirm-ticks"    = tostring(var.orphan_confirm_ticks)
     "ci-recycle-max-unavailable" = tostring(var.recycle_max_unavailable)
+    # The autoscaler's single_instance_assignment, so the controller can publish
+    # a recycling host as exactly one host's worth of demand.
+    "ci-jobs-per-host" = tostring(local.jobs_per_host)
     # Whether a cordon also tells the host to stop its own idle agents, which is
     # what stops the held slot being handed another job (#948). Rendered as the
     # literal "true"/"false" the pool table compares against, never as a bare

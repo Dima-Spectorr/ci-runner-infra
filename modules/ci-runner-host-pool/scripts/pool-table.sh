@@ -62,6 +62,9 @@
 #   16 runner_labels            comma-separated, exactly what the agents register
 #   17 recycle_cordon_stops_agents  true | false — whether a cordon also tells
 #                               the host to stop its own idle agents (#948)
+#   18 jobs_per_host            jobs one host absorbs (slots minus autoscaler
+#                               headroom); the controller converts hosts in a
+#                               make-before-break recycle into demand with it
 #
 # Echoes rows and returns 0 when at least one row is valid; returns 1 when the
 # document cannot be parsed at all or yields no valid row.
@@ -124,17 +127,19 @@ pool_table_parse() {
       # cordon taking every idle slot on the host down is not a wrong number, it
       # is capacity leaving the pool.
       (if (.recycle_cordon_stops_agents == true or .recycle_cordon_stops_agents == "true")
-       then "true" else "false" end)
+       then "true" else "false" end),
+      # Defaults to slots, the value the module renders when headroom is 0.
+      (.jobs_per_host // .slots // 1)
     ] | @tsv | gsub("\u001f"; " ")' 2>/dev/null | tr '\t' '\037') || {
     echo "reject::the pool table is not valid JSON" >&2
     return 1
   }
 
   local name mig region slots minh maxh grace reg_grace ticks recycle
-  local host_os mint role beacon pin labels cordon_stop
+  local host_os mint role beacon pin labels cordon_stop jph
   local kept=0 why
   while IFS=$'\037' read -r name mig region slots minh maxh grace reg_grace \
-    ticks recycle host_os mint role beacon pin labels cordon_stop; do
+    ticks recycle host_os mint role beacon pin labels cordon_stop jph; do
     [ -n "${name:-}" ] || continue
 
     # First reason wins, and every test is guarded on the ones before it, so a
@@ -188,7 +193,7 @@ pool_table_parse() {
     if [ -z "$why" ]; then
       local n
       for n in "$slots" "$minh" "$maxh" "$grace" "$reg_grace" "$ticks" \
-        "$recycle" "$beacon" "$pin"; do
+        "$recycle" "$beacon" "$pin" "$jph"; do
         case "${n:-}" in
           '' | *[!0-9]*) why="a numeric field is not a number ('${n:-}')"; break ;;
         esac
@@ -201,16 +206,21 @@ pool_table_parse() {
     if [ -z "$why" ] && [ "${slots:-0}" -lt 1 ]; then
       why="slots must be at least 1"
     fi
+    # Zero would make every host in a recycle worth no demand, so the surge
+    # that buys its replacement would never be published.
+    if [ -z "$why" ] && [ "${jph:-0}" -lt 1 ]; then
+      why="jobs_per_host must be at least 1"
+    fi
 
     if [ -n "$why" ]; then
       echo "reject:$name:$why" >&2
       continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$mig" "$region" "$slots" "$minh" "$maxh" "$grace" "$reg_grace" \
       "$ticks" "$recycle" "$host_os" "$mint" "$role" "$beacon" "$pin" "$labels" \
-      "$cordon_stop"
+      "$cordon_stop" "$jph"
     kept=$((kept + 1))
   done <<POOL_TABLE_EOF
 $rows

@@ -90,6 +90,28 @@
 # and 0 disables the whole mechanism, which is the kill switch a rule that
 # deletes machines has to have.
 #
+# MAKE BEFORE BREAK — THE REPLACEMENT IS BOUGHT BEFORE THE HOST IS CORDONED.
+#
+# Rolling bounded the loss; it did not remove it. Measured on a 20-host pool
+# with max_unavailable=4, 2026-10-11 03:20Z: four hosts cordoned with 2-3 jobs
+# each (one for 26+ minutes) while pull-request runs queued. The pool sat at
+# max_hosts, so the autoscaler could not add anything, and every idle slot the
+# cordons removed was simply gone — a two-hour rollout run four hosts short.
+#
+# So a busy host that qualifies is first RESERVED, not cordoned. A reservation
+# changes nothing on the host: it keeps every slot and keeps taking work. What
+# it changes is the pool's arithmetic. recycle_surge_demand() below counts a
+# host in the recycle set as ONE host carrying its own running jobs and nothing
+# more, so the demand the autoscaler reads asks for its replacement at once;
+# and the autoscaler's ceiling is max_hosts + recycle_max_unavailable, so a pool
+# already at max_hosts has room to buy it. Only once the reservation is older
+# than register_grace — the module's own bound on "a new host has booted and
+# registered" — is the old host cordoned. The replacement is serving before the
+# old host's idle slots leave, so the pool's capacity never dips below where it
+# started. The surge ends by itself: the retire deletes the old host, which
+# lowers the MIG's target, and with nothing left in the recycle set the demand
+# is capped at max_hosts again.
+#
 # The caller owns all I/O — GitHub, gcloud, the metadata server — so this rule
 # is exercised by scripts/ci/recycle-decision.selftest.sh instead of only in
 # production.
@@ -99,7 +121,7 @@
 # recycle_decision <instance_status> <template_state> <busy_slots> \
 #                  <registration_state> <age_seconds> <register_grace_seconds> \
 #                  <in_flight> <max_unavailable> <already_cordoned> \
-#                  <partial_for_seconds>
+#                  <partial_for_seconds> <reserved_for_seconds>
 #
 #   instance_status     : GCE instanceStatus. Only RUNNING is recycled; every
 #                         other state is drain_decision's business, and it
@@ -115,9 +137,12 @@
 #   age_seconds         : how long the controller has known this host.
 #   register_grace_seconds : how long `absent` is allowed to mean "still
 #                         booting".
-#   in_flight           : hosts already mid-recycle (cordoned, not yet gone).
+#   in_flight           : hosts already mid-recycle (reserved or cordoned, not
+#                         yet gone).
 #   max_unavailable     : how many may be mid-recycle at once. 0 = disabled.
-#   already_cordoned    : 1 if THIS host is one of the in_flight ones.
+#                         Also the surge: the autoscaler may run this many
+#                         hosts above max_hosts while they are replaced.
+#   already_cordoned    : 1 if THIS host is cordoned.
 #   partial_for_seconds : how long this host has read `partial` WITHOUT
 #                         INTERRUPTION. 0 when it is not partial now, and 0 for
 #                         a caller that does not track it -- which keeps this
@@ -125,8 +150,13 @@
 #                         ever", the same way max_unavailable=0 does. Compared
 #                         against max(register_grace, 960s); the floor is the
 #                         slot sweep's own worst case, derived at rule 2.
+#   reserved_for_seconds: how long THIS host has held a reservation — its
+#                         replacement requested, its slots still serving. -1
+#                         (the default) when it holds none. A reserved host is
+#                         one of the in_flight ones, like a cordoned one.
 #
-# Echoes "cordon:<reason>", "retire:<reason>" or "skip:<reason>". Always exits 0
+# Echoes "reserve:<reason>", "cordon:<reason>", "retire:<reason>" or
+# "skip:<reason>". Always exits 0
 # -- the verdict is the output, not the status, so a `set -e` caller cannot be
 # tripped by a skip.
 recycle_decision() {
@@ -140,6 +170,8 @@ recycle_decision() {
   local max_unavail="${8:-0}"
   local cordoned="${9:-0}"
   local partial_for="${10:-0}"
+  local reserved_for="${11:--1}"
+  case "$reserved_for" in -1) ;; '' | *[!0-9]*) reserved_for=-1 ;; esac
 
   # 0. Off. A mechanism that deletes machines on a schedule nobody triggered
   #    needs a switch that stops it without a rollback, and this is it.
@@ -253,19 +285,41 @@ recycle_decision() {
   # 5. Budget. Checked AFTER the safety rules and BEFORE the action, and skipped
   #    entirely for a host already mid-recycle: it is already counted in
   #    in_flight, and refusing to finish what we started would leave a cordoned
-  #    host — one with no idle slots and no way back — parked forever.
-  if [ "$cordoned" != "1" ] && [ "$in_flight" -ge "$max_unavail" ]; then
+  #    host — one with no idle slots and no way back — parked forever. A
+  #    reserved host is exempt for the same reason: its replacement is already
+  #    bought, and dropping it here would leave the surge paid for and the old
+  #    host never cordoned.
+  if [ "$cordoned" != "1" ] && [ "$reserved_for" -lt 0 ] &&
+    [ "$in_flight" -ge "$max_unavail" ]; then
     echo "skip:at-capacity in-flight=$in_flight>=max=$max_unavail"
     return 0
   fi
 
-  # 6. Still working. Cordon it — deregister the idle slots so no new job can
-  #    reach this host, and leave the busy ones alone; GitHub refuses those
-  #    anyway, and that refusal is the guarantee that nothing running is
-  #    interrupted. Re-issued every tick on purpose: it is idempotent, and a
-  #    slot whose deregistration failed once must not be the reason a host takes
-  #    another job.
+  # 6. Still working, so make before break.
+  #
+  #    Not reserved yet, or reserved for less than register_grace: RESERVE. The
+  #    host keeps every slot and keeps serving; the caller records the
+  #    reservation and the surge demand buys the replacement. register_grace is
+  #    the bound, not a new number, because it is already this module's answer
+  #    to "how long may a new host take to boot and register" — the same window
+  #    that decides `absent` means dead. A replacement that has not arrived by
+  #    then (a quota refusal, a zone out of capacity) is not waited on forever:
+  #    the cordon proceeds and the pool is one host short for one job length,
+  #    which is exactly what every recycle cost before this change.
+  #
+  #    Then CORDON — deregister the idle slots so no new job can reach this
+  #    host, and leave the busy ones alone; GitHub refuses those anyway, and
+  #    that refusal is the guarantee that nothing running is interrupted.
+  #    Re-issued every tick on purpose: it is idempotent, and a slot whose
+  #    deregistration failed once must not be the reason a host takes another
+  #    job. A host already cordoned stays cordoned whatever its reservation
+  #    says: a cordon is never walked back into a reservation, because its
+  #    deregistered slots do not come back.
   if [ "$busy" -gt 0 ]; then
+    if [ "$cordoned" != "1" ] && [ "$reserved_for" -lt "$reg_grace" ]; then
+      echo "reserve:$reason busy=$busy reserved_for=${reserved_for}s<${reg_grace}s"
+      return 0
+    fi
     echo "cordon:$reason busy=$busy"
     return 0
   fi
@@ -290,4 +344,83 @@ recycle_decision() {
   #    sequence; it does not authorise a bare delete.
   echo "retire:$reason reg=$reg cordoned=$cordoned"
   return 0
+}
+
+# recycle_surge_demand <demand_jobs> <recycling_hosts> <recycling_busy> \
+#                      <max_hosts> <jobs_per_host> [<min_hosts>]
+#
+# The demand the autoscaler should read, in JOBS, given the hosts mid-recycle.
+# Pure, like recycle_decision, and for the same reason.
+#
+#   demand_jobs     : queued + in-progress jobs this pool can serve.
+#   recycling_hosts : RUNNING hosts in the recycle set this tick - reserved or
+#                     cordoned, not retired.
+#   recycling_busy  : the jobs those hosts are executing, summed.
+#   max_hosts       : the pool's ceiling in normal operation.
+#   jobs_per_host   : the autoscaler's single_instance_assignment - how many
+#                     jobs it buys one host for (slots minus headroom, >= 1).
+#   min_hosts       : the warm floor (default 0).
+#
+# The autoscaler sizes the pool to ceil(demand / jobs_per_host). A host in the
+# recycle set is worth exactly ONE host to that arithmetic - it carries its own
+# running jobs and, once cordoned, takes nothing new - so its jobs come out of
+# the shared demand and it goes back in as one host's worth:
+#
+#   shared    = min(demand - recycling_busy, max_hosts * jobs_per_host)
+#   shared    = max(shared, min_hosts * jobs_per_host)   while recycling only
+#   published = shared + recycling_hosts * jobs_per_host
+#
+# ceil(published / jobs_per_host) is then recycling_hosts PLUS the hosts the
+# rest of the work needs: the replacements are bought while the old hosts still
+# stand. The warm floor joins the shared part only while something recycles, so
+# recycling the last warm host buys its replacement first instead of letting
+# the pool touch zero; with nothing recycling the autoscaler's own min_replicas
+# already holds that floor and the demand is left alone. The cap is on the
+# SHARED part only, so hosts outside the recycle set never exceed max_hosts and
+# the whole pool never exceeds max_hosts + recycling_hosts - which the
+# autoscaler's max_replicas (max_hosts + recycle_max_unavailable) bounds a
+# second time. With nothing recycling this is min(demand, max_hosts *
+# jobs_per_host): the controller now enforces max_hosts itself, because
+# max_replicas carries the surge headroom and is no longer it.
+#
+# Malformed recycle input degrades to the plain capped demand - never to a
+# number that buys hosts nobody asked for. Echoes one non-negative integer.
+recycle_surge_demand() {
+  local demand="${1:-0}" hosts="${2:-0}" busy="${3:-0}" maxh="${4:-0}" per="${5:-1}"
+  local minh="${6:-0}"
+  case "$demand" in '' | *[!0-9]*) demand=0 ;; esac
+  case "$maxh" in '' | *[!0-9]*) maxh=0 ;; esac
+  case "$minh" in '' | *[!0-9]*) minh=0 ;; esac
+  case "$per" in '' | *[!0-9]*) per=1 ;; esac
+  [ "$per" -ge 1 ] || per=1
+  case "$hosts$busy" in *[!0-9]*) hosts=0; busy=0 ;; esac
+  [ "$minh" -le "$maxh" ] || minh=$maxh
+
+  local shared=$((demand - busy))
+  [ "$shared" -lt 0 ] && shared=0
+  local cap=$((maxh * per))
+  [ "$shared" -gt "$cap" ] && shared=$cap
+  if [ "$hosts" -gt 0 ] && [ "$shared" -lt $((minh * per)) ]; then
+    shared=$((minh * per))
+  fi
+  echo $((shared + hosts * per))
+}
+
+# recycle_surge_floor <published_jobs> <jobs_per_host> <min_hosts>
+#
+# The fewest RUNNING hosts an idle drain may leave while a recycle is live:
+# ceil(published / jobs_per_host), never below min_hosts. This is the pool size
+# the autoscaler is being told to hold, so draining an idle host below it is
+# pure churn - the autoscaler reads the same surge on the next tick and buys
+# the host straight back. It is what keeps a replacement bought for a reserved
+# host alive until the host it replaces is gone. Echoes one integer.
+recycle_surge_floor() {
+  local pub="${1:-0}" per="${2:-1}" minh="${3:-0}"
+  case "$pub" in '' | *[!0-9]*) pub=0 ;; esac
+  case "$minh" in '' | *[!0-9]*) minh=0 ;; esac
+  case "$per" in '' | *[!0-9]*) per=1 ;; esac
+  [ "$per" -ge 1 ] || per=1
+  local want=$(((pub + per - 1) / per))
+  [ "$want" -lt "$minh" ] && want=$minh
+  echo "$want"
 }

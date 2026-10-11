@@ -331,7 +331,7 @@ variable "min_hosts" {
 }
 
 variable "max_hosts" {
-  description = "Ceiling of hosts. max_hosts * slots_per_host is the pool's real job concurrency."
+  description = "Ceiling of hosts. max_hosts * slots_per_host is the pool's real job concurrency. During a make-before-break recycle the pool may briefly run up to max_hosts + recycle_max_unavailable hosts; the controller caps demand at max_hosts, so it returns here when the rollout ends."
   type        = number
   default     = 4
 }
@@ -963,6 +963,18 @@ variable "recycle_max_unavailable" {
     a boot. Raise it only on a pool with headroom. Set it to 0 to switch the
     mechanism off — the kill switch is unchanged, it is just no longer the
     thing you get by saying nothing.
+
+    It is ALSO the surge: replacements are bought BEFORE old hosts leave (make
+    before break). A busy host due for recycling is first RESERVED — it keeps
+    serving while the controller publishes it as one extra host of demand,
+    which buys its replacement — and is cordoned only after register_grace, by
+    which time the replacement has registered. So while N hosts are mid-recycle
+    the pool may run up to max_hosts + N hosts: the autoscaler's max_replicas is
+    max_hosts + recycle_max_unavailable, and the controller itself caps the
+    shared demand at max_hosts, so the pool falls back to max_hosts as the old
+    hosts retire. No separate surge setting exists on purpose: the hosts that
+    may be out of service and the hosts that may be added for them are the same
+    number.
 
     Watch `ci_hosts_stale_template`: it climbs to the pool size when a release
     lands and falls back to zero as hosts are replaced. Stuck above zero means a

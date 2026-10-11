@@ -57,7 +57,7 @@ select_out=$(
 
   declare -A P_MIG P_REGION P_SLOTS P_MIN P_MAX P_GRACE P_REGGRACE P_TICKS
   declare -A P_RECYCLE P_HOST_OS P_MINT P_ROLE P_BEACON P_PIN P_LABELS
-  declare -A P_CORDON_STOP
+  declare -A P_CORDON_STOP P_JPH
   # D_EXPIRED is declared even though pool_select reads it as `${...:-0}`: an
   # associative subscript on a variable bash has never seen is parsed as
   # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
@@ -99,6 +99,9 @@ select_out=$(
   # belong to cordons one.
   P_CORDON_STOP[a]=true
   P_CORDON_STOP[b]=false
+  # Carried over, pool b would publish each recycling host as pool a's host size.
+  P_JPH[a]=3
+  P_JPH[b]=1
   P_MINT[a]=false
   P_MINT[b]=true
   D_TOTAL[a]=7
@@ -120,11 +123,11 @@ select_out=$(
   MIG_TEMPLATE="ci-lin-tpl-v5"
 
   pool_select b
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$POOL" "$MIG" "$CONTROLLER_HOST_OS" "$MINT_REG" "$RUNNER_MATCH_LABELS" \
     "$MIG_BASE" "$MIG_TARGET" "$MIG_TEMPLATE" \
     "$DEMAND_TOTAL" "$DEMAND_QUEUED" "$RUNNING_MAX" "$POOL_JOBS_PER_CHECK" \
-    "$RECYCLE_CORDON_STOPS_AGENTS"
+    "$RECYCLE_CORDON_STOPS_AGENTS" "$JOBS_PER_HOST"
 )
 check "pool_select: the second pool's own fields are all in place" \
   "b|mig-b|windows|true|b,self-hosted,x64" \
@@ -156,6 +159,10 @@ check "pool_select: jobs-per-check is this pool's, not the previous pool's" \
 check "pool_select: the host-side cordon flag is this pool's" \
   "false" \
   "$(printf '%s' "$select_out" | cut -d'|' -f13)"
+
+check "pool_select: jobs_per_host is this pool's" \
+  "1" \
+  "$(printf '%s' "$select_out" | cut -d'|' -f14)"
 
 # --- 2. the marker sweep cannot reach another pool's markers ------------------
 #
@@ -228,11 +235,11 @@ check "sweep: the controller really carries the scoping guard" yes "$r"
 
 # --- 3. the recycle budget is this pool's, not the controller's ---------------
 #
-# `find -name 'cordon-*'` counts every pool's cordons. With four pools rolling
-# out at once and a budget of one, three of them never start.
-grep -qF "find \"\$STATE_DIR\" -maxdepth 1 -name \"cordon-\$MIG_BASE-*\"" "$CTRL" &&
+# `find -name 'cordon-*'` counts every pool's cordons and reservations. With
+# four pools rolling out at once and a budget of one, three of them never start.
+grep -qF "find \"\$STATE_DIR\" -maxdepth 1 \\( -name \"cordon-\$MIG_BASE-*\" -o -name \"reserve-\$MIG_BASE-*\" \\)" "$CTRL" &&
   r=yes || r=no
-check "recycle: the cordon count is scoped to this pool's MIG" yes "$r"
+check "recycle: the cordon and reserve count is scoped to this pool's MIG" yes "$r"
 
 # No base name means the budget reads FULLY SPENT. A pool that cannot count its
 # own cordons must not start new ones — the failure mode of the opposite choice
@@ -278,7 +285,7 @@ legacy=$(
   printf '%s' "$POOLS_JSON" | pool_table_parse 2>/dev/null | tr '\t' '|'
 )
 check "legacy: one row, and every absent key took its default" \
-  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false" \
+  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false|3" \
   "$legacy"
 
 # --- 5. `background` is in the LINUX pool's match set only (#1533) ------------

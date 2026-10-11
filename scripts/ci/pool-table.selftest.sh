@@ -94,7 +94,7 @@ FULL='[{"name":"linux-ci","mig":"ci-linux-mig","region":"europe-west4",
   "recycle_max_unavailable":2,"host_os":"linux",
   "mints_registration_token":false,"role":"ci","beacon_interval":31,
   "pin_orphan_grace_seconds":903,"runner_labels":"self-hosted,linux-ci,Repo",
-  "recycle_cordon_stops_agents":true}]'
+  "recycle_cordon_stops_agents":true,"jobs_per_host":5}]'
 
 # --- the column-order contract ------------------------------------------------
 # controller-startup.sh reads these rows POSITIONALLY. Appending a column is
@@ -120,6 +120,14 @@ want_field "column 14 is beacon_interval" 14 31
 want_field "column 15 is pin_orphan_grace_seconds" 15 903
 want_field "column 16 is runner_labels" 16 "self-hosted,linux-ci,Repo"
 want_field "column 17 is recycle_cordon_stops_agents" 17 true
+want_field "column 18 is jobs_per_host" 18 5
+
+# jobs_per_host defaults to slots: an older table without the column still
+# converts a recycling host into exactly one host of demand.
+run '[{"name":"p","mig":"m","region":"r","slots":4,"runner_labels":"a"}]'
+want_field "jobs_per_host defaults to slots" 18 4
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a","jobs_per_host":0}]'
+want_reject "zero jobs_per_host is refused" "jobs_per_host must be at least 1"
 
 # --- the four-pool shape this table exists for --------------------------------
 # Order is contract, not incidental: the tick walks the table in order, and the

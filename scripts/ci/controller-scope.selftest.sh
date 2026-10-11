@@ -1359,8 +1359,8 @@ rm -rf "$_psd"
 grep -q 'partial_for=$(partial_seconds "$host" "$HOST_REG")' "$CTRL" && r=yes || r=no
 check "partial_seconds: the tick computes it" yes "$r"
 # shellcheck disable=SC2016
-grep -A2 'recycle_decision "\$status"' "$CTRL" | grep -q '"\$partial_for")' && r=yes || r=no
-check "partial_seconds: recycle_decision receives it as its tenth argument" yes "$r"
+grep -A2 'recycle_decision "\$status"' "$CTRL" | grep -q '"\$partial_for" "\$reserved_for")' && r=yes || r=no
+check "partial_seconds: recycle_decision receives it as its tenth argument, reserved_for as the eleventh" yes "$r"
 # shellcheck disable=SC2016
 sed -n '/^  rm -f "\$STATE_DIR\/idle-\$host"/,/pinhold/p' "$CTRL" \
   | grep '"\$STATE_DIR/partial-\$host"' >/dev/null && r=yes || r=no
@@ -1369,8 +1369,8 @@ check "partial_seconds: the marker is cleaned up with the host" yes "$r"
 # list; a name left off it becomes a global that survives into the next pool's
 # tick, so a host that was never partial could be recycled on the previous
 # pool's clock.
-grep -q '^  local host status .* partial_for$' "$CTRL" && r=yes || r=no
-check "partial_seconds: partial_for is local to tick_pool" yes "$r"
+grep -q '^  local host status .* partial_for reserved_for$' "$CTRL" && r=yes || r=no
+check "partial_seconds: partial_for and reserved_for are local to tick_pool" yes "$r"
 
 # --- pool_size accounting -----------------------------------------------------
 #

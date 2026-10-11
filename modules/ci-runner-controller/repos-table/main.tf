@@ -120,7 +120,7 @@ locals {
         runner_labels = try(p.runner_labels, null) == null ? "" : tostring(p.runner_labels)
         slots         = try(p.slots, null) == null ? 1 : p.slots
         numbers = [
-          for k in ["slots", "min_hosts", "max_hosts", "drain_grace_seconds", "register_grace_seconds", "orphan_confirm_ticks", "recycle_max_unavailable", "beacon_interval", "pin_orphan_grace_seconds"] :
+          for k in ["slots", "min_hosts", "max_hosts", "drain_grace_seconds", "register_grace_seconds", "orphan_confirm_ticks", "recycle_max_unavailable", "beacon_interval", "pin_orphan_grace_seconds", "jobs_per_host"] :
           tostring(p[k]) if try(p[k], null) != null
         ]
       }
@@ -239,7 +239,7 @@ output "rows" {
 
   precondition {
     condition     = alltrue(flatten([for p in local.pools_flat : [for n in p.numbers : can(regex("^[0-9]+$", n))]]))
-    error_message = "a pool's slots, min_hosts, max_hosts, drain_grace_seconds, register_grace_seconds, orphan_confirm_ticks, recycle_max_unavailable, beacon_interval and pin_orphan_grace_seconds must each be a whole number, zero or more. The VM compares them with shell integer tests, where a minus sign or a decimal point is not a wrong answer but a dead tick, so its pool table parser rejects the row."
+    error_message = "a pool's slots, min_hosts, max_hosts, drain_grace_seconds, register_grace_seconds, orphan_confirm_ticks, recycle_max_unavailable, beacon_interval, pin_orphan_grace_seconds and jobs_per_host must each be a whole number, zero or more. The VM compares them with shell integer tests, where a minus sign or a decimal point is not a wrong answer but a dead tick, so its pool table parser rejects the row."
   }
 
   precondition {
