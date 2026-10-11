@@ -884,8 +884,8 @@ cases_quota() { # <fetch-file>
     unset LANE_STARTED PASS_BUDGET GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
     : >"$GH_STUB_LOG"
 
-    out="$(lane_gh_retry api ok/q1)"
-    [ $? -eq 0 ] && [ "$out" = 'out:ok/q1' ]
+    out="$(lane_gh_retry api ok/q1)"; rc=$?
+    [ "$rc" -eq 0 ] && [ "$out" = 'out:ok/q1' ]
     say quota-headers-never-reach-the-caller $?
     [ "$(cat "$d/quota" 2>/dev/null)" = '5000 4990 10 1900000000' ]
     say quota-noted-from-the-answer $?
@@ -1202,7 +1202,7 @@ guard_runs() { # <scripts-dir> <tag-suffix>
 
 # <plenty-run-tag> <exhausted-run-tag> <no-headers-run-tag>
 cases_guard() {
-  local p="$WORK/run.$1" x="$WORK/run.$2" n="$WORK/run.$3"
+  local rc p="$WORK/run.$1" x="$WORK/run.$2" n="$WORK/run.$3"
   grep -q '^lane: quota at pass start: remaining=4990 of limit=5000 used=10 resets=.*, from the lane.s newest API answer (allow:above-floor' "$p/log" \
     && ! grep -q 'SKIPPED, not idle' "$p/log" && [ "$(grep -cx "repos/$REPO" "$p/calls")" -eq 1 ]
   say guard-plenty-continues $?
@@ -1212,8 +1212,8 @@ cases_guard() {
   grep -q "SKIPPED, not idle — no answer from the GitHub API carried the merge App's quota headers" "$n/log" \
     && grep -q '^lane: quota at pass start: unknown' "$n/log" && [ "$(grep -vc '^$' "$n/calls")" -eq 1 ]
   say guard-no-header-holds $?
-  ! grep -q '^RATE_LIMIT' "$p/calls" "$x/calls" "$n/calls"
-  say guard-never-asks-rate-limit $?
+  if grep -q '^RATE_LIMIT' "$p/calls" "$x/calls" "$n/calls"; then rc=1; else rc=0; fi
+  say guard-never-asks-rate-limit "$rc"
 }
 
 guard_runs "$real" ''
