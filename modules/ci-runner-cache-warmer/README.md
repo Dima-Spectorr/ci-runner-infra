@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.122.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.123.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -184,7 +184,7 @@ a plan.
 ### Two phases
 
 The step that installs and builds does **not** upload. It writes the archive to
-`/workspace`, and two later steps in a different image publish it. This does not
+`/workspace`, and two other steps in a different image publish it. This does not
 change what a compromised install *could* do — see above — but it keeps the
 publishing steps small enough to read, and it is the same shape the workflow it
 replaces used, for the same reason.
@@ -219,6 +219,21 @@ Step 3 skips every hash the server served without asking the bucket, checks the
 rest with one metadata GET each and uploads with `ifGenerationMatch=0`, **16 at a
 time** (bounded with `wait -n`), instead of one `gcloud storage objects describe`
 per artifact in sequence.
+
+### Published while the build runs, not after it
+
+`publish-turbo` has `wait_for = ["dependencies"]`, the same step the build waits
+for, so it runs **beside** the build: every 5 seconds it offers each artifact turbo
+has finished (its `<hash>-meta.json` sidecar exists — turbo writes it after the
+archive is complete) and defers, rather than refuses, one that does not yet pass
+the zstd check. The build step creates `build.done` on exit, whatever its outcome
+(stage-scripts removes any copy the checkout brought); the publisher then makes one
+final pass over everything left and ends. Measured before this (2026-10-11): a
+commit to a foundational package re-hashed ~800 tasks, the warm ran 20 minutes and
+published every artifact at its end, after typecheck and lint, so pull requests in
+that window rebuilt ~200 of ~240 `build` tasks whose hashes the warm already had.
+Now a `build` artifact is in the pool seconds after its task ends. The summary line
+reports `first-published-at=` and `finished-at=` in seconds from the step's start.
 
 ### A refused snapshot keeps the turbo warm, and still turns red
 

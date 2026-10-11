@@ -565,7 +565,7 @@ derives_tasks_by_default() { # <main.tf>
   matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
   # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
   # `\n` in an ERE is not that, and matched nothing.
-  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\n\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
   matches "$code" 'WARM_TASKS=\$\(node \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs turbo\.json \$\{join\(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'\$\{g\}'"'"'"\]\)\}\) \|\| \{ .*exit 1; \}' || return 1
   matches "$code" "gzip -d > \\$\{local\.staged_dir\}/derive-turbo-tasks\.cjs"
 }
@@ -769,8 +769,10 @@ FAKE
   printf 'nozstd' >"$t/turbo/badmagic1.tar.zst"
   # 18: just past the bound of 16, so an unbounded loop shows a peak over it.
   for i in $(seq -w 1 18); do art "up$i" ok; done
+  # The build already over: one final pass, which is what this test measures.
+  : >"$t/done"
   PATH="$t/bin:$PATH" FAKE_STATE="$t/state" FAKE_TOTAL=18 WARM_BUCKET=b WARM_TURBO_PREFIX=turbo/o/r/ \
-    WARM_TURBO_DIR="$t/turbo" WARM_SERVED_DIR="$t/served" bash "$1" >/dev/null 2>&1
+    WARM_TURBO_DIR="$t/turbo" WARM_SERVED_DIR="$t/served" WARM_BUILD_DONE="$t/done" bash "$1" >/dev/null 2>&1
   rc=0
   [ "$(wc -l <"$t/state/uploads" 2>/dev/null || echo 0)" -eq 18 ] || rc=1
   ! grep -q served1 "$t/state/calls" 2>/dev/null || rc=1
@@ -783,6 +785,78 @@ FAKE
 
 if publishes_incrementally "$TURBO"; then ok; else
   bad "warm-turbo.sh, run against fake curl/gcloud/zstd, re-asked about a served hash, re-uploaded a present one, published a truncated artifact, or uploaded one at a time / unbounded"
+fi
+
+# 23. PUBLISHED WHILE THE BUILD RUNS. Measured 2026-10-11: a foundational
+#     commit re-hashed ~800 tasks and the warm published every one only after
+#     typecheck and lint, so pull requests in that 20-minute window rebuilt
+#     artifacts the warm already had. publish-turbo now runs beside the build
+#     (wait_for the step the build waits for), the build step marks its end on
+#     EXIT, stage-scripts clears a stale marker, and the publisher offers a
+#     finished artifact (sidecar present) at once, defers an unfinished one, and
+#     makes a final pass after the marker appears.
+publishes_beside_the_build() { # <main.tf>
+  local code pub
+  code=$(code_of "$1")
+  pub=$(step_block "$code" publish-turbo)
+  [ -n "$pub" ] || return 1
+  matches "$pub" 'wait_for[[:space:]]*=[[:space:]]*\["dependencies"\]' || return 1
+  matches "$pub" '"WARM_BUILD_DONE=\$\{local\.build_done\}"' || return 1
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n' || return 1
+  matches "$code" 'rm -f \$\{local\.build_done\}'
+}
+
+if publishes_beside_the_build "$MAIN"; then ok; else
+  bad "publish-turbo no longer runs beside the build, or the build's end is never marked (a publisher that waits forever) or a stale marker survives — every artifact is published only after the last lint task again"
+fi
+
+publishes_while_building() { # <warm-turbo.sh>
+  local t rc pid
+  t=$(mktemp -d)
+  mkdir -p "$t/bin" "$t/turbo" "$t/served" "$t/state"
+  cat >"$t/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+url="${*: -1}"; out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] && : >"$out"
+case "$url" in
+  */upload/*) echo "$url" >>"$FAKE_STATE/uploads"; printf 200 ;;
+  *) printf 404 ;;
+esac
+FAKE
+  printf '#!/bin/sh\necho faketoken\n' >"$t/bin/gcloud"
+  printf '#!/bin/sh\nfor f; do :; done\n! grep -q CORRUPT "$f"\n' >"$t/bin/zstd"
+  chmod +x "$t/bin/curl" "$t/bin/gcloud" "$t/bin/zstd"
+  art() { { printf '\050\265\057\375'; printf '%s' "$2"; } >"$t/turbo/$1.tar.zst"; }
+  art finished1 ok; : >"$t/turbo/finished1-meta.json"
+  art writing1 ok
+  art growing1 CORRUPT; : >"$t/turbo/growing1-meta.json"
+  PATH="$t/bin:$PATH" FAKE_STATE="$t/state" WARM_BUCKET=b WARM_TURBO_PREFIX=turbo/o/r/ \
+    WARM_TURBO_DIR="$t/turbo" WARM_SERVED_DIR="$t/served" WARM_BUILD_DONE="$t/done" bash "$1" >/dev/null 2>&1 &
+  pid=$!
+  rc=0
+  for _ in $(seq 1 100); do grep -q finished1 "$t/state/uploads" 2>/dev/null && break; sleep 0.1; done
+  grep -q finished1 "$t/state/uploads" 2>/dev/null || rc=1
+  # Still building: neither the unfinished nor the not-yet-whole one is
+  # offered, and the publisher has not ended on its own.
+  sleep 1
+  ! grep -qE 'writing1|growing1' "$t/state/uploads" 2>/dev/null || rc=1
+  kill -0 "$pid" 2>/dev/null || rc=1
+  # The write completes, then the build ends: the final pass takes both.
+  art growing1 ok
+  : >"$t/done"
+  for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; rc=1; fi
+  wait "$pid" 2>/dev/null
+  grep -q writing1 "$t/state/uploads" 2>/dev/null || rc=1
+  grep -q growing1 "$t/state/uploads" 2>/dev/null || rc=1
+  [ "$(grep -c finished1 "$t/state/uploads" 2>/dev/null)" = 1 ] || rc=1
+  rm -rf "$t"
+  return "$rc"
+}
+
+if publishes_while_building "$TURBO"; then ok; else
+  bad "warm-turbo.sh, run while the build is still going, did not publish a finished artifact at once, offered an unfinished one, refused a not-yet-whole one for good, published one twice, or did not end after the build did"
 fi
 
 # --- mutations -----------------------------------------------------------------
@@ -1148,12 +1222,36 @@ mutate "the uploads run one at a time again" "$TURBO" \
   publishes_incrementally
 
 mutate "the concurrency bound removed" "$TURBO" \
-  's@^    wait -n$@    :@' \
+  's@^      wait -n$@      :@' \
   publishes_incrementally
 
 mutate "a truncated artifact published" "$TURBO" \
   's@\[ "\$magic" = "28b52ffd" \] || return 1@:@' \
   publishes_incrementally
+
+mutate "publish-turbo back after the build" "$MAIN" \
+  's@^      wait_for = \["dependencies"\]$@@' \
+  publishes_beside_the_build
+
+mutate "the build's end never marked" "$MAIN" \
+  's@trap .touch \${local\.build_done}. EXIT\\n@@' \
+  publishes_beside_the_build
+
+mutate "a stale end marker from the checkout kept" "$MAIN" \
+  's@rm -f \${local\.build_done}@true@' \
+  publishes_beside_the_build
+
+mutate "an unfinished artifact offered while building" "$TURBO" \
+  's@\[ ! -f "\$WARM_TURBO_DIR/\$hash-meta\.json" \]@false@' \
+  publishes_while_building
+
+mutate "a not-yet-whole artifact refused for good while building" "$TURBO" \
+  's@^    if \[ "\$FINAL" = 0 \]; then$@    if false; then@' \
+  publishes_while_building
+
+mutate "the publisher stops at the first pass" "$TURBO" \
+  's@^while \[ ! -e "\$WARM_BUILD_DONE" \]; do$@while false; do@' \
+  publishes_while_building
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
