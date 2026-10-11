@@ -285,25 +285,47 @@ resource "google_project_iam_member" "controller_build_reader" {
   member  = "serviceAccount:${local.controller_email}"
 }
 
-# A Windows host cannot mint its own registration token (it holds no App-key
-# read — see `host_os`), so the controller mints it and writes it onto the host
-# as instance metadata. setMetadata on an instance checks actAs on the account
-# attached to it, which instance-admin does not carry: without this every write
-# is refused, the host waits out its 300s and denies boot at phase 5 (#898).
+# setMetadata on an instance checks actAs on the account attached to it, which
+# instance-admin does not carry. The controller writes metadata onto hosts of
+# EVERY pool, so it needs actAs on every pool's host account:
+#
+# - Windows: a Windows host cannot mint its own registration token (it holds no
+#   App-key read — see `host_os`), so the controller mints it and writes it onto
+#   the host. Refused, the host waits out its 300s and denies boot at phase 5
+#   (#898).
+# - Every OS: a cordon writes `ci-cordon=1` onto a stale-template host so the
+#   host stops each slot as it goes idle (`recycle_cordon_stops_agents`, #948).
+#   This grant was Windows-only, so on every Linux pool that write was refused
+#   with SERVICE_ACCOUNT_ACCESS_DENIED — 58 refusals in one day on one pool,
+#   measured 2026-10-11 — and the cordoned hosts kept taking jobs for 40+
+#   minutes while a 20-host rollout sat at 0/20.
 #
 # One account, named — this pool's host account, not a project-level
 # serviceAccountUser. It does widen the controller: with instance-admin it can
 # now start or re-script a VM as the host account, and so reach the job
 # account through the host's tokenCreator. Accepted because the controller runs
-# no build input and already holds the App key, and on Windows the host account
-# holds nothing else (`host_grants` = 0) — the job account's grants are the
-# ceiling. Per pool, so it is written on the reuse path too: each pool's host
-# account is its own binding.
-resource "google_service_account_iam_member" "controller_acts_as_windows_host" {
-  count              = var.host_os == "windows" ? 1 : 0
+# no build input and already holds the App key, log and metric write — so the
+# ceiling is the job account's grants plus whatever a consuming stack adds to
+# the host account, on either OS. On the reuse path one shared controller
+# reaches every pool's job account in the project. Per pool, so it is written
+# on the reuse path too: each pool's host account is its own binding.
+#
+# Never when there is no separate controller: `controller_email` then falls
+# back to the host account itself, and host-acts-as-itself on top of its
+# instance-admin would let an escaped job re-script peer hosts' startup.
+resource "google_service_account_iam_member" "controller_acts_as_host" {
+  count = var.create_controller_service_account || var.controller_service_account_email != "" ? 1 : 0
+
   service_account_id = google_service_account.runner.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${local.controller_email}"
+}
+
+# Was `controller_acts_as_windows_host[0]`; a Windows pool moves, it does not
+# destroy and recreate its only boot-time grant.
+moved {
+  from = google_service_account_iam_member.controller_acts_as_windows_host[0]
+  to   = google_service_account_iam_member.controller_acts_as_host[0]
 }
 
 # Deliberately NOT granted here: storage, artifact registry, deploy, or any

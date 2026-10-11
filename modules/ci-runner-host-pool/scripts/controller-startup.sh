@@ -4538,12 +4538,16 @@ cordon_host() {
       # No zone means no instance to address, and a guessed one is a call
       # against some other machine. Same refusal registration_token_step makes.
       log "cordon $host: no zone in the instance self-link — cannot set ci-cordon, the cordon falls back to deregistration alone"
-    elif timeout 60 gcloud compute instances add-metadata "$host" \
+    elif flag_err=$(timeout 60 gcloud compute instances add-metadata "$host" \
       --project="$PROJECT" --zone="$zone" \
-      --metadata=ci-cordon=1 >/dev/null 2>&1; then
+      --metadata=ci-cordon=1 2>&1 >/dev/null); then
       event INFO cordon-flag "$host" "cordon $host: ci-cordon=1 set — its own sweep now stops each slot as that slot goes idle" zone="$zone"
     else
-      log "cordon $host: could not set ci-cordon=1 — the cordon falls back to deregistration alone and may not converge while the pool is saturated (#948)"
+      flag_reason=$(printf '%s\n' "$flag_err" | grep -m1 -E 'ERROR|denied|DENIED|not found' || printf '%s\n' "$flag_err" | head -n1)
+      # An EVENT, not a log line: a refused write here was a log line, and every
+      # Linux pool's cordon was refused for want of actAs on the host account
+      # with nothing on any dashboard to say so (2026-10-11).
+      event ERROR cordon-flag-refused "$host" "cordon $host: could not set ci-cordon=1 — the cordon falls back to deregistration alone and may not converge while the pool is saturated (#948); e.g. the controller lacks actAs on the host account" zone="$zone" reason="${flag_reason:0:200}"
     fi
   fi
 
