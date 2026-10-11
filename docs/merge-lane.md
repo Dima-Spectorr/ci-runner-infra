@@ -1023,6 +1023,16 @@ What changed:
   run stays green; the next trigger resumes it, and when no trigger comes the
   fleet-wide retry does ("A lost pass is retried", below). That is a skip, not
   blindness: a read that fails for any other reason still fails the run.
+- **The floor is judged from the lane's own answers, not from `GET /rate_limit`**
+  (#1543). Every `gh api` the lane makes is run with `-i`; the
+  `x-ratelimit-remaining` / `-reset` headers of the newest `core` answer —
+  a refusal included, which reports 0 — are what the guard compares to the
+  floor. `rate_limit` lags the counter that refuses calls (the same reason the
+  retry probes rather than trusting it, below), so a pass could start on a
+  quota already spent. When no answer has carried the headers yet, the guard
+  makes ONE ordinary counted read of the repository to get some; if even that
+  answer carries none, the pass is held as *Skipped, not idle* rather than
+  started blind. A window whose reset time has already passed is not held.
 - **A rate-limited status read no longer asks for a permission.** The
   commit-status warning used to say "grant the merge App `Commit statuses:
   read`" on any failure; on 2026-09-17 that was a 403 from the exhausted quota,

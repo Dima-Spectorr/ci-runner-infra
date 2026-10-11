@@ -118,6 +118,78 @@ lane_rate_limit_wait() {
 # The one sleep the retry makes. A function so the self-test can see it.
 lane_retry_sleep() { command sleep "$1"; }
 
+# ---------------------------------------------------------------------------
+# THE QUOTA IS READ FROM THE LANE'S OWN ANSWERS, NOT FROM `rate_limit` (#1543).
+#
+# `GET /rate_limit` was seen reporting `used=0` for the merge App's token while
+# real calls on the same token were refused for rate limit (IntegrateIT,
+# 2026-10-11, pass 38115253421 — see merge-lane-recover.sh). A guard that asks
+# that endpoint whether to keep spending is asking the one number that was
+# wrong. Every real answer GitHub gives carries the window that answered it in
+# `x-ratelimit-remaining` / `x-ratelimit-reset`, refusals included, and the lane
+# already makes those calls: so every `gh api` here runs with `-i`, the header
+# block is cut off the output before any caller sees it, and the newest core
+# window is written to LANE_QUOTA as `limit remaining used reset`. The guard in
+# merge-lane.sh reads that file and nothing else.
+#
+# A FILE, replaced whole with `mv`, for the reason the call counter is one: the
+# calls happen in `$(...)` subshells and in concurrent fetch jobs, and a reader
+# must never see half a line. Last answer wins, which is what "most recent"
+# means when several are in flight. Empty LANE_QUOTA records nothing.
+
+# <raw> <out> <headers> — splits `gh api -i` output. `gh` prints each page's
+# header block as an `HTTP/x.y nnn` line, then `Name: value` lines ending in
+# CR LF, then a lone CR LF; the body follows. Every block goes to <headers>
+# (so its last block is the newest answer), everything else to <out>. The lone
+# line is matched as "\r" OR "": some awk builds (Git Bash's) strip the CR on
+# read, and a split that waited for "\r" there swallowed the body as headers.
+lane_gh_split() {
+  awk -v hdr="$3" '
+    inh { if ($0 == "\r" || $0 == "") { inh = 0 } else { print > hdr }; next }
+    /^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { inh = 1; print > hdr; next }
+    { print }
+  ' "$1" >"$2"
+}
+
+# <headers> — writes the LAST block's core window to LANE_QUOTA. A block for
+# another bucket (`graphql`, `search`) says nothing about the REST quota the
+# lane spends, and is ignored.
+lane_quota_note() {
+  local q
+  [ -n "${LANE_QUOTA:-}" ] && [ -s "$1" ] || return 0
+  q="$(tr -d '\r' <"$1" | awk -F': *' '
+    /^HTTP\// { l = ""; r = ""; u = ""; s = ""; res = ""; next }
+    { k = tolower($1) }
+    k == "x-ratelimit-limit" { l = $2 }
+    k == "x-ratelimit-remaining" { r = $2 }
+    k == "x-ratelimit-used" { u = $2 }
+    k == "x-ratelimit-reset" { s = $2 }
+    k == "x-ratelimit-resource" { res = $2 }
+    END {
+      if (r ~ /^[0-9]+$/ && s ~ /^[0-9]+$/ && (res == "" || res == "core"))
+        print (l ~ /^[0-9]+$/ ? l : "?") " " r " " (u ~ /^[0-9]+$/ ? u : "?") " " s
+    }')"
+  [ -n "$q" ] || return 0
+  printf '%s\n' "$q" >"$LANE_QUOTA.$$.$BASHPID" && mv -f "$LANE_QUOTA.$$.$BASHPID" "$LANE_QUOTA"
+}
+
+# <dir> <gh-args...> — one real call: output to <dir>/out, error text to
+# <dir>/err, the status returned. A `gh api` call is made with `-i` and its
+# answer's window noted; its output reaches <dir>/out without the headers.
+lane_gh_call() {
+  local d="$1" rc=0
+  shift
+  if [ "${1:-}" != api ]; then
+    command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
+    return "$rc"
+  fi
+  command gh api -i "${@:2}" >"$d/raw" 2>"$d/err" || rc=$?
+  : >"$d/hdr"
+  lane_gh_split "$d/raw" "$d/out" "$d/hdr"
+  lane_quota_note "$d/hdr"
+  return "$rc"
+}
+
 # `command gh "$@"`, made once more after a short rate-limit wait. The caller
 # receives the output, the error text and the status of the LAST attempt.
 #
@@ -132,7 +204,7 @@ lane_gh_retry() {
     command gh "$@"
     return
   fi
-  command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
+  lane_gh_call "$d" "$@" || rc=$?
   if [ "$rc" -ne 0 ] && wait="$(lane_rate_limit_wait "$d/err")"; then
     if lane_gh_mutates "$@"; then
       echo "lane: rate limited on a write; a write is never repeated on the old verdict — the pass ends and the recover job decides again from live state" >&2
@@ -145,7 +217,7 @@ lane_gh_retry() {
       echo "lane: rate limited; making this call once more in ${wait}s" >&2
       lane_retry_sleep "$wait"
       rc=0
-      command gh "$@" >"$d/out" 2>"$d/err" || rc=$?
+      lane_gh_call "$d" "$@" || rc=$?
     fi
   fi
   cat "$d/out"

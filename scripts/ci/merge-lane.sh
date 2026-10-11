@@ -92,8 +92,7 @@ LANE_BASE_FIX_MERGED=''
 # The counter is a FILE, appended to, for the reason `STATUS_WARN_ONCE` is one:
 # almost every call happens inside a `$(...)` subshell, where a shell variable
 # increment dies. A paginated read counts once however many pages it walks, so
-# the number is a floor. `rate_limit` is not counted — GitHub does not charge
-# for it.
+# the number is a floor.
 #
 # THE SAME WRAPPER IS WHERE A READ IS RECORDED AND WHERE IT IS REPLAYED. A fetch
 # job (`LANE_RECORD` set) makes the read for real and writes it down, without
@@ -107,8 +106,12 @@ LANE_RECORD=''
 LANE_REPLAY=''
 LANE_CALLS="$LANE_TMP/api-calls"
 : >"$LANE_CALLS"
+# The core window the newest real answer carried — see "THE QUOTA IS READ FROM
+# THE LANE'S OWN ANSWERS" in merge-lane-fetch.sh. Named once, here: a fetch job
+# moves LANE_TMP into its own directory, and its answers count too.
+LANE_QUOTA="$LANE_TMP/quota"
 gh() {
-  if [ "${1:-}" = api ] && [ "${2:-}" != rate_limit ]; then
+  if [ "${1:-}" = api ]; then
     if [ -n "$LANE_RECORD" ]; then
       lane_gh_record "$@"
       return
@@ -157,33 +160,58 @@ if ! [[ "$QUOTA_FLOOR" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-# Prints `limit remaining used reset`, or nothing when the read fails. An
-# unreadable quota does NOT hold the lane: the reads that follow fail loudly on
-# their own if the quota really is gone, and a guard that stopped on its own
-# failure would turn a flaky endpoint into a silent outage.
+# Prints `limit remaining used reset` of the core window the lane's newest real
+# API answer carried (`x-ratelimit-*`, noted by `lane_gh_call`), or nothing when
+# no answer has carried one yet. Never `GET /rate_limit`: that endpoint said
+# `used=0` while the same token's real calls were being refused (#1543).
 lane_quota() {
   local q
-  q="$(command gh api rate_limit --jq '.resources.core | "\(.limit) \(.remaining) \(.used) \(.reset)"' 2>/dev/null)" || return 0
-  [[ "$q" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] && printf '%s' "$q"
+  [ -s "$LANE_QUOTA" ] || return 0
+  q="$(cat "$LANE_QUOTA" 2>/dev/null)" || return 0
+  [[ "$q" =~ ^[0-9?]+\ [0-9]+\ [0-9?]+\ [0-9]+$ ]] && printf '%s' "$q"
   return 0
 }
 
 LANE_SKIP_REASON=''
-# Returns 1, with the reason in `LANE_SKIP_REASON`, when the quota is below the
-# floor. <label> names the moment in the log.
+# The guard's probe is made once a run: a second one, at run end after a held
+# pass, would spend a call to learn what the first already showed.
+LANE_QUOTA_PROBED=''
+# Returns 1, with the reason in `LANE_SKIP_REASON`, when the pass must not
+# spend: the newest answer's window is under the floor, or no answer has said
+# what the window is. <label> names the moment in the log.
+#
+# NOTHING SEEN YET IS NOT "PLENTY". The first pass of a run has made no call, so
+# there is no answer to read: the guard makes ONE real read (`repos/<repo>`,
+# counted like any other) and decides from that answer's headers. A refusal
+# carries them too, at `remaining=0`. When even that answer carries none, the
+# API is not answering the lane at all, a pass would be blind from its first
+# read, and it is held, not started on a guess (`lane_quota_verdict`).
 lane_quota_allows() {
-  local label="$1" q limit remaining used reset
+  local label="$1" q limit='' remaining='' used='' reset='' verdict when
   q="$(lane_quota)"
+  if [ -z "$q" ] && [ "$QUOTA_FLOOR" -gt 0 ] && [ -z "$LANE_QUOTA_PROBED" ]; then
+    LANE_QUOTA_PROBED=1
+    gh api "repos/$R" --jq '.id' >/dev/null 2>&1 || true
+    q="$(lane_quota)"
+  fi
+  [ -z "$q" ] || read -r limit remaining used reset <<<"$q"
+  verdict="$(lane_quota_verdict "$remaining" "$reset" "$QUOTA_FLOOR" "$(date -u +%s)")"
   if [ -z "$q" ]; then
-    echo "lane: quota at $label: unreadable (spent by this run so far: $(lane_calls))"
-    return 0
+    echo "lane: quota at $label: unknown — no API answer this run has carried the quota headers ($verdict; spent by this run so far: $(lane_calls))"
+  else
+    when="$(date -u -d "@$reset" +%H:%M:%SZ)"
+    echo "lane: quota at $label: remaining=$remaining of limit=$limit used=$used resets=$when, from the lane's newest API answer ($verdict; spent by this run so far: $(lane_calls))"
   fi
-  read -r limit remaining used reset <<<"$q"
-  echo "lane: quota at $label: remaining=$remaining of limit=$limit used=$used resets=$(date -u -d "@$reset" +%H:%M:%SZ) (spent by this run so far: $(lane_calls))"
-  if [ "$QUOTA_FLOOR" -gt 0 ] && [ "$remaining" -lt "$QUOTA_FLOOR" ]; then
-    LANE_SKIP_REASON="the merge App's shared API quota is at $remaining of $limit, under the floor of $QUOTA_FLOOR, until $(date -u -d "@$reset" +%H:%M:%SZ)"
-    return 1
-  fi
+  case "$verdict" in
+    hold:below-floor)
+      LANE_SKIP_REASON="the merge App's shared API quota is at $remaining of $limit, under the floor of $QUOTA_FLOOR, until $when"
+      return 1
+      ;;
+    hold:*)
+      LANE_SKIP_REASON="no answer from the GitHub API carried the merge App's quota headers, not even to a probe, so how much of the shared quota is left is unknown"
+      return 1
+      ;;
+  esac
   return 0
 }
 

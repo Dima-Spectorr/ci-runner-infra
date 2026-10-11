@@ -1958,17 +1958,21 @@ counts_what_it_spends() {
 }
 
 # Below the floor the pass does not start, and says so as a warning naming the
-# quota — never a quiet "nothing actionable". And the guard must not turn its
-# own failure to read the quota into a skip.
+# quota — never a quiet "nothing actionable". The quota is read from the
+# headers of the lane's own newest answer (#1543), never from `rate_limit`, and
+# with no answer yet the guard holds rather than guessing.
 stops_short_of_an_exhausted_quota() {
   local code
   code=$(code_of "$1")
   matches "$code" '^QUOTA_FLOOR="\$\{QUOTA_FLOOR:-500\}"' || return 1
+  matches "$code" '^LANE_QUOTA="\$LANE_TMP/quota"$' || return 1
   matches "$code" '^  if ! lane_quota_allows "pass start"; then$' || return 1
   matches "$code" '::warning::lane: SKIPPED, not idle' || return 1
-  matches "$code" '\[ "\$remaining" -lt "\$QUOTA_FLOOR" \]' || return 1
+  matches "$code" 'lane_quota_verdict "\$remaining" "\$reset" "\$QUOTA_FLOOR"' || return 1
+  matches "$code" 'hold:below-floor\)' || return 1
   before "$code" '^  if ! lane_quota_allows "pass start"; then$' '^  if one_pass; then$' || return 1
-  matches "$code" 'unreadable \(spent by this run so far'
+  matches "$code" 'quota at \$label: unknown' || return 1
+  ! matches "$code" 'rate_limit'
 }
 
 passes_the_quota_floor_to_the_driver() {
