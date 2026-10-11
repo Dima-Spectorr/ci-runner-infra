@@ -1243,7 +1243,7 @@ STUB
 
   # Refused throughout: 900s in all, then the dispatch is made anyway.
   : >"$d/probes"
-  for i in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
+  for _ in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
   rrun; rc=$?
   [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]
   res recover-wait-is-capped $?
