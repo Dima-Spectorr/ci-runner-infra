@@ -545,7 +545,7 @@ wired "the veto event is throttled per host" 'throttled_event "\$STATE_DIR/pinve
 wired "an unexplained beacon read failure is a throttled event too" \
   'throttled_event "\$STATE_DIR/beaconerr-\$host" "status-\$rc" WARNING beacon-read-failed'
 # A marker per host that nothing reaps is a file per host the pool ever had.
-host_gone=$(awk '/rm -f "\$STATE_DIR\/idle-\$host" "\$STATE_DIR\/seen-\$host"/ { on = 1 } on { print } on && !/\\$/ { exit }' "$CTL")
+host_gone=$(awk '/rm -f "\$STATE_DIR\/idle-\$host" "\$STATE_DIR\/beaconmiss-\$host"/ { on = 1 } on { print } on && !/\\$/ { exit }' "$CTL")
 for sf in pinveto pinerr beaconerr; do
   case "$host_gone" in
     *"\"\$STATE_DIR/$sf-\$host\""*) PASS=$((PASS + 1)) ;;
