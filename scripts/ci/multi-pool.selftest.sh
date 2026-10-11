@@ -281,6 +281,42 @@ check "legacy: one row, and every absent key took its default" \
   "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false" \
   "$legacy"
 
+# --- 5. `background` is in the LINUX pool's match set only (#1533) ------------
+#
+# One controller derives the match set of a Linux pool and a Windows pool in the
+# same loop. Linux hosts add `background` to their lower slots and push runs ask
+# for it, so the Linux set must contain it or every push job is nobody's demand.
+# Windows hosts register no such label, so the Windows set must not, or the
+# Windows pool buys hosts for Linux push work. The derivation is lifted out of
+# controller-startup.sh and RUN for both, and two mutations of it must go red.
+# shellcheck disable=SC2016
+match_prog=$(sed -n '/^  P_MATCH_JSON\["\$p_name"\]=\$(printf/,/unique'"'"')$/p' "$CTRL" \
+  | sed -e '1s/^.*jq -R -c --arg os "\$p_hostos" '"'"'//' -e '$s/'"'"')$//')
+derive_sets() { # <jq-program> -> "<linux set>|<windows set>"
+  local l w
+  l=$(printf '%s' "self-hosted,pool-l,gcp,Repo" | jq -R -c --arg os linux "$1" 2>/dev/null)
+  w=$(printf '%s' "self-hosted,pool-w,gcp,Repo" | jq -R -c --arg os windows "$1" 2>/dev/null)
+  printf '%s|%s' "$l" "$w"
+}
+bg_split_ok() { # <jq-program>
+  local sets
+  sets=$(derive_sets "$1")
+  case "${sets%%|*}" in *'"background"'*) : ;; *) return 1 ;; esac
+  case "${sets#*|}" in *'"background"'*) return 1 ;; esac
+  # and the program is real: the Windows set still has its OS label
+  case "${sets#*|}" in *'"windows"'*) return 0 ;; *) return 1 ;; esac
+}
+bg_split_ok "$match_prog" && r=yes || r=no
+check "match set: background in the Linux pool's set, not the Windows pool's" yes "$r"
+# shellcheck disable=SC2016
+mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background"\] else \[\] end)/[]/')
+if [ "$mut" = "$match_prog" ]; then r=stale; elif bg_split_ok "$mut"; then r=missed; else r=caught; fi
+check "mutation: background dropped from every set is caught" caught "$r"
+# shellcheck disable=SC2016
+mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background"\] else \[\] end)/["background"]/')
+if [ "$mut" = "$match_prog" ]; then r=stale; elif bg_split_ok "$mut"; then r=missed; else r=caught; fi
+check "mutation: background added to the Windows set too is caught" caught "$r"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

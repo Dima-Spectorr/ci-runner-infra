@@ -47,6 +47,7 @@ match_set() { # <configured-csv> <host_os>
   printf '%s' "$1" | jq -R -c --arg os "$2" '
     (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
     | split(",") + ["self-hosted", $osl, "X64"]
+      + (if $osl == "Linux" then ["background"] else [] end)
     | map(select(length > 0) | ascii_downcase) | unique'
 }
 POOL_LABELS=$(match_set "$POOL_CONFIGURED" linux)
@@ -386,11 +387,48 @@ win 1 "a Windows pool answers for a Windows job" \
 win 0 "a Windows pool does not answer for a Linux job" \
   '{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp"]}]}'
 
+# --- background work is demand (#1533) -----------------------------------------
+#
+# Push and schedule runs ask for `background`, which the host adds to its lower
+# slots and no pool configures. A match set without it reads every push job as
+# another pool's: ci_demand drops it, and a pool whose only queued work is a push
+# run never scales out for it. A Windows pool must NOT answer for it: its hosts
+# register no such label, so counting it there buys Windows hosts for Linux work.
+BG_JOB='{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp","Telnet-Emulation","background"]}]}'
+WIN_BG_JOB='{"jobs":[{"status":"queued","labels":["self-hosted","windows","gcp","background"]}]}'
+expect 1 "a push run's background job is this Linux pool's demand" "$BG_JOB"
+win 0 "a Windows pool does not answer for a background job" "$WIN_BG_JOB"
+
+# MUTATIONS: the two ways a later edit plausibly breaks the derivation. Each
+# broken derivation is run against the same jobs and must change an answer.
+# shellcheck disable=SC2016  # jq programs, not shell expansions
+NO_BG='(if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+  | split(",") + ["self-hosted", $osl, "X64"] | map(select(length > 0) | ascii_downcase) | unique'
+# shellcheck disable=SC2016
+BG_EVERYWHERE='(if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+  | split(",") + ["self-hosted", $osl, "X64", "background"] | map(select(length > 0) | ascii_downcase) | unique'
+bg_mutant() { # <description> <configured-csv> <host_os> <jq-derivation> <jobs-json> <answer-of-the-correct-derivation>
+  local set got
+  set=$(printf '%s' "$2" | jq -R -c --arg os "$3" "$4")
+  got=$(printf '%s' "$5" | jq -r --argjson mine_labels "$set" "$FILTER")
+  if [ "$got" != "$6" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: mutation not detected: %s\n' "$1"
+  fi
+}
+bg_mutant "background dropped from the Linux match set" \
+  "$POOL_CONFIGURED" linux "$NO_BG" "$BG_JOB" 1
+bg_mutant "background added to the Windows match set" \
+  "self-hosted,ci-runner-host-win,gcp,Telnet-Emulation" windows "$BG_EVERYWHERE" "$WIN_BG_JOB" 0
+
 # A fixture that derives the match set the way the controller does proves
 # nothing once the controller stops doing it, so the derivation is pinned too.
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 for needle in \
   'split(",") + ["self-hosted", $osl, "X64"]' \
+  '+ (if $osl == "Linux" then ["background"] else [] end)' \
   'map(select(length > 0) | ascii_downcase) | unique' \
   'def jlabels: ((.labels // []) | map(ascii_downcase));'
 do

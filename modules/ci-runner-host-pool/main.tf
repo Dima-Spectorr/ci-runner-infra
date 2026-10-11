@@ -524,6 +524,20 @@ resource "google_compute_instance_template" "host" {
     "ci-runner-group"        = var.runner_group
     "ci-slots"               = tostring(var.slots_per_host)
     "ci-pool"                = var.name
+
+    # THE INTERACTIVE SLOTS (#1533): how many of this host's TOP slots take
+    # pull-request work only. Slots 1..(slots - this) also answer to the
+    # `background` label, which push and schedule runs ask for, so a push run's
+    # fan-out can never fill the last slots of a host while a PR job queues.
+    #
+    # Not a knob of its own. It is the autoscaler's headroom — the slots the MIG
+    # already keeps free by sizing to `slots - headroom` per host — given a job
+    # to do: the capacity is paid for either way, and naming who may use it is
+    # what turns idle insurance into PR priority. Capped at slots - 1 so every
+    # host keeps at least one background slot; a pool whose push work found no
+    # runner at all would queue it forever. A 1-slot host gets 0 and behaves as
+    # it always did.
+    "ci-interactive-slots" = tostring(min(var.autoscaler_headroom_slots, var.slots_per_host - 1))
     "ci-metric-prefix"       = var.metric_prefix
 
     # THE CORDON FLAG, declared empty so the key exists from boot (#948).
