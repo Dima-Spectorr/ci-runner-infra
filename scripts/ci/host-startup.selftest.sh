@@ -1982,7 +1982,7 @@ slot_labels_behaves() { # <file>
   code=$(code_of "$1")
   # the split comes from the module, not a literal on the host
   matches "$code" '^INTERACTIVE_SLOTS=\$\(md "instance/attributes/ci-interactive-slots"\)$' || return 1
-  matches "$code" '^BACKGROUND_SLOTS=\$\(\(SLOTS - INTERACTIVE_SLOTS\)\)$' || return 1
+  matches "$code" '^BACKGROUND_SLOTS=\$\(\(10#\$SLOTS - 10#\$INTERACTIVE_SLOTS\)\)$' || return 1
   # and a value that leaves no background slot is refused, not run
   matches "$code" '\[ "\$INTERACTIVE_SLOTS" -lt "\$SLOTS" \]' || return 1
   matches "$code" '\|\| die "ci-interactive-slots \(' || return 1
@@ -2204,7 +2204,7 @@ mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'          
 mutate "background on every slot"            's@if \[ "\$1" -le "\$BACKGROUND_SLOTS" \]; then@if true; then@'   slot_labels_behaves
 mutate "background on no slot"               "s@'%s,background'@'%s'@"                                              slot_labels_behaves
 mutate "every slot registers the pool list"  's@--labels "\$(slot_labels "\$idx")"@--labels "$LABELS"@'               slot_labels_behaves
-mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((SLOTS - INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
+mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
 mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves
 mutate "interactive count never read"        '/^INTERACTIVE_SLOTS=\$(md /d'                                         slot_labels_behaves
 mutate "background count not published"      '/^Environment=CI_HOST_BACKGROUND_SLOTS=/d'                            slot_labels_behaves
