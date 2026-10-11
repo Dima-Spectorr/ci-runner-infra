@@ -3,8 +3,10 @@
 # warm-turbo.sh — publish a default-branch build's Turborepo artifacts
 #
 # WHERE THIS RUNS
-#   As the last step of the cache warmer's Cloud Build, after a step has run the
-#   repository's build on the DEFAULT BRANCH. Never on a pool host: a host
+#   As a step of the cache warmer's Cloud Build that runs CONCURRENTLY with the
+#   step building the repository's DEFAULT BRANCH, publishing each artifact as
+#   soon as turbo finishes it and ending once that step has ended (see "PUBLISH
+#   WHILE THE BUILD RUNS" below). Never on a pool host: a host
 #   executes pull-request code, and a build artifact is a tarball the next build
 #   unpacks into its output tree and reports as its own result. The host-side
 #   server is read-only for exactly that reason, and this is the other half —
@@ -41,6 +43,8 @@
 #   WARM_MAX_BYTES     refuse to publish an artifact over this   (default 512Mi)
 #   WARM_SERVED_DIR    where the build step's read-only cache server kept the
 #                      artifacts it SERVED from the store        (optional)
+#   WARM_BUILD_DONE    a file the build step creates when it ends; this step
+#                      publishes while it is absent, then once more (required)
 #   WARM_DRY_RUN       1 = say what would be uploaded, upload nothing
 #
 # INCREMENTAL, AND WHY A SERVED HASH IS SKIPPED WITHOUT A REQUEST
@@ -80,6 +84,7 @@ log() { printf '[warm-turbo] %s\n' "$*" >&2; }
 : "${WARM_BUCKET:?WARM_BUCKET is required}"
 : "${WARM_TURBO_PREFIX:?WARM_TURBO_PREFIX is required}"
 : "${WARM_TURBO_DIR:?WARM_TURBO_DIR is required}"
+: "${WARM_BUILD_DONE:?WARM_BUILD_DONE is required}"
 WARM_MAX_BYTES="${WARM_MAX_BYTES:-536870912}"
 WARM_DRY_RUN="${WARM_DRY_RUN:-0}"
 
@@ -144,7 +149,10 @@ WARM_SERVED_DIR="${WARM_SERVED_DIR:-}"
 # repository changes what it should be.
 PUBLISH_PARALLEL=16
 
-RESULTS=$(mktemp -d) || { log "the result directory could not be staged"; exit 2; }
+if ! RESULTS=$(mktemp -d) || ! mkdir "$RESULTS/deferred"; then
+  log "the result directory could not be staged"
+  exit 2
+fi
 trap 'rm -rf "$RESULTS"' EXIT
 
 # Sets HTTP_CODE and err_detail; never returns non-zero, because every outcome
@@ -226,6 +234,12 @@ publish_one() { # <artifact> <hash> <size>
   fi
 
   if ! is_whole_zstd "$artifact"; then
+    # While the build runs, a failed check may be an artifact still being
+    # written by a turbo that does not rename into place: tried again later.
+    if [ "$FINAL" = 0 ]; then
+      : >"$RESULTS/deferred/$hash"
+      return 0
+    fi
     log "refusing '$hash': not a complete zstd frame — a truncated artifact is never published"
     echo refused >"$RESULTS/$hash"
     return 0
@@ -256,6 +270,132 @@ publish_one() { # <artifact> <hash> <size>
   return 0
 }
 
+refused=0
+served=0
+
+# Decided in the parent, once per artifact name, across every pass: a hash
+# offered once is never offered again unless its pass deferred it.
+declare -A OFFERED=()
+
+# One pass over the cache directory. FINAL=0 is a pass while the build is still
+# running: only an artifact turbo has FINISHED is offered — its
+# `<hash>-meta.json` sidecar is written after the archive is complete — and one
+# that fails the zstd check is deferred to a later pass rather than refused,
+# because a later pass may find it whole. FINAL=1 runs after the build step has
+# ended, offers everything left and refuses what is still not whole.
+# Sets LAUNCHED to the number of artifacts it offered.
+FINAL=0
+LAUNCHED=0
+publish_pass() {
+  local artifact base hash size running=0 r
+  LAUNCHED=0
+  [ -d "$WARM_TURBO_DIR" ] || return 0
+  # `find` rather than a glob: a monorepo's cache directory routinely holds more
+  # entries than a command line can carry. -maxdepth 1 because only the top level
+  # holds artifacts; turbo keeps its own bookkeeping in subdirectories.
+  #
+  # STREAMED through process substitution, not a pipe: a pipe would run the loop
+  # in a subshell and `wait` below would have no children to wait for.
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    base=$(basename "$artifact")
+    hash=${base%.tar.zst}
+    [ -z "${OFFERED[$base]:-}" ] || continue
+
+    # The hash reaches an object name, so it is checked against the same charset
+    # the host-side server accepts before it is used to build one. A file the
+    # server would refuse to serve must not be published: it would be a paid-for
+    # object that answers no read.
+    case "$hash" in
+      *[!A-Za-z0-9_-]* | "")
+        log "refusing '$base': not an artifact hash"
+        OFFERED[$base]=1
+        refused=$((refused + 1))
+        continue
+        ;;
+    esac
+
+    # Served from this prefix by the build step's read-only server: already
+    # there. The server writes that file before it answers, so it exists before
+    # turbo's local copy of the same hash does.
+    if [ -n "$WARM_SERVED_DIR" ] && [ -f "$WARM_SERVED_DIR/$hash" ]; then
+      OFFERED[$base]=1
+      served=$((served + 1))
+      continue
+    fi
+
+    # Still being written, as far as this pass can tell: wait for the sidecar.
+    if [ "$FINAL" = 0 ] && [ ! -f "$WARM_TURBO_DIR/$hash-meta.json" ]; then
+      continue
+    fi
+
+    OFFERED[$base]=1
+    size=$(stat -c %s "$artifact" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$WARM_MAX_BYTES" ]; then
+      # The host-side server treats anything over its bound as a miss, so
+      # publishing this would cost storage and never serve a read.
+      log "refusing '$hash': ${size}B is over the ${WARM_MAX_BYTES}B artifact bound"
+      refused=$((refused + 1))
+      continue
+    fi
+
+    # Minted (or re-used) HERE, in the parent, so every child inherits the same
+    # token as a shell variable — never as an argument.
+    gcs_token || GCS_TOKEN=""
+
+    # The bound. `wait -n` returns as soon as any one child finishes.
+    if [ "$running" -ge "$PUBLISH_PARALLEL" ]; then
+      wait -n
+      running=$((running - 1))
+    fi
+    publish_one "$artifact" "$hash" "$size" &
+    running=$((running + 1))
+    LAUNCHED=$((LAUNCHED + 1))
+  done < <(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
+  wait
+
+  # A deferred artifact is offered again by the next pass, and does not count
+  # as progress: a pass that only deferred still sleeps before the next one.
+  for r in "$RESULTS"/deferred/*; do
+    [ -f "$r" ] || continue
+    rm -f "$r"
+    LAUNCHED=$((LAUNCHED - 1))
+    unset 'OFFERED['"$(basename "$r")".tar.zst']'
+  done
+}
+
+count_of() { find "$RESULTS" -maxdepth 1 -type f ! -name '*.body' -exec cat {} + 2>/dev/null | grep -cx "$1"; }
+
+# PUBLISH WHILE THE BUILD RUNS, NOT AFTER IT.
+#
+# This step runs BESIDE the build step, not after it, and publishes each
+# artifact the moment turbo finishes it. Measured 2026-10-11 on a consumer
+# monorepo: a commit to a foundational package re-hashed every dependent build;
+# the next warm ran 20 minutes cold and published all 774 new artifacts at its
+# very end, after build, typecheck and lint, so every pull request in that
+# window rebuilt ~200 of ~240 build tasks (`build` ~7.5 min against ~1 min) —
+# identical hashes, simply not published yet. Now a build artifact is in the
+# store seconds after its task ends, long before typecheck and lint finish.
+#
+# The build step touches WARM_BUILD_DONE on exit, whatever its outcome; until
+# then this loops, one pass every PASS_INTERVAL seconds, and then makes one
+# final pass that catches the last artifacts and anything a live pass deferred.
+PASS_INTERVAL=5
+started=$(date +%s)
+first_at=""
+while [ ! -e "$WARM_BUILD_DONE" ]; do
+  publish_pass
+  if [ "$LAUNCHED" -gt 0 ]; then
+    now=$(($(date +%s) - started))
+    [ -n "$first_at" ] || first_at=$now
+    log "while building, at ${now}s: offered $LAUNCHED; published=$(count_of published) so far"
+  else
+    sleep "$PASS_INTERVAL"
+  fi
+done
+FINAL=1
+publish_pass
+
 if [ ! -d "$WARM_TURBO_DIR" ]; then
   # Not a failure. A repository that does not use turbo, or a build where every
   # task was already replayed from a cache this warmer filled on an earlier run,
@@ -264,69 +404,12 @@ if [ ! -d "$WARM_TURBO_DIR" ]; then
   exit 0
 fi
 
-refused=0
-served=0
-running=0
-
-# `find` rather than a glob: a monorepo's cache directory routinely holds more
-# entries than a command line can carry. -maxdepth 1 because only the top level
-# holds artifacts; turbo keeps its own bookkeeping in subdirectories.
-#
-# STREAMED through process substitution, not a pipe: a pipe would run the loop in
-# a subshell and `wait` below would have no children to wait for.
-while IFS= read -r artifact; do
-  [ -n "$artifact" ] || continue
-  base=$(basename "$artifact")
-  hash=${base%.tar.zst}
-
-  # The hash reaches an object name, so it is checked against the same charset
-  # the host-side server accepts before it is used to build one. A file the
-  # server would refuse to serve must not be published: it would be a paid-for
-  # object that answers no read.
-  case "$hash" in
-    *[!A-Za-z0-9_-]* | "")
-      log "refusing '$base': not an artifact hash"
-      refused=$((refused + 1))
-      continue
-      ;;
-  esac
-
-  # Served from this prefix by the build step's read-only server: already there.
-  if [ -n "$WARM_SERVED_DIR" ] && [ -f "$WARM_SERVED_DIR/$hash" ]; then
-    served=$((served + 1))
-    continue
-  fi
-
-  size=$(stat -c %s "$artifact" 2>/dev/null || echo 0)
-  if [ "$size" -gt "$WARM_MAX_BYTES" ]; then
-    # The host-side server treats anything over its bound as a miss, so
-    # publishing this would cost storage and never serve a read.
-    log "refusing '$hash': ${size}B is over the ${WARM_MAX_BYTES}B artifact bound"
-    refused=$((refused + 1))
-    continue
-  fi
-
-  # Minted (or re-used) HERE, in the parent, so every child inherits the same
-  # token as a shell variable — never as an argument.
-  gcs_token || GCS_TOKEN=""
-
-  # The bound. `wait -n` returns as soon as any one child finishes.
-  if [ "$running" -ge "$PUBLISH_PARALLEL" ]; then
-    wait -n
-    running=$((running - 1))
-  fi
-  publish_one "$artifact" "$hash" "$size" &
-  running=$((running + 1))
-done < <(find "$WARM_TURBO_DIR" -maxdepth 1 -type f -name '*.tar.zst' 2>/dev/null)
-wait
-
-count_of() { find "$RESULTS" -maxdepth 1 -type f ! -name '*.body' -exec cat {} + 2>/dev/null | grep -cx "$1"; }
 published=$(count_of published)
 skipped=$(count_of skipped)
 failed=$(count_of failed)
 refused=$((refused + $(count_of refused)))
 
-log "published=$published already-present=$((skipped + served)) served-by-the-store=$served refused=$refused failed=$failed"
+log "published=$published already-present=$((skipped + served)) served-by-the-store=$served refused=$refused failed=$failed first-published-at=${first_at:-after the build}s finished-at=$(($(date +%s) - started))s"
 
 # A failed upload is not a failed warm. The next scheduled run republishes it,
 # and every build in between simply misses on that one task — which is what it

@@ -247,6 +247,7 @@ locals {
     SERVER_GZ_EOF
     rm -f ${local.snapshot_archive}
     rm -rf ${local.served_dir}
+    rm -f ${local.build_done}
     chmod +x ${local.staged_dir}/publish-cache-snapshot.sh ${local.staged_dir}/scan-cache-credentials.sh ${local.staged_dir}/warm-turbo.sh
     ${local.stage_scan_allow}
   EOT
@@ -417,6 +418,11 @@ locals {
   # published, exactly as before — never a failed one. The served artifacts stay
   # in `served_dir`, which the publishing step reads to skip them unasked.
   served_dir = "${local.staged_dir}/turbo-served"
+  # Created by the build step on exit, whatever its outcome: publish-turbo runs
+  # beside the build, publishing each artifact as turbo finishes it, and stops
+  # after one last pass once this exists. stage-scripts removes it first, so a
+  # file the checkout carried cannot end the publisher before the build starts.
+  build_done = "${local.staged_dir}/build.done"
   serve_port = 8082
   serve_log  = "${local.staged_dir}/turbo-cache-server.log"
   serve_step = join("", [
@@ -624,7 +630,7 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\n${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
+  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
@@ -876,7 +882,7 @@ resource "google_cloudbuild_trigger" "warm" {
     # 2. THE BUILD, whose only purpose here is the artifacts it leaves behind.
     #    It is allowed to fail: a default branch that is briefly broken should
     #    not also stop the dependency snapshot from being published, and the
-    #    turbo step below simply finds fewer artifacts. The exit code is logged
+    #    turbo step beside it simply finds fewer artifacts. The exit code is logged
     #    by Cloud Build either way, so a permanently broken default branch is
     #    still visible.
     #
@@ -909,12 +915,25 @@ resource "google_cloudbuild_trigger" "warm" {
       ])
     }
 
-    # 3. THE TURBO ARTIFACTS.
+    # 3. THE TURBO ARTIFACTS, published WHILE the build runs.
+    #
+    #    `wait_for` the same step the build waits for, so the two start
+    #    together: each artifact is uploaded seconds after turbo finishes it,
+    #    rather than every artifact after the last lint task. Measured
+    #    2026-10-11: a foundational commit re-hashed ~800 tasks, the warm ran
+    #    20 minutes and published them all at its end, and pull requests in that
+    #    window rebuilt ~200 of ~240 build tasks with hashes the warm already
+    #    had. The step ends after the build step creates `build_done` (on exit,
+    #    whatever its outcome) and one final pass. It runs no repository code.
+    #    publish-snapshot, with no `wait_for`, still waits for both.
     step {
       id     = "publish-turbo"
       name   = var.gcloud_image
       script = local.run_turbo
+
+      wait_for = ["dependencies"]
       env = [
+        "WARM_BUILD_DONE=${local.build_done}",
         "WARM_BUCKET=${var.cache_bucket}",
         "WARM_TURBO_PREFIX=${local.turbo_prefix}",
         "WARM_TURBO_DIR=${var.turbo_cache_dir}",
