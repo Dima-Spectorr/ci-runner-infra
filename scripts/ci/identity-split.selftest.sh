@@ -330,18 +330,29 @@ else
   bad "nothing refuses controller_service_account_email = this pool's host account — that is the collapse create_controller_service_account rejects, reached by a route with no check on it"
 fi
 
-# 21. On Windows the controller writes the registration token onto the host,
-#     and setMetadata checks actAs on the host's account (#898). SA-scoped to
-#     this pool's host account, windows only, bound to the controller — never
-#     project-level, never on a linux pool.
-actas="$(block '^resource "google_service_account_iam_member" "controller_acts_as_windows_host"' "$IDENTITY/main.tf")"
-if matches "$actas" '^  count              = var\.host_os == "windows" \? 1 : 0' &&
-   matches "$actas" 'service_account_id = google_service_account\.runner\.name' &&
+# 21. The controller writes metadata onto every pool's hosts — the Windows
+#     registration token (#898) and the cordon flag on every OS (#948) — and
+#     setMetadata checks actAs on the host's account. SA-scoped to this pool's
+#     host account, every OS, bound to the controller — never project-level.
+actas="$(block '^resource "google_service_account_iam_member" "controller_acts_as_host"' "$IDENTITY/main.tf")"
+if matches "$actas" 'service_account_id = google_service_account\.runner\.name' &&
    matches "$actas" 'role               = "roles/iam\.serviceAccountUser"' &&
-   matches "$actas" 'member             = "serviceAccount:\$\{local\.controller_email\}"'; then
-  ok "the controller may act as the Windows host account, and only that one"
+   matches "$actas" 'member             = "serviceAccount:\$\{local\.controller_email\}"' &&
+   matches "$actas" 'count = var\.create_controller_service_account \|\| var\.controller_service_account_email != "" \? 1 : 0' &&
+   ! matches "$actas" 'host_os'; then
+  ok "the controller may act as this pool's host account on every OS, only that one, and never when it IS the host account"
 else
-  bad "the controller cannot act as the Windows host account (or the grant is broader) — every registration-token write is refused and the host denies boot at phase 5"
+  bad "the controller cannot act as every pool's host account (or the grant is broader, or OS-gated, or written when the controller falls back to the host account itself) — Windows hosts deny boot at phase 5 and every Linux cordon flag is refused, so cordoned hosts keep taking jobs"
+fi
+
+# 22. The grant was `controller_acts_as_windows_host[0]`. Without the moved
+#     block every Windows pool destroys and recreates its only boot-time grant.
+moved="$(cat "$IDENTITY/main.tf")"
+if matches "$moved" 'from = google_service_account_iam_member\.controller_acts_as_windows_host\[0\]' &&
+   matches "$moved" 'to   = google_service_account_iam_member\.controller_acts_as_host\[0\]'; then
+  ok "the old Windows-only actAs grant moves to the every-OS one"
+else
+  bad "no moved block from controller_acts_as_windows_host[0] to controller_acts_as_host[0] — every Windows pool would destroy and recreate its boot-time grant"
 fi
 
 if [ "$fail" -eq 0 ]; then
