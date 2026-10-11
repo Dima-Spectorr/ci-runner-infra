@@ -582,9 +582,18 @@ while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   # and never buy the host that would have registered one -- a deadlock that
   # only an operator could break. It is correct for every machine type this
   # module can create; an arm64 pool would need this to follow the machine type.
+  #
+  # `background` (#1533) is the fourth label no `ci-runner-labels` value carries:
+  # every Linux host adds it to its lower slots (host-startup.sh `slot_labels`),
+  # and push/schedule runs ask for it. Left out of the match set, every one of
+  # those jobs would fail the subset test, count as nobody's demand, and a pool
+  # whose only work was a push run would never buy the host that runs it.
+  # Linux only, like the slots that carry it: a Windows host registers no such
+  # label, and answering for it there would buy Windows hosts for Linux work.
   P_MATCH_JSON["$p_name"]=$(printf '%s' "$p_labels" | jq -R -c --arg os "$p_hostos" '
     (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
     | split(",") + ["self-hosted", $osl, "X64"]
+      + (if $osl == "Linux" then ["background"] else [] end)
     | map(select(length > 0) | ascii_downcase) | unique')
   P_MATCH_CSV["$p_name"]=$(printf '%s' "${P_MATCH_JSON[$p_name]}" | jq -r 'join(",")')
 done <<<"$pool_rows"

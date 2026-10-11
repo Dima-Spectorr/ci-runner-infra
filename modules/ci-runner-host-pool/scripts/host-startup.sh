@@ -91,6 +91,9 @@ KEY_SECRET=$(md "instance/attributes/ci-app-key-secret")
 LABELS=$(md "instance/attributes/ci-runner-labels")
 RUNNER_GROUP=$(md "instance/attributes/ci-runner-group")
 SLOTS=$(md "instance/attributes/ci-slots")
+# How many of the TOP slots take pull-request work only (#1533). Computed by the
+# module from the autoscaler headroom; validated below, once SLOTS is known.
+INTERACTIVE_SLOTS=$(md "instance/attributes/ci-interactive-slots")
 POOL=$(md "instance/attributes/ci-pool")
 JOB_SA=$(md "instance/attributes/ci-job-service-account")
 BROKER_PORT=$(md "instance/attributes/ci-job-broker-port")
@@ -149,6 +152,30 @@ TURBO_MAX_ARTIFACT=${TURBO_MAX_ARTIFACT:-536870912}
 
 SLOTS=${SLOTS:-1}
 
+# --- background slots (#1533) --------------------------------------------------
+#
+# Slots 1..BACKGROUND_SLOTS also answer to `background`; the slots above them do
+# not. Push and schedule runs ask for `background` (the shared-infra anchor adds
+# it), so they can only ever fill the lower slots, and the top INTERACTIVE_SLOTS
+# of every host stay free for pull-request jobs -- which ask for no such label
+# and so fit every slot. Measured on IntegrateIT 2026-10-10: unpinned PR shards
+# waited up to 164s while a 17-job push run held the pool.
+#
+# Fails closed. The value is rendered by the same template that ships this
+# script, so a missing or malformed one is a mis-wired pool, and guessing would
+# guess one of two silent failures: `background` on every slot (no PR priority)
+# or on none (push work queued forever against a label nothing carries).
+case "${INTERACTIVE_SLOTS:-}" in
+  '' | *[!0-9]*) die "ci-interactive-slots metadata is '${INTERACTIVE_SLOTS:-}', not a whole number -- refusing to guess which slots push runs may use" ;;
+esac
+case "$SLOTS" in
+  '' | *[!0-9]*) die "ci-slots metadata is '$SLOTS', not a whole number" ;;
+esac
+[ "$INTERACTIVE_SLOTS" -lt "$SLOTS" ]   || die "ci-interactive-slots ($INTERACTIVE_SLOTS) leaves none of this host's $SLOTS slot(s) for background work -- push runs would queue forever"
+# Base 10 explicitly: a hand-edited `010` passes the digit check above and
+# bash arithmetic would otherwise read it as octal.
+BACKGROUND_SLOTS=$((10#$SLOTS - 10#$INTERACTIVE_SLOTS))
+
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   die "missing ci-github-owner/ci-github-repo metadata"
 fi
@@ -172,6 +199,17 @@ fi
 [ -n "${HOSTNAME_SHORT:-}" ] || die "could not read instance/name from metadata — without it this host cannot publish its affinity label, and a pinned job would queue against a label nothing answers"
 HOST_LABEL="host-$HOSTNAME_SHORT"
 LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
+
+# The label list ONE slot registers with: the pool's, plus `background` on the
+# lower BACKGROUND_SLOTS slots only. A pure function of its index so the
+# self-test can run it for every slot of a host rather than trust its text.
+slot_labels() { # <idx>
+  if [ "$1" -le "$BACKGROUND_SLOTS" ]; then
+    printf '%s,background' "$LABELS"
+  else
+    printf '%s' "$LABELS"
+  fi
+}
 [ -d "$RUNNER_HOME" ] || die "golden image is missing $RUNNER_HOME — this host was booted from the wrong image, and booting a bare image here would reintroduce the per-job install cost this pool removes"
 
 # --- GitHub App installation token -------------------------------------------
@@ -4998,6 +5036,7 @@ Environment=CI_SLOT_VCPUS=$(( cpus / SLOTS > 0 ? cpus / SLOTS : 1 ))
 Environment=CI_SLOT_MEM_MB=$(( mem_kb / 1024 / SLOTS ))
 Environment=CI_HOST_VCPUS=$cpus
 Environment=CI_HOST_SLOTS=$SLOTS
+Environment=CI_HOST_BACKGROUND_SLOTS=$BACKGROUND_SLOTS
 EOF
 }
 
@@ -6318,7 +6357,7 @@ install_slot() {
     --unattended --replace --disableupdate \
     --url "https://github.com/$OWNER/$REPO" \
     --name "$name" \
-    --labels "$LABELS" \
+    --labels "$(slot_labels "$idx")" \
     --work "$dir/_work" \
     "${group_arg[@]}" >>/var/log/ci-host.log 2>&1 || {
       # Through refuse_slot like the gates above it, and for a reason of its own:

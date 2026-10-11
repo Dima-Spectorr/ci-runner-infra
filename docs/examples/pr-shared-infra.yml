@@ -188,6 +188,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # shared-infra-exempt(lint, #248): a linter touches no database, and pinning
   # it would serialise it behind the anchor for no benefit
+  #
+  # This file triggers on pull_request only, so a literal pool is right here. A
+  # workflow that ALSO runs on push or schedule must not name the pool by hand:
+  # those runs are background work (#1533), and a literal list lacks the
+  # `background` label that keeps them off the slots each host reserves for PR
+  # jobs. Take `fromJSON(needs.anchor.outputs.pool)` instead (anchor v5.119.0+,
+  # rolled out AFTER the hosts — see docs/ci-pr-shared-infra.md).
   lint:
     name: Lint
     if: github.event.pull_request.head.repo.fork == false

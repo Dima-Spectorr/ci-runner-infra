@@ -1947,6 +1947,58 @@ else
   bad "the remote build cache is mis-wired — a slot pointed at a dead or unreachable server, a cache the network can reach, or a boot that dies over it; every one of those presents as builds that pass and are slow, which is the failure this layer exists to end"
 fi
 
+# PR PRIORITY (#1533). The lower slots of a host answer to `background`, the
+# top ones do not, and push/schedule runs ask for `background` -- so push work
+# can only ever fill the lower slots and a pull-request job finds a top slot
+# free. Both ways of breaking it are SILENT: `background` on every slot hands
+# the whole host back to push runs (PR jobs wait again, measured 164s on
+# 2026-10-10), and `background` on no slot leaves every push job queued against
+# a label nothing carries until GitHub cancels it a day later.
+#
+# So `slot_labels` is extracted and RUN for every slot of a host, not matched.
+slot_labels_behaves() { # <file>
+  local body code got
+  body=$(extract_fn "$1" slot_labels)
+  # An empty extraction defines nothing and fails every case below, which would
+  # read as a passing mutation for the wrong reason. Refuse it explicitly.
+  case "$body" in
+    *BACKGROUND_SLOTS*) : ;;
+    *) return 1 ;;
+  esac
+  # A 4-slot host with one interactive slot: slots 1-3 background, slot 4 not.
+  # shellcheck disable=SC2034  # LABELS and BACKGROUND_SLOTS are read by the eval'd body
+  got=$(
+    LABELS="self-hosted,pool,host-x"
+    BACKGROUND_SLOTS=3
+    eval "$body"
+    for i in 1 2 3 4; do printf '%s|' "$(slot_labels "$i")"; done
+  )
+  [ "$got" = "self-hosted,pool,host-x,background|self-hosted,pool,host-x,background|self-hosted,pool,host-x,background|self-hosted,pool,host-x|" ] || return 1
+  # A one-slot host (interactive 0): its only slot must still take push work.
+  # shellcheck disable=SC2034
+  got=$(LABELS="self-hosted,pool"; BACKGROUND_SLOTS=1; eval "$body"; slot_labels 1)
+  [ "$got" = "self-hosted,pool,background" ] || return 1
+
+  code=$(code_of "$1")
+  # the split comes from the module, not a literal on the host
+  matches "$code" '^INTERACTIVE_SLOTS=\$\(md "instance/attributes/ci-interactive-slots"\)$' || return 1
+  matches "$code" '^BACKGROUND_SLOTS=\$\(\(10#\$SLOTS - 10#\$INTERACTIVE_SLOTS\)\)$' || return 1
+  # and a value that leaves no background slot is refused, not run
+  matches "$code" '\[ "\$INTERACTIVE_SLOTS" -lt "\$SLOTS" \]' || return 1
+  matches "$code" '\|\| die "ci-interactive-slots \(' || return 1
+  # every slot registers ITS list, never the pool's
+  matches "$code" '^    --labels "\$\(slot_labels "\$idx"\)" \\$' || return 1
+  ! matches "$code" '--labels "\$LABELS"' || return 1
+  # and the anchor can size a background fan-out from it
+  matches "$code" '^Environment=CI_HOST_BACKGROUND_SLOTS=\$BACKGROUND_SLOTS$'
+}
+
+if slot_labels_behaves "$SCRIPT"; then
+  ok
+else
+  bad "the background label is not on exactly the lower slots of a host -- on every slot, push runs take the slots pull-request jobs wait for; on none, push jobs queue against a label nothing carries"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 if has_slot_share "$SCRIPT"; then
   ok
@@ -2148,6 +2200,14 @@ mutate "share hardcoded"              's@Environment=CI_SLOT_VCPUS=\$(( cpus / S
 mutate "memory share dropped"         '/^Environment=CI_SLOT_MEM_MB=/d'                           has_slot_share
 mutate "host totals dropped"          '/^Environment=CI_HOST_VCPUS=/d'                            has_slot_share
 mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'                            has_slot_share
+
+mutate "background on every slot"            's@if \[ "\$1" -le "\$BACKGROUND_SLOTS" \]; then@if true; then@'   slot_labels_behaves
+mutate "background on no slot"               "s@'%s,background'@'%s'@"                                              slot_labels_behaves
+mutate "every slot registers the pool list"  's@--labels "\$(slot_labels "\$idx")"@--labels "$LABELS"@'               slot_labels_behaves
+mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
+mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves
+mutate "interactive count never read"        '/^INTERACTIVE_SLOTS=\$(md /d'                                         slot_labels_behaves
+mutate "background count not published"      '/^Environment=CI_HOST_BACKGROUND_SLOTS=/d'                            slot_labels_behaves
 
 mutate "band DNAT dropped"            '/PREROUTING -d "\$addr" -p tcp --dport/,+3d'          has_shared_infra_band
 mutate "DNAT matched on the interface" 's@PREROUTING -d "\$addr" -p tcp@PREROUTING -i "$ifc" -p tcp@g' has_shared_infra_band

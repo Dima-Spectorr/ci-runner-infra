@@ -52,6 +52,13 @@ variable "name" {
     condition     = !startswith(var.name, "ci-shared-infra-")
     error_message = "name must not start with \"ci-shared-infra-\" — that prefix is reserved for the tags shared_infra_id mints, and a pool wearing one joins that pair's firewall rules as a source or a target."
   }
+
+  validation {
+    # The pool name is always published as a runner label (main.tf
+    # `runner_labels`), so this name would put the reserved label on every slot.
+    condition     = lower(var.name) != "background"
+    error_message = "name may not be `background`: the pool name is added as a runner label on every slot, and `background` is reserved for the lower slots that push runs use."
+  }
 }
 
 variable "instance_base_name" {
@@ -464,6 +471,12 @@ variable "autoscaler_headroom_slots" {
     0 restores the old zero-headroom behaviour. The effective assignment is
     floored at 1, so this cannot be set high enough to make the autoscaler
     believe a host serves no jobs at all.
+
+    The same slots are the host's INTERACTIVE slots (#1533, Linux hosts): the
+    top min(this, slots_per_host - 1) slots of every host do not carry the
+    `background` label, so push and schedule runs (which ask for it through the
+    shared-infra anchor) never occupy them and a pull-request job finds them
+    free. 0 therefore also means "no PR priority". See docs/ci-pr-shared-infra.md.
   EOT
   type        = number
   default     = 1
@@ -753,6 +766,10 @@ variable "runner_labels" {
     `host-<instance-name>`, and the controller reads a `host-*` entry in a job's
     `runs-on` as an affinity pin to one machine. A pool label sharing that
     prefix would be read as a pin to a host that does not exist.
+
+    `background` is RESERVED too (#1533): the host adds it to its lower slots
+    only, which is what keeps the top slots for pull-request work. Configured
+    here it would land on EVERY slot and silently switch that priority off.
   EOT
   type        = list(string)
   default     = []
@@ -760,6 +777,19 @@ variable "runner_labels" {
   validation {
     condition     = alltrue([for l in var.runner_labels : !startswith(l, "host-")])
     error_message = "runner_labels may not start with `host-`: that prefix is reserved for the per-instance affinity label, and a pool label using it would be read as a pin to a host that does not exist."
+  }
+
+  validation {
+    condition     = alltrue([for l in var.runner_labels : lower(l) != "background"])
+    error_message = "runner_labels may not contain `background`: the host adds that label to its lower slots only, so pull-request jobs keep the top slots. Configured on the pool it would reach every slot and push runs would take the slots PR jobs are waiting for."
+  }
+
+  validation {
+    # The list is joined with commas into ONE `config.sh --labels` argument, so
+    # an entry like "x,background" would smuggle a reserved label past the
+    # per-entry checks above.
+    condition     = alltrue([for l in var.runner_labels : !strcontains(l, ",") && trimspace(l) == l && l != ""])
+    error_message = "runner_labels entries may not be empty or contain commas or surrounding whitespace: the list is joined with commas into one label argument, so a comma would split one entry into several labels."
   }
 }
 

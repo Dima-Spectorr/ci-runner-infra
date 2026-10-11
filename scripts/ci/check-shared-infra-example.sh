@@ -223,13 +223,13 @@ while IFS= read -r line; do
   n=$(printf '%s\n' "$line" \
     | sed -e 's/\$([^)]*)/A/g' -e 's/"[^"]*"/A/g' -e 's/^[[:space:]]*publish[[:space:]]*//' \
     | tr -s ' ' '\n' | grep -c '.')
-  [ "$n" -ge 5 ] || short=$((short + 1))
+  [ "$n" -eq 6 ] || short=$((short + 1))
 done < <(grep -E '^[[:space:]]*publish[[:space:]]+' "$ANCHOR")
 
 if [ "$calls" -eq 0 ]; then
   bad "the anchor publishes its outputs nowhere — either the helper was renamed or this check stopped asserting anything"
 elif [ "$short" -ne 0 ]; then
-  bad "$short of $calls publish() call(s) in the anchor pass fewer than 5 arguments: a degrade branch that omits one hands the caller the literal string 'null' for that output, which fails in the consuming job long after the anchor went green"
+  bad "$short of $calls publish() call(s) in the anchor do not pass exactly 6 arguments (runs-on, addr, pg, pinned, slots, pool): a degrade branch that omits one hands the caller the literal string 'null' for that output, which fails in the consuming job long after the anchor went green"
 else
   ok
 fi
