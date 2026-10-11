@@ -149,7 +149,10 @@ WARM_SERVED_DIR="${WARM_SERVED_DIR:-}"
 # repository changes what it should be.
 PUBLISH_PARALLEL=16
 
-RESULTS=$(mktemp -d) && mkdir "$RESULTS/deferred" || { log "the result directory could not be staged"; exit 2; }
+if ! RESULTS=$(mktemp -d) || ! mkdir "$RESULTS/deferred"; then
+  log "the result directory could not be staged"
+  exit 2
+fi
 trap 'rm -rf "$RESULTS"' EXIT
 
 # Sets HTTP_CODE and err_detail; never returns non-zero, because every outcome
