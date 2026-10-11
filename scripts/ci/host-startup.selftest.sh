@@ -1987,7 +1987,7 @@ slot_labels_behaves() { # <file>
   matches "$code" '\[ "\$INTERACTIVE_SLOTS" -lt "\$SLOTS" \]' || return 1
   matches "$code" '\|\| die "ci-interactive-slots \(' || return 1
   # every slot registers ITS list, never the pool's
-  matches "$code" '^    --labels "\$\(slot_labels "\$idx"\)" \$' || return 1
+  matches "$code" '^    --labels "\$\(slot_labels "\$idx"\)" \\$' || return 1
   ! matches "$code" '--labels "\$LABELS"' || return 1
   # and the anchor can size a background fan-out from it
   matches "$code" '^Environment=CI_HOST_BACKGROUND_SLOTS=\$BACKGROUND_SLOTS$'

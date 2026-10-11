@@ -615,6 +615,14 @@ jobs:
       - name: shared-infra-db fallback self-test
         run: bash scripts/ci/shared-infra-db.selftest.sh
 
+      # The anchor's `run:` block, RUN rather than read (#1533): extracted as
+      # GitHub runs it and driven against stub `ci-pin-hold`/`docker`. Pins
+      # which events ask for `background`, the width a background run may fan
+      # out to, the `pool` output, and the unpinned fallback for a host with no
+      # background slot to spare — each a silent failure in a consumer.
+      - name: shared-infra anchor self-test
+        run: bash scripts/ci/shared-infra-anchor.selftest.sh
+
       # The Windows startup script is guarded twice, because the two harnesses
       # answer different questions. Pester (in the Windows job) executes the
       # functions and checks what they RETURN. This one reads the file as text

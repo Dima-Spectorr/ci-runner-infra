@@ -178,6 +178,16 @@ on:
           Every one of those runs was serialised against a limit that was not
           there.
         value: ${{ jobs.anchor.outputs.slots }}
+      pool:
+        description: >-
+          The UNPINNED pool as a JSON array, consumed with `fromJSON` — the
+          array `runs-on` would hold had this run not pinned a host. For a job
+          that must NOT share the pinned host (a heavy leg that would starve
+          its siblings) without restating the label set by hand. On a push or
+          schedule run it carries `background` (#1533), so such a leg also
+          stays off the slots each host keeps for pull-request work; on a fork
+          it is the hosted array, the same as `runs-on`.
+        value: ${{ jobs.anchor.outputs.pool }}
 
 permissions:
   contents: read
@@ -221,7 +231,14 @@ jobs:
     # a self-hosted pool, and the only way to build one from an input is to
     # build the JSON and read it back. A `repo-label` that is not a plain label
     # fails `fromJSON` here, loudly, rather than silently matching no runner.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && inputs.hosted-runner || fromJSON(format('["self-hosted","linux","gcp","{0}"]', inputs.repo-label)) }}
+    #
+    # PR PRIORITY (#1533). A push or schedule run asks for `background` too,
+    # and only the LOWER slots of each host carry that label: the top
+    # `ci-interactive-slots` of every host answer to pull-request work alone.
+    # The anchor asks for it here as well as in what it publishes, because the
+    # host and slot the anchor lands on decide where the whole run pins — an
+    # anchor on a top slot would hand a push run's stack the slot PR jobs need.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && inputs.hosted-runner || fromJSON(format('["self-hosted","linux","gcp","{0}"{1}]', inputs.repo-label, (github.event_name == 'push' || github.event_name == 'schedule') && ',"background"' || '')) }}
     # Fixed, not an input — see the note in the input block above.
     timeout-minutes: 15
     outputs:
@@ -230,6 +247,7 @@ jobs:
       pg: ${{ steps.up.outputs.pg }}
       pinned: ${{ steps.up.outputs.pinned }}
       slots: ${{ steps.up.outputs.slots }}
+      pool: ${{ steps.up.outputs.pool }}
     steps:
       # The CALLER's repository at the caller's sha: in a `workflow_call` the
       # `github` context is the caller's event, so this is the tree whose
@@ -252,10 +270,11 @@ jobs:
           MIGRATE: ${{ inputs.migrate }}
           HOSTED_RUNNER: ${{ inputs.hosted-runner }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          # Every exit below publishes all five outputs. `addr` and `pg` are
+          # Every exit below publishes all six outputs. `addr` and `pg` are
           # published EMPTY on a degrade rather than omitted, so a consumer that
           # reads them gets an obviously-blank value instead of the literal
           # string `null` that a missing output yields.
@@ -266,15 +285,28 @@ jobs:
           # consumed it, long after the anchor went green. Both are therefore
           # arguments here rather than optional, so a new degrade branch cannot
           # be added without stating what it means for a fan-out.
-          publish() { # <runs-on-json> <addr> <pg> <pinned:0|1> <slots>
+          publish() { # <runs-on-json> <addr> <pg> <pinned:0|1> <slots> <pool-json>
             {
               printf 'runs-on=%s\n' "$1"
               printf 'addr=%s\n' "$2"
               printf 'pg=%s\n' "$3"
               printf 'pinned=%s\n' "$4"
               printf 'slots=%s\n' "$5"
+              printf 'pool=%s\n' "$6"
             } >> "$GITHUB_OUTPUT"
           }
+
+          # PR PRIORITY (#1533). Push and schedule runs are BACKGROUND work: on
+          # `main` they check and warm the cache, and nobody waits on them to
+          # merge. Every array this anchor publishes then carries `background`,
+          # a label only the lower slots of each host register with, so the top
+          # `ci-interactive-slots` of every host stay free for pull-request
+          # jobs. Every other event — pull_request above all — asks for no such
+          # label and so fits every slot.
+          case "${EVENT_NAME:-}" in
+            push | schedule) background=1 ;;
+            *) background=0 ;;
+          esac
 
           # The concurrency a pinned run actually gets. `CI_HOST_SLOTS` is set
           # by the host at boot beside `CI_HOST_LABEL`; one slot is held by
@@ -296,14 +328,16 @@ jobs:
           # template would put an unescaped `"` straight into the JSON, and the
           # consumer's `fromJSON` would fail in a job that never named the
           # value.
-          pool="$(jq -cn --arg l "$REPO_LABEL" '["self-hosted","linux","gcp",$l]')"
+          pool="$(jq -cn --arg l "$REPO_LABEL" --arg bg "$background" \
+                    '["self-hosted","linux","gcp",$l] + (if $bg == "1" then ["background"] else [] end)')"
 
           # A fork pull request runs entirely on GitHub-hosted runners: no warm
           # host, no pin, and no shared stack. A suite that needs the stack has
           # to bring up its own throwaway service on this leg, or not run on
           # forks.
           if [ "${IS_FORK:-false}" = "true" ]; then
-            publish "$(jq -cn --arg r "$HOSTED_RUNNER" '[$r]')" "" "" 0 0
+            hosted="$(jq -cn --arg r "$HOSTED_RUNNER" '[$r]')"
+            publish "$hosted" "" "" 0 0 "$hosted"
             echo "::notice::fork pull request — the whole run stays on hosted runners"
             exit 0
           fi
@@ -312,7 +346,7 @@ jobs:
           # contract: degrade to unpinned scheduling, do not fail. A gate that
           # bricks every run on an old host is a gate that gets reverted.
           if [ -z "${CI_HOST_LABEL:-}" ]; then
-            publish "$pool" "" "" 0 0
+            publish "$pool" "" "" 0 0 "$pool"
             echo "::notice::host predates the affinity contract — running unpinned"
             exit 0
           fi
@@ -324,6 +358,33 @@ jobs:
           pg=$(( CI_SHARED_INFRA_PORT_MIN + 0 ))
           [ "$pg" -le "$CI_SHARED_INFRA_PORT_MAX" ] || { echo "band exhausted"; exit 1; }
 
+          # THE WIDTH A PINNED RUN GETS, decided BEFORE the host is held. A
+          # pull-request run may use every slot but the reserved one. A
+          # background run may use only the host's background slots, less the
+          # one `--reserve-slot` takes — its jobs carry `background` and cannot
+          # land on the top slots at all. `CI_HOST_BACKGROUND_SLOTS` is set at
+          # boot beside `CI_HOST_SLOTS`.
+          #
+          # Fewer than one usable slot — a host whose only background slot is
+          # the one the stack would hold, or one too old to say how many it has
+          # — runs UNPINNED rather than pinning a host its own consumers could
+          # never be scheduled on. The exit comes before `ci-pin-hold`, so no
+          # pin is taken that nothing would use.
+          if [ "$background" = 1 ]; then
+            b="${CI_HOST_BACKGROUND_SLOTS:-}"
+            case "$b" in
+              '' | *[!0-9]*) b=0 ;;
+            esac
+            slots=$(( 10#$b - 1 ))
+            if [ "$slots" -lt 1 ]; then
+              publish "$pool" "" "" 0 0 "$pool"
+              echo "::notice::background run, and this host has no background slot beside the reserved one (CI_HOST_BACKGROUND_SLOTS='${CI_HOST_BACKGROUND_SLOTS:-}') — running unpinned"
+              exit 0
+            fi
+          else
+            slots="$(free_slots)"
+          fi
+
           # READ THE ANSWER. `ci-pin-hold` is an admission decision, not a
           # request: it exits 0 either way and says `pinned=0` when another run
           # already holds this host. Publishing the label anyway pins every
@@ -333,13 +394,13 @@ jobs:
           # `--reserve-slot` is what keeps the stack alive after this job ends.
           if [ "$(ci-pin-hold --run "$GITHUB_RUN_ID" --ttl "$CI_PIN_TTL" --reserve-slot \
                     | sed -n 's/^pinned=//p')" != 1 ]; then
-            publish "$pool" "" "" 0 0
+            publish "$pool" "" "" 0 0 "$pool"
             echo "::notice::another run holds this host — running unpinned"
             exit 0
           fi
 
-          pinned="$(jq -cn --arg l "$REPO_LABEL" --arg h "$CI_HOST_LABEL" \
-                      '["self-hosted","linux","gcp",$l,$h]')"
+          pinned="$(jq -cn --arg l "$REPO_LABEL" --arg h "$CI_HOST_LABEL" --arg bg "$background" \
+                      '["self-hosted","linux","gcp",$l,$h] + (if $bg == "1" then ["background"] else [] end)')"
 
           # PIN-ONLY. An empty `compose-file` means this run wants rule 1 and
           # not rule 2: the host is pinned and every job lands together, but
@@ -357,7 +418,7 @@ jobs:
           # A consumer using `shared-infra-db` therefore falls back on its own
           # leg without needing to know which of the two happened.
           if [ -z "$COMPOSE_FILE_IN" ]; then
-            publish "$pinned" "$CI_SHARED_INFRA_ADDR" "" 1 "$(free_slots)"
+            publish "$pinned" "$CI_SHARED_INFRA_ADDR" "" 1 "$slots" "$pool"
             echo "::notice::pinned ${CI_HOST_LABEL} with no shared stack — compose-file is empty"
             exit 0
           fi
@@ -374,4 +435,4 @@ jobs:
               bash -c "$MIGRATE"
           fi
 
-          publish "$pinned" "$CI_SHARED_INFRA_ADDR" "$pg" 1 "$(free_slots)"
+          publish "$pinned" "$CI_SHARED_INFRA_ADDR" "$pg" 1 "$slots" "$pool"

@@ -412,6 +412,81 @@ the credential the server checks. `health-timeout` is a whole number of
 seconds, validated: `90m` is rejected with a message instead of reaching the
 arithmetic and dying as a bash syntax error.
 
+### Push and schedule runs are background work (#1533)
+
+Measured on IntegrateIT, 2026-10-10: in 2 of 8 pull-request runs, jobs waited
+100-192s for a runner while a push-to-`main` run held the pool with a build and
+nine test shards. On `main` those runs only check and warm the cache — nobody
+waits on them to merge — so they should never take a slot a PR job is waiting
+for.
+
+**What the hosts do.** Each host keeps its top `ci-interactive-slots` for
+pull-request work only. The module sets it to `min(autoscaler_headroom_slots,
+slots_per_host - 1)`, so it is the headroom the autoscaler already pays for, not
+a new knob. Slots `1 .. slots - interactive` also register the `background`
+label; the top slots do not. Every host keeps at least one background slot, and a
+1-slot host behaves exactly as before. The host exports
+`CI_HOST_BACKGROUND_SLOTS` beside `CI_HOST_SLOTS`, and the controller counts a
+queued `background` job as demand on the Linux pool, so push work still scales
+the pool up.
+
+**What the anchor does.** On a `push` or `schedule` event it adds `background` to
+its own `runs-on` and to every array it publishes (`runs-on` and `pool`). Every
+other event, `pull_request` above all, asks for no such label and so fits every
+slot. A background run that pins a host gets `slots = CI_HOST_BACKGROUND_SLOTS -
+1` (its jobs cannot use the top slots, and `--reserve-slot` holds one). The
+anchor works that width out *before* `ci-pin-hold`. If it is below 1 or the value
+is missing, the run publishes **unpinned**, so no pin is taken that its own jobs
+could never be scheduled on.
+
+**The `pool` output.** The unpinned pool as a JSON array: the array `runs-on`
+would hold if this run had not pinned a host, with `background` included on a
+push or schedule run. It is the hosted array on a fork. Use it for a leg that
+must *not* share the pinned host, rather than restating the label set by hand: a
+hand-written `[self-hosted, linux, gcp, <Repo>]` on a push run lands on the slots
+PR jobs are waiting for.
+
+**What a consumer changes.** Nothing beyond bumping the anchor pin. Jobs that take
+`fromJSON(needs.anchor.outputs.runs-on)` inherit `background` automatically.
+Self-hosted jobs that name the pool directly and run on `push` should switch to
+`fromJSON(needs.anchor.outputs.pool)`.
+
+**Rollout order — hosts first, then consumers.** Roll the hosts (release
+`v5.119.0` of the host-pool and controller modules) **before** any consumer bumps
+its anchor pin. An anchor that asks for `background` against hosts that do not
+yet register it queues every push and schedule run against a label that no
+runner carries. The reverse order is harmless: new hosts serve an old anchor
+exactly as before, because an old anchor asks for no `background` and fits every
+slot. Check that the hosts carry the label before you bump any consumer:
+
+```sh
+gh api repos/<owner>/<repo>/actions/runners --paginate \
+  -q '.runners[] | select(any(.labels[]; .name == "background")) | .name'
+```
+
+#### Decision: reserved top slots, and the options we rejected
+
+We chose to reserve the top slots of every host for PR work, using the label
+GitHub already matches on. These were rejected:
+
+- **Scale-up-only priority** (the controller adds hosts sooner when PR jobs
+  queue). GitHub still gives a new host to the *oldest* queued job, which is
+  often a push job, and at `max_hosts` nothing can be added, so the priority
+  disappears exactly at the peak where it matters.
+- **A separate pool for background work.** It splits capacity: idle background
+  hosts cannot serve PR jobs and the reverse. It also needs a second set of
+  per-repository tfvars and a second autoscaler to tune.
+- **Relabelling runners at runtime** (moving `background` on and off as the queue
+  changes). It needs `administration: write` on every repository, and the
+  relabel races GitHub's job assignment: a job can be assigned in between, which
+  is the case it was meant to prevent.
+- **Cancelling push runs when PR work queues.** Push runs warm the cache that PR
+  runs read. Cancelling them saves a slot now and costs cache misses on every
+  later PR run.
+- **Runner groups.** A group restricts *which repositories or workflows* may use
+  a runner, not *which event* triggered the run, so it cannot separate push from
+  pull_request inside one workflow.
+
 ## 3. The infrastructure owner job
 
 Exactly one job in the workflow brings the stack up, and it is the anchor.

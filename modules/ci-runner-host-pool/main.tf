@@ -538,7 +538,7 @@ resource "google_compute_instance_template" "host" {
     # runner at all would queue it forever. A 1-slot host gets 0 and behaves as
     # it always did.
     "ci-interactive-slots" = tostring(min(var.autoscaler_headroom_slots, var.slots_per_host - 1))
-    "ci-metric-prefix"       = var.metric_prefix
+    "ci-metric-prefix"     = var.metric_prefix
 
     # THE CORDON FLAG, declared empty so the key exists from boot (#948).
     #
