@@ -50,7 +50,7 @@ LOG=/var/log/ci-controller.log
 # address repositories under, and it is a directory OF ITS OWN beneath the
 # state directory, never the state directory itself. The single-repository
 # controller keeps its markers directly in /var/lib/ci-controller — `idle-*`,
-# `boot-*`, `orphan-*`, `cordon-*`, `seen-*`, `etag-*`, `demand-jobs`,
+# `boot-*`, `orphan-*`, `cordon-*`, `etag-*`, `demand-jobs`,
 # `runs-counted` — and a slug is made of an owner and a repository name that
 # somebody else chose. Side by side, a repository whose slug is one of those
 # names would have had a marker file where its directory belongs. One level
@@ -1176,6 +1176,22 @@ gh_token() {
   [ -n "$GH_TOKEN" ] || return 1
   GH_TOKEN_EXPIRY=$((now + 3600))
   printf '%s' "$GH_TOKEN"
+}
+
+# gh_token_prime — run gh_token in THIS shell, so its cache is the parent's.
+#
+# Every caller reads the token as `$(gh_token)`, and a command substitution is a
+# subshell: the GH_TOKEN / GH_TOKEN_EXPIRY it sets die with it. So the hour-long
+# cache above never survived a single call, and EVERY GitHub request paid a
+# Secret Manager read plus a fresh mint. Measured on the shared controller VM
+# (2026-10-11, #1537): 9 key reads in 237s at ~5s each, the largest single cost
+# in the tick, and the reason the outcome sweep exhausted its 30s budget on
+# every tick. Primed here, each `$(gh_token)` inherits a valid cache and returns
+# it without forking anything. The token stays in memory; nothing is written.
+#
+# Never fatal: a failed mint is the callers' to report, exactly as before.
+gh_token_prime() {
+  gh_token >/dev/null || true
 }
 
 # --- the Actions-write token (#490) --------------------------------------------
@@ -3067,67 +3083,101 @@ host_facts() {
 }
 
 # host_age_seconds <host>
-# How long THIS CONTROLLER has known the host, from a file stamped the first
-# tick it appears. Deliberately not the instance's creationTimestamp: that would
-# cost an API call per host per tick, and the direction this errs in is the safe
-# one — after a controller restart every host reads young, so the worst case is
-# that a genuinely dead host survives one register-grace window instead of a
-# live one being shot.
+# How long the machine behind the host name has been up: now minus the LATER of
+# its creationTimestamp and its lastStartTimestamp, both read from the instance
+# list collect_host_boots() already makes once per pool per tick — no call per
+# host, and no file.
 #
-# The file is named after the host, so it is only "how long we have known THIS
-# machine" while forget_restarted_hosts() keeps removing it when the machine
-# behind the name cold-starts. See there.
+# It used to be a `seen-<host>` file stamped the first tick this controller saw
+# the host, so every controller restart made every host young again: a fleet
+# apply reset every never-registered / never-booted clock in the fleet, and the
+# hosts that most needed draining were the ones a restart protected (#1537).
+# The instance's own timestamps survive a controller restart; a file on the
+# controller's disk does not.
+#
+# The LATER of the two, not creationTimestamp alone: a MIG recreate is carried
+# out in place and keeps creationTimestamp (see collect_host_boots), so the
+# creation time of a host recreated a minute ago is days old. lastStartTimestamp
+# is the boot that is actually running.
+#
+# A host the list did not return — the list failed, or the instance is still
+# PROVISIONING and has no timestamp yet — reads 0. That is the safe direction:
+# a host reads young, never old.
 host_age_seconds() {
-  local host="$1"
-  local f="$STATE_DIR/seen-$host"
-  local now first
+  local born="${HOST_BORN[$1]:-}" now age
+  case "$born" in "" | *[!0-9]*) echo 0; return 0 ;; esac
   now=$(date +%s)
-  if [ ! -f "$f" ]; then
-    echo "$now" >"$f"
-    echo 0
-    return 0
-  fi
-  first=$(cat "$f" 2>/dev/null)
-  [ -n "$first" ] || { echo "$now" >"$f"; echo 0; return 0; }
-  echo $((now - first))
+  age=$((now - born))
+  [ "$age" -ge 0 ] || age=0
+  echo "$age"
 }
 
 # --- which BOOT a host's clocks belong to ------------------------------------
 #
-# Every per-host clock above and below is a file named after the HOST, and a
-# host name outlives the machine behind it. A MIG `recreateInstances` keeps the
-# name — and, measured on a regional MIG, keeps the instance too: it is carried
-# out as an in-place `instances.update` (RECREATE_DISK + RESTART), so the
-# numeric id and the creationTimestamp are both UNCHANGED. The host that comes
-# back has a blank disk and no agents, and it inherited the dead host's
-# `seen-`, `idle-` and `beaconmiss-` files. It read `absent` with an age of six
-# and a half hours and 222 beacon misses, so drain rule 5 called it
-# never-registered, the beacon rule called it never-booted, and the controller
-# deleted it 96 seconds after it was recreated.
+# Every per-host clock below is a file named after the HOST, and a host name
+# outlives the machine behind it. A MIG `recreateInstances` keeps the name —
+# and, measured on a regional MIG, keeps the instance too: it is carried out as
+# an in-place `instances.update` (RECREATE_DISK + RESTART), so the numeric id
+# and the creationTimestamp are both UNCHANGED. The host that comes back has a
+# blank disk and no agents, and it inherited the dead host's `idle-` and
+# `beaconmiss-` files and its age. It read `absent` with an age of six and a
+# half hours and 222 beacon misses, so drain rule 5 called it never-registered,
+# the beacon rule called it never-booted, and the controller deleted it 96
+# seconds after it was recreated.
 #
 # So the clocks are tied to the BOOT: the instance id (a delete and re-insert
 # under one name) together with lastStartTimestamp (a recreate in place, or any
 # stop and start). When either moves, the machine has cold-started since those
 # clocks were stamped and they describe something that no longer exists.
 #
-# ONE list call per pool per tick, not a describe per host — the cost
-# host_age_seconds refuses is still refused. And the MIG's own list-instances
-# cannot answer this: it carries `id` but no start time, and the id alone
-# would have read the incident above as "nothing changed".
+# ONE list call per pool per tick, not a describe per host. The MIG's own
+# list-instances cannot answer this: it carries `id` but no start time, and the
+# id alone would have read the incident above as "nothing changed". The same
+# call also carries what host_age_seconds and cordon adoption need — the two
+# timestamps and the host's `ci-cordon` metadata — so neither costs a call.
 #
-# A list that fails leaves HOST_BOOTS empty, and empty changes NOTHING: an
-# unreadable fact is not a restart. The direction this errs in is the one
-# host_age_seconds already chose — a host reads young, never old.
+# A list that fails leaves HOST_BOOTS, HOST_BORN and HOST_CORDON_FLAG empty, and
+# empty changes NOTHING: an unreadable fact is not a restart, a host with no
+# birth reads young, and a host with no flag is not adopted as cordoned.
 HOST_BOOTS=""
+declare -A HOST_BORN=() HOST_CORDON_FLAG=()
 
 collect_host_boots() {
   HOST_BOOTS=""
   # Without the base name there is no bound on the list, and an unbounded one
   # is every instance in the project.
-  [ -n "$MIG_BASE" ] || return 0
-  HOST_BOOTS=$(timeout 60 gcloud compute instances list --project="$PROJECT" \
-    --filter="name~^$MIG_BASE-" \
-    --format="csv[no-heading](name,id,lastStartTimestamp)" 2>/dev/null) || HOST_BOOTS=""
+  if [ -n "$MIG_BASE" ]; then
+    HOST_BOOTS=$(timeout 60 gcloud compute instances list --project="$PROJECT" \
+      --filter="name~^$MIG_BASE-" \
+      --format="csv[no-heading](name,id,creationTimestamp,lastStartTimestamp,metadata.items.filter(key:ci-cordon).extract(value).flatten())" 2>/dev/null) || HOST_BOOTS=""
+  fi
+  index_host_boots
+  return 0
+}
+
+# index_host_boots — HOST_BOOTS (`name,id,created,started,ci-cordon` rows) into
+# HOST_BORN[name] (epoch of the later timestamp) and HOST_CORDON_FLAG[name].
+index_host_boots() {
+  # Re-declared, not merely cleared, for the reason RECYCLE_SKIPS is: one
+  # controller serves several pools, and a plain assignment keeps the entries.
+  unset HOST_BORN HOST_CORDON_FLAG
+  declare -gA HOST_BORN=() HOST_CORDON_FLAG=()
+  local name id created started flag t epoch born
+  while IFS=, read -r name id created started flag; do
+    case "$name" in "" | *[!a-z0-9-]*) continue ;; esac
+    # Exactly `1`, what cordon_host writes. The host template sets the key empty.
+    [ "$flag" = "1" ] && HOST_CORDON_FLAG["$name"]=1
+    # RFC 3339 with an offset (`2026-10-10T18:26:19.181-07:00`), which jq's
+    # fromdateiso8601 refuses — so date(1), and only on a value of the
+    # documented shape.
+    born=0
+    for t in "$created" "$started"; do
+      case "$t" in "" | *[!0-9TZ:.+-]*) continue ;; esac
+      epoch=$(date -d "$t" +%s 2>/dev/null) || continue
+      [ "$epoch" -gt "$born" ] && born=$epoch
+    done
+    [ "$born" -gt 0 ] && HOST_BORN["$name"]=$born
+  done <<<"$HOST_BOOTS"
   return 0
 }
 
@@ -3135,11 +3185,13 @@ collect_host_boots() {
 # Compares each listed host's boot with the one its clocks were stamped under
 # (`boot-<host>`), and on a change removes the clocks so the readers restamp.
 #
-#   seen-        the age behind `keep:booting`, never-registered and never-booted.
 #   idle-        an idle streak the previous boot earned.
 #   partial-     likewise for the capacity-lost recycle.
 #   beaconmiss-  consecutive beacon-less reads; the new boot has had none.
 #   beaconerr- / pinerr- / pinveto-   throttle state for events about the old boot.
+#
+# The host's AGE needs nothing here: host_age_seconds reads lastStartTimestamp
+# from the same list, so a new boot is a young host by construction.
 #
 # DELIBERATELY LEFT ALONE, each for its own reason:
 #   pinhold-   the monotonic cache that makes a pin hold un-shortenable. It is
@@ -3154,8 +3206,8 @@ collect_host_boots() {
 # A host seen for the first time, or one whose start time is not readable yet
 # (an instance still PROVISIONING has none), records nothing and resets nothing.
 forget_restarted_hosts() {
-  local name id started boot known f
-  while IFS=, read -r name id started; do
+  local name id created started flag boot known f
+  while IFS=, read -r name id created started flag; do
     # The name becomes a path and the other two become a file's contents, so all
     # three are checked: a value that is not what the API documents is skipped,
     # never written.
@@ -3167,7 +3219,7 @@ forget_restarted_hosts() {
     known=$(cat "$f" 2>/dev/null) || known=""
     [ "$known" = "$boot" ] && continue
     if [ -n "$known" ]; then
-      rm -f "$STATE_DIR/seen-$name" "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" \
+      rm -f "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" \
         "$STATE_DIR/beaconmiss-$name" "$STATE_DIR/beaconerr-$name" \
         "$STATE_DIR/pinerr-$name" "$STATE_DIR/pinveto-$name"
       event INFO host-restarted "$name" "$name: cold-started since its clocks were stamped (was $known, now $boot) -- age, idle and beacon-miss clocks restart" was="$known" now="$boot"
@@ -3177,9 +3229,56 @@ forget_restarted_hosts() {
   return 0
 }
 
+# adopt_flagged_cordons
+# A host whose `ci-cordon` metadata is already 1 IS cordoned: its own sweep is
+# stopping each slot as that slot goes idle, whatever this controller's disk
+# says. The disk is what a controller restart loses — the VM is replaced on a
+# fleet apply, and with it every `cordon-` marker — so a restarted controller
+# met three half-drained hosts, found no marker, and RESERVED them from scratch:
+# a fresh register-grace wait and a replacement bought for each, on hosts that
+# were already refusing work (#1537).
+#
+# So the flag is adopted as the cordon it is: the marker is written (stamped
+# now, the earliest moment this controller can vouch for) and any reservation
+# is dropped, because recycle_decision never reserves a cordoned host. The walk
+# then continues the drain/retire path from where the previous controller left
+# it. Nothing is called and nothing is undone: a flag that is already set is
+# not re-set (see cordon_host), and a host that never carried the flag is not
+# touched.
+adopt_flagged_cordons() {
+  local host status rest
+  while IFS=, read -r host status rest; do
+    [ -n "$host" ] || continue
+    [ "${HOST_CORDON_FLAG[$host]:-}" = "1" ] || continue
+    [ -f "$STATE_DIR/cordon-$host" ] && continue
+    date +%s >"$STATE_DIR/cordon-$host"
+    rm -f "$STATE_DIR/reserve-$host"
+    event INFO cordon-adopted "$host" "$host: carries ci-cordon=1 with no cordon on this controller's disk -- adopted as already cordoned, the drain continues without a new reservation or grace wait" status="${status:-none}"
+  done <<<"$HOSTS"
+  return 0
+}
+
+# recycle_skips_event <hosts-walked> <name-of-assoc-array>
+# ONE event per pool per tick with the count of every recycle `skip:` verdict.
+# A per-host skip is deliberately not an event (it is the answer for every
+# healthy host on every tick), which left a pool that skipped EVERY host — all
+# `booting` after a controller restart, say — with nothing to show for it
+# anywhere (#1537). Every key of the closed set is emitted, zeros included, so
+# the event's shape never depends on what happened this tick.
+recycle_skips_event() {
+  local walked="$1"
+  local -n _tally="$2"
+  local k msg="" kv=()
+  for k in booting template disabled not-running registration-unknown at-capacity partial-grace other; do
+    kv+=("$k=${_tally[$k]:-0}")
+    msg+=" $k=${_tally[$k]:-0}"
+  done
+  event INFO recycle-skips "" "pool ${POOL:-}: recycle skips over $walked host(s):$msg" hosts="$walked" "${kv[@]}"
+}
+
 # --- the absence ledger -------------------------------------------------------
 #
-# host_age_seconds above answers "how long have we known this host". This
+# host_age_seconds above answers "how long has this host been up". This
 # answers the opposite and, for a pinned job, the only question that matters:
 # how long has the host been CONTINUOUSLY MISSING from the MIG's list.
 #
@@ -3193,7 +3292,7 @@ forget_restarted_hosts() {
 #
 # Keyed by HOST and not by job, so it is independent of which pins exist this
 # tick and survives a job being recreated. One file per host, the same shape as
-# seen-/idle-/orphan-, and it is refreshed for every live host every tick — so
+# idle-/orphan-, and it is refreshed for every live host every tick — so
 # "the file is old" and "the host is missing" are the same statement.
 refresh_host_liveness() {
   local live="$1" now="$2" blind="$3"
@@ -3394,8 +3493,8 @@ partial_seconds() {
 #
 # AND NONE OF THE THREE IS ALLOWED TO BE THE LAST WORD ON THE MINT PATH. All of
 # them live on the controller's boot disk, so replacing the controller erases
-# every one at the same instant — together with host_age_seconds, which restarts
-# from this controller's first sight of a host. That single event is what made a
+# every one at the same instant — together with host_age_seconds, which (until
+# #1537) restarted from this controller's first sight of a host. That event is what made a
 # cordoned host mid-job read as brand new and get handed a fresh credential into
 # its own job's metadata. The mint path therefore ends at instance_durable_facts,
 # which asks the GCE API instead. A fourth marker file cannot express either of
@@ -3541,9 +3640,10 @@ delete_registration_token() {
 # the same fact in the same place. These two survive the disk because they are
 # not on it.
 #
-# host_age_seconds explains why the tick does not read creationTimestamp: that
-# would be one describe per host per tick. This is not per tick — see the call
-# site, which sits below both the `minted` marker and the failure cap.
+# The tick's own age (host_age_seconds) comes from one instance list per pool;
+# the key half of this answer needs the instance's metadata, which is one
+# describe per host. This is not per tick — see the call site, which sits below
+# both the `minted` marker and the failure cap.
 instance_durable_facts() {
   local uri="$1" zone host created now keyrow k
   # Reset to the REFUSING pair, not to zero: every `return 1` below leaves these
@@ -3724,8 +3824,8 @@ registration_token_step() {
 
   # --- mint: `absent` ONLY ---
   #
-  # Not `partial`. host_age_seconds is controller-local, so a replaced
-  # controller reads every host as age 0; a SLOTS=2 host with slot 1 running a
+  # Not `partial`. A host's age can read 0 when the instance list fails, as
+  # every host did after a controller replacement before #1537; a SLOTS=2 host with slot 1 running a
   # pull request and slot 2 dead then reads `partial` indefinitely, and minting
   # for it writes a fresh hour-long credential into the metadata of the job on
   # slot 1. A host that is genuinely half-registered does not need a second
@@ -3760,8 +3860,8 @@ registration_token_step() {
   # Every guard above is a marker file under STATE_DIR or an age measured from
   # this controller's own boot, and a controller REPLACEMENT defeats all five at
   # once. A host mid-job that was cordoned then reads: `minted` gone with the
-  # disk, `cordon` gone with the disk, `age` 0 because host_age_seconds starts
-  # at this controller's first sight of it, `busy` 0 because cordoning
+  # disk, `cordon` gone with the disk, `age` 0 whenever the instance list could
+  # not be read (host_age_seconds errs young), `busy` 0 because cordoning
   # deregistered its agents so GitHub reports no runners, and `absent` for the
   # same reason. Brand new, by every local measure, while it executes a pull
   # request — and the token would land in the metadata that job reads and sit
@@ -3791,12 +3891,12 @@ registration_token_step() {
   # meant the controller could learn from the API that an instance is an hour
   # old, write `keylive`, and then hold that live credential for a further whole
   # REGISTER_GRACE — because the expiry chain runs above any durable read and
-  # only ever sees the controller-local `age`, which a replacement reset to 0.
+  # only ever sees the tick's `age`, which an unreadable instance list reads as 0.
   #
   # One rule, not two: the delete happens here, where the evidence is. Teaching
   # the expiry arm to read DUR_AGE instead would mean a describe per host per
-  # tick for as long as any key is live, which is exactly the cost
-  # host_age_seconds documents refusing.
+  # tick for as long as any key is live — the per-host cost the tick's one
+  # instance list (collect_host_boots) exists to avoid.
   if [ "$DUR_AGE" -ge "$REGISTER_GRACE" ]; then
     if [ "$DUR_KEY" = "present" ]; then
       if delete_registration_token "$uri"; then
@@ -3834,8 +3934,7 @@ registration_token_step() {
   # an instance created 30s ago that registered, was cordoned or lost its agents
   # mid-job, and had its token correctly deleted by the previous controller. To a
   # replacement controller that host reads `absent` (cordoning deregistered the
-  # agents), `busy=0` (same reason), `age=0` (host_age_seconds starts at this
-  # controller's first sight of it), no markers (they went with the boot disk),
+  # agents), `busy=0` (same reason), a young `age` (it IS young), no markers (they went with the boot disk),
   # DUR_AGE under the grace and DUR_KEY genuinely absent — every guard satisfied,
   # and indistinguishable from a host that has simply never registered. Minting
   # writes a fresh hour-long credential into the metadata of the job it is
@@ -4422,7 +4521,7 @@ drain_host() {
   # was absent or lapsed -- a live one vetoes the verdict that calls drain_host
   # -- so nothing is being forgotten, and a leftover file would be a veto with
   # no host to apply to.
-  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/seen-$host" "$STATE_DIR/beaconmiss-$host" \
+  rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/beaconmiss-$host" \
     "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host" "$STATE_DIR/pinveto-$host" \
     "$STATE_DIR/pinerr-$host" "$STATE_DIR/beaconerr-$host" "$STATE_DIR/boot-$host"
   event INFO drain-delete "$host" "drain $host: deregistered $deregistered agent(s) and deleted" deregistered="$deregistered"
@@ -4563,7 +4662,15 @@ cordon_host() {
   # cordon this module shipped before #948 — slower, not broken — and the
   # controller runs under `set -e`, so an unguarded gcloud here would kill the
   # tick and take every series this pool publishes down with it.
-  if [ "${RECYCLE_CORDON_STOPS_AGENTS:-false}" = "true" ]; then
+  #
+  # EXCEPT when this tick's instance list already shows the flag set
+  # (collect_host_boots). Then the write is known to have landed, and re-issuing
+  # it is the slowest call a cordoned host's tick makes — 11s measured on a
+  # controller VM serving ten repositories (#1537) — for no change. A list that
+  # failed shows no flag, so the write is still issued: the skip only ever
+  # follows evidence that the flag is there.
+  if [ "${RECYCLE_CORDON_STOPS_AGENTS:-false}" = "true" ] &&
+    [ "${HOST_CORDON_FLAG[$host]:-}" != "1" ]; then
     zone=$(zone_of_uri "$uri")
     if [ -z "$zone" ]; then
       # No zone means no instance to address, and a guessed one is a call
@@ -4676,6 +4783,9 @@ tick() {
   if [ "${LAST_TICK_START:-0}" -gt 0 ]; then CYCLE_SECONDS=$((tick_start - LAST_TICK_START)); fi
   LAST_TICK_START=$tick_start
 
+  # Before the first GitHub call of the tick — see gh_token_prime.
+  gh_token_prime
+
   # A blind tick is not an error, it is a SUSPENSION: every host reads
   # reg=unknown, so nothing drains, in EVERY pool. One is unremarkable; a run of
   # them is a fleet pinned at its current size, billing for hosts nobody is
@@ -4785,6 +4895,9 @@ tick_pool() {
   # next pool's tick on a controller that serves four of them.
   unset RECYCLE_SKIPS
   declare -gA RECYCLE_SKIPS=()
+  # A pool's walk is minutes long; re-primed so it never runs on a token that
+  # the tick-start prime left inside its refresh margin. Free while valid.
+  gh_token_prime
 
   collect_hosts
   # AFTER collect_hosts, and that ordering is the whole reason this is not part
@@ -4800,6 +4913,9 @@ tick_pool() {
   # last tick must be judged this tick on a clock that starts now.
   collect_host_boots
   forget_restarted_hosts
+  # BEFORE the marker sweep and the `recycling` count below, so an adopted
+  # cordon is counted against the budget on the tick it is adopted.
+  adopt_flagged_cordons
   classify_pinned
   rerun_cancelled_pinned
 
@@ -4809,7 +4925,8 @@ tick_pool() {
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
   local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for reserved_for
-  local skip_reason
+  local skip_reason walked=0
+  local -A skip_tally=()
 
   # Hosts already mid-recycle, counted BEFORE any decision this tick, so every
   # host is judged against the same budget rather than against however many
@@ -4928,6 +5045,7 @@ tick_pool() {
     # both — and a sixteen-host pool walked at ten seconds a host is a tick the
     # watchdog would otherwise judge wedged halfway through.
     beat
+    walked=$((walked + 1))
 
     host_facts "$host"
     busy=$HOST_BUSY
@@ -5154,16 +5272,20 @@ tick_pool() {
         # window are the only warning that it is about to act. Gated on the
         # template alone, those ticks would publish nothing and the eventual
         # delete would arrive with no run-up behind it.
+        skip_reason=${verdict#skip:}
+        skip_reason=${skip_reason%% *}
+        skip_reason=${skip_reason%%=*}
+        case "$skip_reason" in
+          # Closed set, so the label can never be widened by a verdict string
+          # somebody edits later without also editing the publisher.
+          disabled | not-running | template | registration-unknown | booting | at-capacity | partial-grace) ;;
+          *) skip_reason=other ;;
+        esac
+        # Every skip, unfiltered, for the one per-pool summary event after the
+        # walk: the per-host skip is not an event at all, so a pool whose hosts
+        # all sat at `booting` for an hour said nothing anywhere (#1537).
+        skip_tally["$skip_reason"]=$((${skip_tally["$skip_reason"]:-0} + 1))
         if [ "$tpl" != "current" ] || [ "$HOST_REG" = "partial" ]; then
-          skip_reason=${verdict#skip:}
-          skip_reason=${skip_reason%% *}
-          skip_reason=${skip_reason%%=*}
-          case "$skip_reason" in
-            # Closed set, so the label can never be widened by a verdict string
-            # somebody edits later without also editing the publisher.
-            disabled | not-running | template | registration-unknown | booting | at-capacity | partial-grace) ;;
-            *) skip_reason=other ;;
-          esac
           RECYCLE_SKIPS["$skip_reason"]=$((${RECYCLE_SKIPS["$skip_reason"]:-0} + 1))
         fi
         ;;
@@ -5215,6 +5337,10 @@ tick_pool() {
       *) : ;;
     esac
   done <<<"$HOSTS"
+
+  # ONE summary per pool per tick, always — zeros included, so "the walk ran and
+  # skipped nothing" and "the walk never ran" are different statements.
+  recycle_skips_event "$walked" skip_tally
 
   # Runs AFTER the drain loop: drain_host() deregisters the agents of the hosts
   # it deletes, so reaping first would race its own bookkeeping.
