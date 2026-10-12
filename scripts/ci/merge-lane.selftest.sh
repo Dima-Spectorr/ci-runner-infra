@@ -1607,6 +1607,20 @@ says_on_the_snapshot_that_it_halted() {
 #
 # The failing set is the base-health read's own record, and an empty one halts
 # exactly as before: "passes what fails on the base" is vacuous against nothing.
+retries_a_red_base_once() { # #1529
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    lane_base_rerun_failed "\$base_sha"$' || return 1
+  matches "$code" '^    if \[ "\$attempt" != 1 \]; then$' || return 1
+  matches "$code" 'GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST "repos/\$R/actions/runs/\$id/rerun-failed-jobs"'
+}
+
+lane_job_reruns_with_its_own_token() { # #1529
+  matches "$(code_of "$1")" '^          LANE_RERUN_TOKEN: \$\{\{ github\.token \}\}$' || return 1
+  # The lane job itself, not only recover, holds the one Actions write.
+  awk '/^  lane:/{l=1} /^  recover:/{l=0} l && /^      actions: write$/{f=1} END{exit !f}' "$1"
+}
+
 names_what_is_failing_on_a_red_base() {
   local code
   code=$(code_of "$1")
@@ -2119,6 +2133,8 @@ check names_the_failing_status_check_refusal "$DRIVER" "a 405 saying a required 
 check halts_when_the_base_itself_is_red "$DRIVER" "the lane keeps merging onto a base whose own required checks are failing, burying the commit that broke it under everything that follows"
 check only_a_definite_failure_halts_the_lane "$DRIVER" "the base-health gate halts on something other than a definite failure, which deadlocks every repository whose required checks run on pull_request only"
 check says_on_the_snapshot_that_it_halted "$DRIVER" "a halted lane renders exactly like a base with nothing open, so the queue view reports a quiet day while nothing can merge"
+check retries_a_red_base_once "$DRIVER" "a red base-health run that failed on infrastructure halts the lane until a person re-runs it (#1529), or the retry is not capped at one attempt, or acts as the App"
+check lane_job_reruns_with_its_own_token "$CALLEE" "the lane job does not hand the driver its own token or lacks actions: write, so the one re-run of a red base (#1529) is refused or would need a new App permission"
 check names_what_is_failing_on_a_red_base "$DRIVER" "a red base does not record which checks fail on it, or admits a fix against an empty list, so any green pull request merges onto the break"
 check admits_only_the_base_fix_on_a_red_base "$DRIVER" "a red base no longer filters the walk, so every green pull request merges onto the break"
 check records_the_head_states_on_a_red_base "$DRIVER" "the candidate's check states are not recorded on a red base, so the fix test re-reads every head or counts nothing as passing"
@@ -2461,6 +2477,16 @@ mutate "the detail read goes back to a tab split" "$DRIVER" \
 
 mutate "the batch stops asking whether the base allows it" "$DRIVER" \
   's@lane_batch_size "\$LANE_STRICT"@lane_batch_size "0"@' batches_only_when_the_base_allows_it
+mutate "a red base is never retried" "$DRIVER" \
+  's@^    lane_base_rerun_failed "\$base_sha"$@    :@' retries_a_red_base_once
+mutate "the retry is not capped at the first attempt" "$DRIVER" \
+  's@^    if \[ "\$attempt" != 1 \]; then$@    if false; then@' retries_a_red_base_once
+mutate "the retry acts as the App" "$DRIVER" \
+  's@GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST@gh api -X POST@' retries_a_red_base_once
+mutate "the lane job stops holding actions: write" "$CALLEE" \
+  '/base-health run once (#1529, `lane_base_rerun_failed`)/,/^      actions: write$/{/^      actions: write$/d}' lane_job_reruns_with_its_own_token
+mutate "the driver is not handed the run's token" "$CALLEE" \
+  '/^          LANE_RERUN_TOKEN: /d' lane_job_reruns_with_its_own_token
 mutate "a red base with no named failure admits a fix anyway" "$DRIVER" \
   's|"\${#LANE_BASE_FAILING\[@\]}" -eq 0 \]; then$|"${#LANE_BASE_FAILING[@]}" -lt 0 ]; then|' names_what_is_failing_on_a_red_base
 mutate "the failing set is read from the wrong file" "$DRIVER" \
@@ -3945,6 +3971,83 @@ behavioural_premerge_cases() {
   _pm_case "a pin-bump waiver for this head waives the label" merged ready-to-merge "$UNLABELLED"
   rm -rf "$fix"
 }
+
+# #1529: a red base is re-run ONCE, by the run's own token, and only where a
+# failing base-health job failed on attempt 1. Runs the shipped function
+# against a stub `gh`, so what is tested is what the lane does.
+behavioural_base_rerun_cases() {
+  local fix
+  fix="$(mktemp -d)"
+  # shellcheck disable=SC2034  # read by the evalled driver function.
+  local R="owner/repo" GH_TOKEN=app-token
+  eval "$(sed -n "/^lane_base_rerun_failed() {/,/^}/p" "$DRIVER")"
+  if ! declare -F lane_base_rerun_failed >/dev/null 2>&1; then
+    echo "FAIL lane_base_rerun_failed could not be lifted, so no re-run case ran"
+    rm -rf "$fix"
+    return
+  fi
+  # shellcheck disable=SC2317  # reached through the evalled function.
+  gh() {
+    printf '%s %s\n' "$GH_TOKEN" "$*" >>"$fix/calls"
+    case "$*" in
+      *'-X POST'*'/actions/runs/'*'/rerun-failed-jobs'*) [ ! -f "$fix/refuse" ] || { echo 'HTTP 403: Resource not accessible by integration'; return 1; } ;;
+      *'actions/runs?head_sha='*) cat "$fix/runs" ;;
+      *'actions/runs/'*'/jobs'*) cat "$fix/jobs" ;;
+      *) echo "rerun stub: unexpected gh call '$*'" >&2; return 1 ;;
+    esac
+  }
+  # _rr_case <label> <want: rerun|none> <failing names, |-separated> <run attempt> <failed job names> [dry|refuse|notoken]
+  # DRY_RUN, LANE_RERUN_TOKEN and LANE_BASE_FAILING are locals that
+  # lane_base_rerun_failed reads through bash's dynamic scope.
+  # shellcheck disable=SC2034
+  _rr_case() {
+    rm -f "$fix/calls" "$fix/refuse"
+    : >"$fix/calls"
+    printf '101 %s\n' "$4" >"$fix/runs"
+    printf '%s\n' "$5" >"$fix/jobs"
+    local DRY_RUN=false LANE_RERUN_TOKEN=run-token
+    [ "${6:-}" = dry ] && DRY_RUN=true
+    [ "${6:-}" = refuse ] && : >"$fix/refuse"
+    [ "${6:-}" = notoken ] && LANE_RERUN_TOKEN=''
+    local -a LANE_BASE_FAILING=()
+    [ -z "$3" ] || IFS='|' read -r -a LANE_BASE_FAILING <<<"$3"
+    local rc=0 out
+    out="$(lane_base_rerun_failed aaaaaaaa1111 2>&1)" || rc=$?
+    local got=none
+    grep -q 'rerun-failed-jobs' "$fix/calls" && got=rerun
+    if [ "$got" = "$2" ] && [ "$rc" = 0 ]; then
+      printf 'PASS %s\n' "$1"
+    else
+      printf 'FAIL %s — %s (rc=%s), want %s; output: %s\n' "$1" "$got" "$rc" "$2" "${out//$'\n'/ }"
+    fi
+  }
+  _rr_case "a failing base-health job on attempt 1 is re-run" rerun main-health 1 main-health
+  if grep -q '^run-token .*-X POST repos/owner/repo/actions/runs/101/rerun-failed-jobs' "$fix/calls" && ! grep -q '^app-token .*-X POST' "$fix/calls"; then
+    echo "PASS the re-run uses the run's own token, never the App's"
+  else
+    echo "FAIL the re-run must use LANE_RERUN_TOKEN, not the App token; calls: $(tr '\n' ' ' <"$fix/calls")"
+  fi
+  _rr_case "attempt 2 already was the retry — no second re-run" none main-health 2 main-health
+  _rr_case "a run whose failed job is not a failing base-health name is left alone" none main-health 1 lint
+  _rr_case "no failing base-health name — nothing is read or re-run" none '' 1 main-health
+  if [ ! -s "$fix/calls" ]; then echo "PASS an empty failing list makes no API call"; else
+    echo "FAIL an empty failing list still called the API: $(tr '\n' ' ' <"$fix/calls")"
+  fi
+  _rr_case "dry-run only says what it would re-run" none main-health 1 main-health dry
+  _rr_case "no workflow token — warns, does not re-run" none main-health 1 main-health notoken
+  _rr_case "a refused re-run is a warning and the pass goes on" rerun main-health 1 main-health refuse
+  rm -rf "$fix"
+}
+
+_rr_out="$(behavioural_base_rerun_cases)"
+while IFS= read -r _rr_line; do
+  case "$_rr_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural base re-run: ${_rr_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural base re-run: unparseable result line '$_rr_line'" ;;
+  esac
+done <<<"$_rr_out"
 
 _pm_out="$(behavioural_premerge_cases)"
 while IFS= read -r _pm_line; do

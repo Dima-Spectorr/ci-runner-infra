@@ -1590,6 +1590,16 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
    the base-health read cannot name which check failed, the pass halts exactly
    as before.
 
+   **A red base run is re-run once (#1529).** A single flaky failure of the
+   base's health run used to halt every merge until the next push to the base
+   (measured 2026-10-10: 38 minutes). A halted pass now re-runs the FAILED jobs
+   of the base runs whose failed job names one of the failing checks — once,
+   because a run on `run_attempt` 1 is the only one it touches. The POST uses
+   the calling job's own `GITHUB_TOKEN`, so the merge App needs no Actions
+   write: **the caller's lane job must grant `actions: write`** (the same grant
+   the `recover` job already needs). Without it the log carries a warning and
+   the pass halts as before. A dry run only logs `would re-run`.
+
 **The gate fails open, deliberately, and it is only as good as your post-merge
 CI.** Only a definite failure halts it. A check that is *missing* or *pending*
 on the base tip does not, because most repositories run their required checks on
