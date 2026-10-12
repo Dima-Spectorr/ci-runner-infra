@@ -1327,7 +1327,7 @@ FX_DIR="$WORK/fix-quiet"
 fx "repos/$REPO/commits/main" '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}}'
 fx "repos/$REPO/rules/branches/main" '[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}}]'
 fx_checks bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb completed '"success"'
-fx "repos/$REPO/pulls" '[]'
+fx graphql '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'
 # Run 77: triggered at 00:26:00, taken by `runner-b` at 00:26:30, and the clock
 # reads 00:26:40. Two decoys: a job in progress on ANOTHER runner, and a job
 # this runner has already finished.
