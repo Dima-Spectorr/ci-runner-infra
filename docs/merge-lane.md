@@ -775,33 +775,6 @@ ordering is the whole of issue #444 and it is asserted by the self-test; if it
 regresses, the cost of a pass goes back to tracking the number of open pull
 requests in the repository rather than the number the lane could act on.
 
-**The open list, and every head's checks with it, is ONE GraphQL query a page**
-(#1541). `lane_snapshot` asks for the open pull requests on the base, 25 a page,
-each with its head, its mergeability, its labels and author, and every check
-suite on the head with its check runs (latest only, as REST's default
-`filter=latest`), its app, its workflow and its event, and the head's commit
-statuses. It writes what it learned as the REST bodies the walk already reads —
-`check-runs`, `check-suites`, `actions/runs?head_sha=`, `status`, and the pull
-request detail — and the `gh` wrapper answers those reads from them through the
-read's own `--jq` program, before a fetch job records and before the call is
-counted. The walk, its projections and its verdicts are the same lines of code;
-what changes is that the per-head check reads are no longer calls. Measured on a
-consumer repository on 2026-10-12: 61 open pull requests were 3 pages at 13
-graphql points each, where the REST walk spent five reads a head.
-
-What the snapshot does NOT answer is read live, as before: a head with more than
-50 suites or a suite with more than 100 runs (a body cut at a page edge would
-count a required check that fell off it ABSENT), a head whose newest commit is
-not the listed head, mergeability GraphQL reports `UNKNOWN` (the detail read's
-wait-and-re-read exists for that, and a REST read is what starts GitHub
-computing it), and the two reads that exist to be fresh — the mergeability
-re-read and the pre-merge read — which run with `LANE_SNAP` emptied. GraphQL
-differs from REST in two ways the snapshot papers over: an app the token cannot
-see is `app: null` (its suite is keyed `app-<suite id>`, so two hidden apps are
-never merged; none posts a check run), and a Bot author's login has no `[bot]`
-suffix (the REST form is written, because `pin-bump-actor` is configured in it).
-The snapshot is replaced at the start of every pass and is gone with the run.
-
 **Those reads are made for every candidate at once, and the verdicts are then
 given in list order.** The ranking cannot be cut short — the oldest head wins at
 equal priority, and a stuck head can become a `drop` that outranks every merge —
@@ -1060,15 +1033,6 @@ What changed:
   makes ONE ordinary counted read of the repository to get some; if even that
   answer carries none, the pass is held as *Skipped, not idle* rather than
   started blind. A window whose reset time has already passed is not held.
-- **The graphql bucket holds a pass too, but only on what it said** (#1541).
-  The open list is read from the `graphql` bucket, a separate 5000-point
-  window, so its answers' headers are noted apart (`$LANE_QUOTA.graphql`). The
-  guard holds on the core window as above OR on a KNOWN graphql window under
-  the same floor. An unknown graphql window does not hold: the guard never
-  probes it, because the read that would tell is the pass's own list read,
-  which costs a handful of points. The cross-repository retry tick keeps
-  reading the core window only; the lane's walk spends core, and a pass held
-  on graphql is resumed by the next trigger after the reset.
 - **A rate-limited status read no longer asks for a permission.** The
   commit-status warning used to say "grant the merge App `Commit statuses:
   read`" on any failure; on 2026-09-17 that was a 403 from the exhausted quota,
