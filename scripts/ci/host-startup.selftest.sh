@@ -73,7 +73,15 @@ joined_code_of() { # <file> — continuation lines folded into one line each
 }
 
 has_disableupdate() { # <file>
-  matches "$(joined_code_of "$1")" 'config\.sh([^|;&]|\\)*--disableupdate'
+  local code
+  code=$(code_of "$1")
+  # generate-jitconfig takes no such parameter, so the .runner entry inside the
+  # config is rewritten with disableUpdate (and ephemeral) set to true...
+  matches "$code" '^for want in \("disableUpdate", "ephemeral"\):$' || return 1
+  matches "$code" '^    s\[next\(\(k for k in s if k\.lower\(\) == want\.lower\(\)\), want\)\] = True$' || return 1
+  matches "$code" '^cfg\[key\] = base64\.b64encode\(json\.dumps\(s\)\.encode\(\)\)\.decode\(\)$' || return 1
+  # ...and what reaches the agent is the REWRITTEN config, not the API's own.
+  matches "$code" 'base64\.b64encode\(json\.dumps\(cfg\)\.encode\(\)\)\.decode\(\)'
 }
 
 has_metadata_fence() { # <file>
@@ -117,7 +125,7 @@ has_slot_isolation() { # <file>
   matches "$code" 'chmod 0750 "/home/\$u"' || return 1
   # and the agent runs as the slot's own user
   matches "$code" '^User=\$u$' || return 1
-  matches "$code" 'sudo -u "\$u" .*"\$dir/config\.sh"'
+  matches "$code" '^ExecStart=\$dir/run\.sh$'
 }
 
 # A slot whose daemon is up but cannot START a container is the failure this
@@ -350,8 +358,10 @@ has_slot_reset() { # <file>
   ! matches "$code" 'if \[ -n "\$JOB_SA" \].*ACTIONS_RUNNER_HOOK' || return 1
   # plus the third reset, which is the one the two hooks cannot cover: an agent
   # killed mid-job never ran its completed hook, and a warm host reboots over
-  # the previous boot's leftovers. `+` is what runs it as root despite User=.
-  matches "$code" '^ExecStartPre=\+/opt/ci/job-hooks/slot-reset\.sh boot \$idx$' || return 1
+  # the previous boot's leftovers. The slot loop (root) starts with a reset and
+  # resets again after every agent exit, before it mints the next runner (#1481).
+  matches "$code" '^need_reset=1$' || return 1
+  matches "$code" '^    if ! timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx" >/dev/null 2>&1; then$' || return 1
 
   # the files exist, root-owned and not writable by the slots that execute them —
   # one set shared by every uid on the host, and one of them runs as root
@@ -392,9 +402,8 @@ has_slot_reset() { # <file>
   matches "$code" 'mv -T -- "\\\$work" "\\\$held"' || return 1
   matches "$code" 'mv -T -- "\\\$held" "\\\$work"' || return 1
   matches "$code" 'install -d -o root -g root -m 0700 "\$SLOT_ROOT/\.reset/\$idx"' || return 1
-  # and the boot reset in provision_slot_user does not run under an agent that a
-  # warm reboot already brought up — that unit ran its own boot reset
-  matches "$code" 'systemctl is-active --quiet "ci-runner@\$idx\.service"' || return 1
+  # and the slot loop never resets under an agent a previous loop left running
+  matches "$code" '^while agent_up; do sleep 5; done$' || return 1
   # and the workspace the runner already prepared for the STARTING job is
   # emptied, not unlinked — a plain `run:` step chdirs into it
   matches "$code" 'install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"' || return 1
@@ -422,12 +431,11 @@ has_slot_reset() { # <file>
   matches "$code" 'fail_after=1' || return 1
   # ...but the COMPLETED hook never turns a finished job red (#1544, #1484): the
   # started shim stays an exec, the completed shim reports and exits 0, and the
-  # failed reset is recorded root-side so the sweep fences the slot at once
+  # failed reset is counted as a burn, and the slot loop resets again before it
+  # registers the slot for anything else (#1481)
   matches "$code" "reset='exec sudo -n /opt/ci/job-hooks/slot-reset\.sh started'" || return 1
   matches "$code" "reset='sudo -n /opt/ci/job-hooks/slot-reset\.sh completed && exit 0" || return 1
-  matches "$code" 'if \[ "\\\$stage" = completed \] && \[ "\\\$rc" != 0 \] && \[ -n "\\\$\{SUDO_UID:-\}" \]; then' || return 1
-  matches "$code" ': >"\\\$SLOT_STATE/\\\$idx/unclean-after-job"' || return 1
-  matches "$code" 'rm -f -- "\\\$burns" "\\\$SLOT_STATE/\\\$idx/unclean-after-job"' || return 1
+  matches "$code" '^    rm -f -- "\\\$burns"$' || return 1
 
   # ONE RESET AT A TIME PER SLOT. The hooks alone were serial — the runner does
   # not start a job's hook while another job's is running on the same slot — so
@@ -840,17 +848,20 @@ has_secrets_out_of_argv() { # <file>
   matches "$code" '\-K <\(printf.*"\$jwt"\)' || return 1
   matches "$code" '\-K <\(printf.*"\$tok"\)' || return 1
 
-  # config.sh is not curl. actions/runner takes every `configure` argument as
-  # ACTIONS_RUNNER_INPUT_<NAME> and clears it from its own environment block, so
-  # the token lands in /proc/<pid>/environ — owner-only — instead.
-  ! matches "$joined" 'config\.sh([^|;&]|\\)*--token' || return 1
-  matches "$code" '^  ACTIONS_RUNNER_INPUT_TOKEN="\$token"' || return 1
-  # The NAME in argv, the VALUE in the environment. `sudo VAR=value` would have
-  # put the token straight back into sudo's own cmdline.
-  matches "$code" 'sudo -u "\$u" --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN' || return 1
-  # And fails closed: sudo's env_reset dropping the variable is silent, so a
-  # host that cannot carry it must not register rather than fall back to argv.
-  matches "$joined" 'sudo_passes_env "\$u".*return 1' || return 1
+  # The just-in-time runner config (#1481) is the one-job credential. It is
+  # never on a command line: the API response is piped into python3 on STDIN,
+  # the result is written by the printf builtin into a root 0600 file in a root
+  # 0700 directory, PID 1 reads that file into the agent's environment as
+  # ACTIONS_RUNNER_INPUT_JITCONFIG, and the file is removed once the agent has
+  # exec'd (Type=exec, so ExecStartPost cannot run before the read).
+  ! matches "$joined" 'run\.sh([^|;&]|\\)*--jitconfig' || return 1
+  matches "$code" '\| python3 -I -c .$' || return 1
+  matches "$code" "printf 'ACTIONS_RUNNER_INPUT_JITCONFIG=%s" || return 1
+  matches "$code" '^  if ! \( umask 077$' || return 1
+  matches "$code" 'chown root:root "\$JIT_DIR" && chmod 0700 "\$JIT_DIR"' || return 1
+  matches "$code" '^EnvironmentFile=\$JIT_DIR/\$idx\.env$' || return 1
+  matches "$code" '^ExecStartPost=\+/bin/rm -f \$JIT_DIR/\$idx\.env$' || return 1
+  matches "$code" '^Type=exec$' || return 1
 
   # There WAS a belt on top of this — /proc hidden from the slot users, so that
   # a future call site could not reintroduce the class even if it tried. It is
@@ -968,14 +979,14 @@ band_arithmetic_disjoint() { # <file>
 if has_disableupdate "$SCRIPT"; then
   ok
 else
-  bad "config.sh is not passed --disableupdate — a forced self-update will take every slot on the host OFFLINE (#2281)"
+  bad "the just-in-time runner config is not rewritten with disableUpdate=true — a forced self-update will take every slot on the host OFFLINE (#2281)"
   # Show the joined invocation the predicate actually saw. The first occurrence
   # of this failure was green locally and red in CI on a byte-identical script,
   # and with only the verdict printed there was nothing to tell a genuine
   # regression apart from an artefact of how the text was assembled. Print the
   # evidence, so the next occurrence is read rather than guessed at.
   printf '  saw: %s\n' "$(joined_code_of "$SCRIPT" \
-    | grep -n 'config\.sh' \
+    | grep -n 'disableUpdate' \
     | sed -e 's/\r/<CR>/g' -e '6,$d')"
 fi
 
@@ -1180,8 +1191,8 @@ has_pin_hold() { # <file>
   # if it cannot. The live branch's stop can miss -- the hold can expire before
   # the slot ever goes idle -- and reaching teardown with the agent up deletes
   # the containers, home and workspace of a job running right now.
-  matches "$code" 'agent stopped before teardown' || return 1
-  matches "$code" 'could not stop the agent — NOT tearing down' || return 1
+  matches "$code" 'if systemctl is-active --quiet "ci-runner@\\\$slot\.service"; then' || return 1
+  matches "$code" 'its agent is running a job -- NOT tearing down' || return 1
 
   # A FAILED ENUMERATION IS NOT AN EMPTY ONE. `docker ps` timing out left ids
   # empty with the failure dropped, so removal was skipped, teardown was called
@@ -1192,19 +1203,9 @@ has_pin_hold() { # <file>
   # left no state to retry from and the slot stayed down for the life of the
   # host, with the controller keeping that host at the floor rather than
   # replacing it.
-  matches "$code" 'the agent would not start — the hold stays in place' || return 1
-
-  # IDLE NEEDS TWO WITNESSES. The clean marker is on disk from the completed
-  # hook until the NEXT job's started hook, so a tick in either window stopped
-  # the unit under a live job -- through the mechanism added to avoid that.
-  #
-  # Anchored on the NEGATED form, not on the bare pgrep. The bare spelling
-  # stopped identifying this site the moment the idle slot sweep grew a worker
-  # probe of its own: the needle went on matching the sweep's copy while the pin
-  # sweep's own had been deleted, which is a gate reading green about a line
-  # that is gone. The negation is what makes this site this site — the sweep's
-  # two probes are both positive.
-  matches "$code" '! pgrep -u .*Runner.*Worker.* &&' || return 1
+  matches "$code" 'teardown incomplete -- the hold stays in place' || return 1
+  # a plain pin (no --reserve-slot) only releases: its slot never left service
+  matches "$code" 'if \[ "\\\$reserve" != 1 \]; then' || return 1
 
   # A PREVIOUS-BOOT HOLD IS PUBLISHED AS RELEASED, not only logged. The instance
   # answers the same host-* label across a reboot, so nothing else can tell the
@@ -1250,6 +1251,11 @@ has_pin_hold() { # <file>
   # unexpired record from the PREVIOUS boot spared image tags for containers
   # that did not survive the guest.
   matches "$code" 'h_boot" = "\\\$\(cat /proc/sys/kernel/random/boot_id' || return 1
+  # ONLY A RESERVING HOLD SPARES THE SLOT (#1481, review H-1). Any job can write
+  # a reserve=0 hold on its own slot; sparing on that skips quiesce_slot, while
+  # the slot loop's held() still lets the next job in, so the job's stragglers
+  # meet the next job's JIT config and secrets.
+  matches "$code" 'h_reserve" = 1 \]' || return 1
 
   # A DURATION, because that is what the contract publishes (`CI_PIN_TTL: 90m`)
   # and what a workflow author writes beside a timeout-minutes they already own.
@@ -1273,15 +1279,6 @@ has_pin_hold() { # <file>
   matches "$code" '^AccuracySec=5$' || return 1
   matches "$code" 'systemctl enable --now ci-pin-sweep\.timer' || return 1
 
-  # It takes a held slot out of service once its job ends — not the completed
-  # hook, which runs inside the agent unit and would SIGTERM itself mid-report,
-  # and not the controller, which never opens a shell on a host that is healthy
-  # and busy. Gated on the clean marker, which is what makes "idle" a fact
-  # rather than a guess: a slot running a job has no marker.
-  matches "$code" '\[ "\\\$reserve" = 1 \] && \[ -f "\\\$marker" \] &&' || return 1
-  matches "$code" 'systemctl is-active --quiet "ci-runner@\\\$slot\.service"; then' || return 1
-  matches "$code" 'systemctl stop "ci-runner@\\\$slot\.service"' || return 1
-
   # A LIVE HOLD IS REPUBLISHED UNTIL THE ATTRIBUTE CONFIRMS IT (#1393). The PUT
   # that took the hold is best effort, and on a host with no ci/ namespace a
   # lost PUT reads to the controller as a free host (#1384). The sweep reads
@@ -1300,8 +1297,11 @@ has_pin_hold() { # <file>
   matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$slot"' || return 1
   matches "$code" 'if \[ "\\\$rc" != 0 \]; then' || return 1
   matches "$code" 'rm -f -- "\\\$RECORD"' || return 1
-  matches "$code" 'the agent stays DOWN' || return 1
-  matches "$code" 'systemctl start "ci-runner@\\\$slot\.service"' || return 1
+  matches "$code" 'the slot is not registered until it goes' || return 1
+  # ...and the sweep never stops or starts an agent itself (#1481): a reserved
+  # slot is kept out of service by its loop not registering it.
+  ! matches "$code" 'systemctl (start|stop|disable)[^|]*"ci-runner@\\\$slot\.service"' || return 1
+  matches "$code" 'the slot loop re-registers it'
 }
 
 # --- the idle slot sweep ------------------------------------------------------
@@ -1320,63 +1320,45 @@ has_slot_sweep() { # <file>
   local code
   code=$(code_of "$1")
 
-  # installed, and NOT fatal. Every slot still works without it; what is lost is
-  # the recovery, so a host that has one is worth more than a host that refuses
-  # to boot. The log line has to say which of those happened.
-  matches "$code" 'install_slot_sweep \|\|' || return 1
-  ! matches "$code" 'install_slot_sweep \|\| die' || return 1
-  matches "$code" 'stay dirty until this host is recycled' || return 1
+  # installed, and FATAL: without the loop no slot is ever registered.
+  matches "$code" 'install_slot_loop \|\| die' || return 1
+  # one loop per slot, root, restarted by systemd, and NOT enabled: main()
+  # starts each after the fence, the broker and the slot units exist.
+  matches "$code" '^ExecStart=/opt/ci/job-hooks/slot-loop\.sh %i$' || return 1
+  matches "$code" '^Restart=always$' || return 1
+  ! matches "$code" 'systemctl enable[^|]*ci-slot-loop' || return 1
+  matches "$code" 'systemctl start "ci-slot-loop@\$i\.service"' || return 1
+  # the installed script parses before it replaces the old one
+  matches "$code" 'bash -n "\$f\.tmp" \|\|' || return 1
 
-  # ON A TIMER, because "the job that would have noticed" is exactly the job
-  # this exists to stop spending. Same cadence as the pin sweep.
-  matches "$code" 'systemctl enable --now ci-slot-sweep\.timer' || return 1
-  matches "$code" '^TimeoutStartSec=900$' || return 1
+  # A previous loop that died with its agent mid-job is never reset under.
+  matches "$code" '^while agent_up; do sleep 5; done$' || return 1
+  # The reset is bounded and the SAME reset the hooks call.
+  matches "$code" 'timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx"' || return 1
 
-  # BOTH WITNESSES, and this is the whole safety argument. The marker is absent
-  # for the entire length of a live job, so "dirty" alone describes a running
-  # job exactly as well as it describes an abandoned one; the worker process is
-  # the fact that tells them apart.
-  matches "$code" 'if \[ -f "\\\$marker" \]; then' || return 1
-  matches "$code" "pgrep -u \"\\\\\\\$u\" -f 'Runner\\\\.Worker'" || return 1
+  # THE GATE IS ASKED TWICE: before minting, and again after, because ci-drain
+  # can go up while the runner is minted and the controller's roster read may
+  # already have missed it. A gated runner is withdrawn, never started.
+  counts "$code" 'if why=\$\(gate\); then' 2 || return 1
+  matches "$code" 'delete_runner "\$id" \|\| log "slot \$idx: could not withdraw runner' || return 1
 
-  # A state read as a WORD. `is-active --quiet` answers only for 'active', so it
-  # calls the boot reset -- which runs as the agent unit's own ExecStartPre --
-  # an inactive slot, and the sweep would fire a second, concurrent reset into
-  # a slot already being reset.
-  matches "$code" 'state=\\\$\(systemctl is-active "ci-runner@\\\$idx\.service"' || return 1
-  matches "$code" 'activating \| deactivating \| reloading\) continue ;;' || return 1
+  # The ONE stop left: a runner whose marker was withdrawn while it waited is
+  # deleted through the API first -- GitHub refuses with 422 while a job is
+  # assigned -- and only a runner GitHub agreed is gone is ever stopped.
+  # "Running a job" is a Runner.Worker in the agent UNIT's cgroup, never a name
+  # match over the process table that a stray same-named process satisfies
+  # (#1481, review L-2).
+  matches "$code" '! job_running; then' || return 1
+  matches "$code" 'cg=\$\(systemctl show -p ControlGroup --value "\$UNIT"' || return 1
+  matches "$code" '\[ "\$c" = Runner\.Worker \] && return 0' || return 1
+  ! matches "$code" "pgrep[^#]*Runner" || return 1
+  matches "$code" 'if \[ "\$dirty" -ge 12 \] && delete_runner "\$id"; then' || return 1
+  matches "$code" '\[ "\$withdrawn" -lt 14 \] \|\| systemctl stop "\$UNIT"' || return 1
+  counts "$code" 'systemctl stop "\$UNIT"' 1 || return 1
 
-  # TWO TICKS, not one. A pgrep that missed a process it should have seen is
-  # indistinguishable from an idle slot in a single sample; requiring the state
-  # to persist turns that from a wrong action into a skipped tick.
-  matches "$code" '^GRACE=60$' || return 1
-  matches "$code" '\[ \\\$\(\(now - seen\)\) -ge "\\\$GRACE" \] \|\| continue' || return 1
-  # a slot whose own completed hook could not clean it skips the grace (#1544)
-  matches "$code" 'if \[ ! -f "\\\$dir/unclean-after-job" \]; then' || return 1
-  # …and a slot that came back clears the clock rather than carrying a
-  # measurement taken before a whole job toward its next dirty spell
-  counts "$code" 'rm -f -- "\\\$since"' 3 || return 1
-
-  # THE AGENT GOES DOWN FIRST, and the worker is asked AGAIN afterwards. The
-  # stop is what stops a job being assigned mid-reset; the second pgrep is what
-  # refuses the reset if one arrived anyway. Losing either one puts root's
-  # `rm -rf` under a live job.
-  matches "$code" 'systemctl stop "ci-runner@\\\$idx\.service"' || return 1
-  matches "$code" 'refusing to reset underneath one' || return 1
-  # a stop that failed is not a stopped agent
-  matches "$code" 'its agent would not stop' || return 1
-
-  # BACK INTO THE POOL EITHER WAY, including after a reset that did not finish.
-  # It is the marker that keeps a job off this slot, not the agent's absence, so
-  # a slot left down would be capacity lost to the bookkeeping rather than the
-  # fault — and it would stay lost for the life of the host.
-  matches "$code" 'systemctl start "ci-runner@\\\$idx\.service"' || return 1
-  matches "$code" 'it stays dirty and the next sweep retries' || return 1
-
-  # It calls the same reset the hooks call. A sweep with its own idea of what
-  # cleaning means is a second implementation of the thing that has to agree
-  # with the marker it writes.
-  matches "$code" '/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"' || return 1
+  # After the agent exits: its runner deleted, and the slot reset before the next.
+  matches "$code" '^  delete_runner "\$id" \|\| true$' || return 1
+  matches "$code" '^  need_reset=1$'
 }
 
 # --- the host half of a cordon (#948) -----------------------------------------
@@ -1401,33 +1383,22 @@ has_host_cordon() { # <file>
   local code
   code=$(code_of "$1")
 
-  # The flag is read from the metadata server at each sweep, not from a file
-  # written at boot: the controller sets it on a RUNNING instance, hours after
-  # this script finished.
-  matches "$code" 'instance/attributes/ci-cordon' || return 1
-  matches "$code" 'CORDONED=0' || return 1
-  matches "$code" 'cordoned && CORDONED=1' || return 1
-
-  # FAIL-OPEN. An unreachable metadata server must read as "not cordoned": the
-  # other direction stops every agent on every host the moment the endpoint
-  # blips, which is the whole fleet, in thirty seconds.
-  matches "$code" '2>/dev/null\) \|\| return 1' || return 1
-
-  # ONLY WHEN PROVABLY IDLE — the same witness the sweep already uses. Without
-  # it the stop lands on a live worker and kills a job that GitHub will not
-  # requeue, which is strictly worse than the livelock it fixes.
-  matches "$code" 'if \[ "\\\$CORDONED" = 1 \]; then' || return 1
-  matches "$code" 'the host is cordoned and this slot is idle' || return 1
-  matches "$code" 'the host is cordoned but this slot.s agent would not stop' || return 1
-
-  # AND IT MUST NOT COME BACK. The sweep's own recovery path puts a slot back
-  # into service after a reset; on a cordoned host that hands the scheduler the
-  # slot again and the host never empties.
-  matches "$code" 'not restarting its agent — the host is cordoned' || return 1
-
-  # The pin sweep is the second restarter, and it is the easier one to forget:
-  # it runs on its own timer, ends a hold, and puts the slot back.
-  matches "$code" 'left DOWN — the host is cordoned' || return 1
+  # Read from the metadata server before EVERY registration, not from a file
+  # written at boot: the controller sets both flags on a RUNNING instance.
+  matches "$code" 'instance/attributes/\$1' || return 1
+  matches "$code" 'c=\$\(attr ci-cordon\)' || return 1
+  matches "$code" 'd=\$\(attr ci-drain\)' || return 1
+  # Cordon is FAIL-OPEN: an unreachable metadata server does not take the whole
+  # fleet out of service in one blip.
+  matches "$code" '\[ "\$c" = 1 \] && \{ echo "the host is cordoned"; return 0; \}' || return 1
+  # Drain is FAIL-CLOSED: the controller sets ci-drain and THEN reads the runner
+  # list, so registering on a failed read slips a runner past that list.
+  matches "$code" "'\\?'\\) echo \"ci-drain could not be read\"; return 0 ;;" || return 1
+  matches "$code" '1\) echo "the host is draining"; return 0 ;;' || return 1
+  # Nothing stops an agent for a cordon any more (#1481): the slot is simply not
+  # registered again when its one job ends.
+  ! matches "$code" 'the host is cordoned and this slot is idle' || return 1
+  ! matches "$code" 'CORDONED=1'
 }
 
 # #278 — A SLOT THAT FAILS EVERY JOB IS STILL CAPACITY.
@@ -1468,7 +1439,8 @@ has_slot_condemn() { # <file>
   # TAKEN OUT OF SERVICE. Not disabled and not deleted — the next tick tries the
   # reset again, so a slot whose obstruction clears recovers on its own.
   matches "$code" '^CONDEMN_MAX=3$' || return 1
-  matches "$code" '\[ "\\\$reset_ok" = 0 \] && \[ "\\\$burns" -ge "\\\$CONDEMN_MAX" \]' || return 1
+  matches "$code" 'read -r burns <"\$dir/burns"' || return 1
+  matches "$code" '^      if \[ "\$burns" -ge "\$CONDEMN_MAX" \]; then$' || return 1
   matches "$code" 'taking it out of service' || return 1
   matches "$code" 'putting it back into service' || return 1
 
@@ -1605,7 +1577,7 @@ has_log_shipper() { # <file>
 # text back into the file the host actually gets.
 generated_scripts_parse() { # <file>
   local name body tmp rc=0
-  for name in slot-reset slot-sweep pin-hold pin-sweep baked-image-audit seed-tool-cache; do
+  for name in slot-reset pin-hold pin-sweep baked-image-audit seed-tool-cache; do
     body=$(awk -v n="$name" '
       $0 == "  cat >/opt/ci/job-hooks/" n ".sh <<EOF" { on = 1; next }
       on && $0 == "EOF" { exit }
@@ -1619,6 +1591,19 @@ generated_scripts_parse() { # <file>
     bash -n "$tmp" >/dev/null 2>&1 || rc=1
     rm -f "$tmp"
   done
+  # The slot loop is assembled from declare -f plus a QUOTED heredoc, so its
+  # body is extracted verbatim (no unescaping) and parsed the same way.
+  body=$(awk '
+    /^install_slot_loop\(\) \{/ { f = 1 }
+    f && $0 == "    cat <<'"'"'EOF'"'"'" { on = 1; next }
+    on && $0 == "EOF" { exit }
+    on { print }
+  ' "$1")
+  [ -n "$body" ] || rc=1
+  tmp=$(mktemp)
+  printf '%s\n' "$body" >"$tmp"
+  bash -n "$tmp" >/dev/null 2>&1 || rc=1
+  rm -f "$tmp"
   [ "$rc" = 0 ]
 }
 
@@ -1631,13 +1616,13 @@ fi
 if has_slot_sweep "$SCRIPT"; then
   ok
 else
-  bad "a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
+  bad "a slot is registered without a reset since its last job, or something other than the slot loop stops an agent that may have accepted a job (#1481) — a slot left dirty by a job that never reached its completed hook is never reset — it refuses every job afterwards, fails each one in seconds, and therefore WINS the queue ahead of healthy slots, so re-running the workflow spreads the outage instead of clearing it (IntegrateIT, 12 of 24 slots, 2026-08-23)"
 fi
 
 if has_host_cordon "$SCRIPT"; then
   ok
 else
-  bad "a cordoned host never stops its own idle agents — the slot GitHub refused to deregister (422) stays registered and keeps taking new work, so busy never reads 0, the host is never retired, and because a cordoned host is exempt from the recycle budget it blocks every other host in its pool from recycling too (#948, measured at 63 minutes with 18 runs queued)"
+  bad "a cordoned or draining host goes on registering its slots, or an unreadable ci-drain reads as not draining (#1481) — a cordoned host never empties — the slot GitHub refused to deregister (422) stays registered and keeps taking new work, so busy never reads 0, the host is never retired, and because a cordoned host is exempt from the recycle budget it blocks every other host in its pool from recycling too (#948, measured at 63 minutes with 18 runs queued)"
 fi
 
 if has_slot_condemn "$SCRIPT"; then
@@ -1818,9 +1803,12 @@ slot_can_execute "$1" "$2"' _ "$1" "${2:-}" >/dev/null 2>&1
   rm -f "$root/norun/run.sh"
   probe "$root/norun" && rc=1
 
+  # NOT a half-finished copy any more: a just-in-time runner starts from
+  # `run.sh --jitconfig` and never calls config.sh (#1481), so a gate that
+  # demanded it would refuse a slot that can run every job.
   cp -a "$root/good" "$root/noconf"
   rm -f "$root/noconf/config.sh"
-  probe "$root/noconf" && rc=1
+  probe "$root/noconf" || rc=1
 
   # Nothing there at all.
   probe "$root/absent" && rc=1
@@ -1852,21 +1840,9 @@ registration_is_gated() { # <file>
   # through a mode 000 one, so without this the pair reports a workspace the job
   # user cannot enter as created and healthy.
   matches "$code" 'slot_can_enter "\$u" "\$dir/_work"' || return 1
-  # THE CREATION IS COLD-BOOT ONLY. slot-reset.sh renames `_work` away while it
-  # empties it and refuses to hand it back if anything appeared at the vacated
-  # name -- so a `mkdir -p` racing a live agent's reset poisons the slot
-  # permanently. The `warm` arm must therefore exist and must be read from the
-  # unit's own state, not guessed.
-  matches "$code" 'slot_unit_preexists "\$idx" && warm=1' || return 1
-  matches "$code" 'if \[ "\$warm" = 1 \]; then' || return 1
-  # ...and that answer must not rest on `is-active` alone. On a warm reboot the
-  # unit is very often `activating` when this snapshot is taken — it runs the
-  # boot reset in an ExecStartPre and waits on the slot's dockerd — and
-  # `is-active` is FALSE for that, so the question would answer "cold" on exactly
-  # the hosts where the cold path is destructive. The unit FILE on disk is the
-  # part that cannot race.
-  matches "$code" 'is-enabled --quiet "ci-runner@\$1.service"' || return 1
-  matches "$code" 'activating' || return 1
+  # Safe on every boot: agent units are never enabled and the slot loops start
+  # at the end of main(), so no reset can be holding `_work` at this moment.
+  ! matches "$code" 'systemctl enable[^|]*ci-runner@' || return 1
   # The mode is restored where the name cannot be swapped — inside slot-reset.sh,
   # which holds `_work` in a root-owned directory — and NOT by a root chmod on a
   # path the slot owns. Both halves are asserted, because dropping the repair
@@ -1877,25 +1853,16 @@ registration_is_gated() { # <file>
   # pins it just as well.)
   matches "$code" 'chmod 0755' || return 1
   matches "$code" 'could not restore the mode of' || return 1
-  # And a refusal must take an already-running agent DOWN. Returning 1 alone only
-  # tells this host the slot was withdrawn; GitHub goes on dispatching into a
-  # workspace the host just refused, and every job it claims is burned.
-  matches "$code" 'systemctl disable --now "ci-runner@\$idx.service"' || return 1
-  matches "$code" 'refuse_slot "\$idx" "\$warm"' || return 1
-  # EVERY gate must sit BEFORE config.sh, or the token is spent and the runner is
-  # registered before anyone asks whether it can run. `_work` is checked here by
-  # name and not only as part of the group: it is the one that was written after
-  # the call first, and a gate that fires after a successful `configure` leaves a
-  # runner registered with GitHub and no service to run it.
+  # A refused slot gets no unit and no loop: only the slots install_slot passed
+  # are started, and the loop is the only thing that ever registers a slot.
+  matches "$code" 'if install_slot "\$i"; then ready="\$ready \$i"' || return 1
+  matches "$code" '^  for i in \$ready; do$' || return 1
+  # EVERY gate must sit BEFORE the agent unit is written, or a slot nobody
+  # asked about has a unit its loop can start.
   local n_gate n_work n_config
   n_gate=$(grep -n 'slot_can_execute "\$dir"' "$1" | head -1 | cut -d: -f1)
   n_work=$(grep -n '\[ -L "\$dir/_work" \]' "$1" | head -1 | cut -d: -f1)
-  # Matched by the sudo line that INVOKES config.sh, not by the bare path: the
-  # path also appears in slot_can_execute's own `-x` test, earlier in the file,
-  # and anchoring on that would compare the gate against itself and pass however
-  # the real call were ordered. (Matching the line-continuation backslash instead
-  # would work too, but `\\` inside single quotes trips shellcheck SC1003.)
-  n_config=$(grep -n 'preserve-env=ACTIONS_RUNNER_INPUT_TOKEN "\$dir/config\.sh"' "$1" | head -1 | cut -d: -f1)
+  n_config=$(grep -n 'cat >"/etc/systemd/system/ci-runner@\$idx\.service"' "$1" | head -1 | cut -d: -f1)
   [ -n "$n_gate" ] && [ -n "$n_work" ] && [ -n "$n_config" ] &&
     [ "$n_gate" -lt "$n_config" ] && [ "$n_work" -lt "$n_config" ]
 }
@@ -2002,7 +1969,8 @@ slot_labels_behaves() { # <file>
   matches "$code" '\[ "\$INTERACTIVE_SLOTS" -lt "\$SLOTS" \]' || return 1
   matches "$code" '\|\| die "ci-interactive-slots \(' || return 1
   # every slot registers ITS list, never the pool's
-  matches "$code" '^    --labels "\$\(slot_labels "\$idx"\)" \\$' || return 1
+  matches "$code" '^  all="self-hosted,Linux,X64,\$\(slot_labels "\$1"\)"$' || return 1
+  matches "$code" 'labels=\$\(jit_labels_json "\$idx"\) \|\| return 1' || return 1
   ! matches "$code" '--labels "\$LABELS"' || return 1
   # and the anchor can size a background fan-out from it
   matches "$code" '^Environment=CI_HOST_BACKGROUND_SLOTS=\$BACKGROUND_SLOTS$'
@@ -2038,9 +2006,10 @@ mutate() { # <description> <sed-program> <predicate> — predicate must go false
   rm -f "$tmp"
 }
 
-mutate "flag removed"              's/ --disableupdate//'                         has_disableupdate
-mutate "flag only in a comment"    's/ --disableupdate/ \\\n  # --disableupdate/' has_disableupdate
-mutate "flag only in a log line"   's/--unattended --replace --disableupdate/--unattended --replace/; s/^log()/log "--disableupdate"\nlog()/' has_disableupdate
+mutate "disableUpdate no longer set"  's/for want in ("disableUpdate", "ephemeral"):/for want in ("ephemeral",):/' has_disableupdate
+mutate "the rewrite sets nothing"     's/want)\] = True$/want)] = False/'               has_disableupdate
+mutate "rewritten entry not stored"   's/^cfg\[key\] = /cfg_unused = /'                 has_disableupdate
+mutate "the API's config passed through" 's/base64.b64encode(json.dumps(cfg).encode()).decode()/r["encoded_jit_config"]/' has_disableupdate
 mutate "fence address dropped"     's/169\.254\.169\.254/127.0.0.1/g'             has_metadata_fence
 mutate "containers unfenced"       's/DOCKER-USER/OUTPUT/g'                       has_metadata_fence
 mutate "fence no longer fatal"     's/fence_metadata || die/fence_metadata || log/' has_metadata_fence
@@ -2048,6 +2017,7 @@ mutate "slot users unfenced"       's/fence_uid "\$(slot_user/fence_uid "runner"
 mutate "agent back on the shared daemon" 's|^Environment=DOCKER_HOST=unix:///run/\$u/docker.sock$|Environment=DOCKER_HOST=unix:///var/run/docker.sock|' has_slot_isolation
 mutate "shared daemon left running" 's/systemctl mask --now docker.service docker.socket/systemctl stop docker.service/' has_slot_isolation
 mutate "slots share one account"   's/^User=\$u$/User=runner/'                     has_slot_isolation
+mutate "agent runs something else" 's@^ExecStart=\$dir/run\.sh$@ExecStart=/bin/true@' has_slot_isolation
 mutate "agent starts without its daemon" 's/start_slot_dockerd "\$idx" || return 1/start_slot_dockerd "$idx" || true/' has_slot_isolation
 mutate "mask failure ignored"      's/|| die "could not mask the rootful Docker daemon.*/|| true/'  has_slot_isolation
 mutate "agent survives a crashed daemon" 's/^BindsTo=ci-dockerd@/#BindsTo=ci-dockerd@/'             has_slot_isolation
@@ -2099,7 +2069,8 @@ mutate "template left without the config" 's@write_docker_cred_helpers >"\$SLOT_
 
 mutate "reset only after the job"         's@^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$@@'                   has_slot_reset
 mutate "reset only before the job"        's@^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=.*$@@'                 has_slot_reset
-mutate "boot reset dropped"               's@^ExecStartPre=+/opt/ci/job-hooks/slot-reset.sh boot \$idx$@@'         has_slot_reset
+mutate "a slot registered without a reset" 's@^need_reset=1$@need_reset=0@'                      has_slot_reset
+mutate "the loop's reset dropped"       's@if ! timeout 900 /opt/ci/job-hooks/slot-reset.sh completed "\$idx"@if false@' has_slot_reset
 mutate "hook install no longer fatal"     's@install_job_hooks || die.*@install_job_hooks || true@'                has_slot_reset
 mutate "template build no longer fatal"   's@seed_slot_template || die.*@seed_slot_template || true@'              has_slot_reset
 mutate "reset script left slot-writable"  's@chmod 0755 /opt/ci/job-hooks/slot-reset.sh@chmod 0777 /opt/ci/job-hooks/slot-reset.sh@' has_slot_reset
@@ -2112,7 +2083,6 @@ mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'         
 mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
 mutate "completed hook fails the job again" "s@reset='sudo -n /opt/ci/job-hooks/slot-reset.sh completed \&\& exit 0@reset='exec sudo -n /opt/ci/job-hooks/slot-reset.sh completed@"   has_slot_reset
-mutate "failed completed not recorded"     's@: >"\\\$SLOT_STATE/\\\$idx/unclean-after-job"@: >/dev/null@'                  has_slot_reset
 mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
@@ -2124,7 +2094,7 @@ mutate "root walks a name the slot can swap" 's@mv -T -- "\\\$work" "\\\$held"@t
 mutate "a symlinked work folder followed" 's@if \[ -L "\\\$work" \]@if false@'                                            has_slot_reset
 mutate "the workspace never handed back" 's@mv -T -- "\\\$held" "\\\$work"@true@'                                    has_slot_reset
 mutate "holding directory left slot-writable" 's@install -d -o root -g root -m 0700 "\$SLOT_ROOT/.reset/\$idx"@install -d -o "\$u" -g "\$u" -m 0700 "\$SLOT_ROOT/.reset/\$idx"@' has_slot_reset
-mutate "boot reset runs under a live agent" 's|systemctl is-active --quiet "ci-runner@\$idx.service"|false|'                                  has_slot_reset
+mutate "reset runs under a live agent"  's@^while agent_up; do sleep 5; done$@:@'          has_slot_reset
 mutate "data root back inside the home"   's@ --data-root=/var/lib/ci-slot/%i/docker@@'                            has_slot_reset
 
 mutate "daemon MTU config removed"        's|daemon\.json|daemon.txt|g'                                          has_container_mtu
@@ -2202,10 +2172,11 @@ mutate "the user bus is stopped with the rest"   's/ && \\\$1 != "dbus.service"/
 
 mutate "App JWT back in curl argv"        's@-K <(printf.*\$jwt")@-H "Authorization: Bearer $jwt"@'          has_secrets_out_of_argv
 mutate "registration token back in curl argv" 's@-K <(printf.*\$tok")@-H "Authorization: Bearer $tok"@'          has_secrets_out_of_argv
-mutate "env prefix dropped from config.sh" '/^  ACTIONS_RUNNER_INPUT_TOKEN=/d'                                    has_secrets_out_of_argv
-mutate "sudo stops preserving the variable" 's@--preserve-env=ACTIONS_RUNNER_INPUT_TOKEN @@'                      has_secrets_out_of_argv
-mutate "--token added back alongside it"   's@--url "https://github.com/$OWNER@--token "$token" --url "https://github.com/$OWNER@' has_secrets_out_of_argv
-mutate "silent env drop no longer fatal"   '/sudo will not pass an environment variable/s@; return 1; }@; }@'     has_secrets_out_of_argv
+mutate "the env file never removed"      '/^ExecStartPost=+\/bin\/rm -f \$JIT_DIR/d'          has_secrets_out_of_argv
+mutate "the config back on run.sh argv"  's@^ExecStart=\$dir/run\.sh$@ExecStart=$dir/run.sh --jitconfig "$cfg"@' has_secrets_out_of_argv
+mutate "env file world-readable"         's@^  if ! ( umask 077$@  if ! ( umask 022@'          has_secrets_out_of_argv
+mutate "jit directory left open"        's@chmod 0700 "\$JIT_DIR"@chmod 0755 "$JIT_DIR"@'   has_secrets_out_of_argv
+mutate "file removed before it is read"  's@^Type=exec$@Type=simple@'                       has_secrets_out_of_argv
 mutate "one slot unit hides /proc again"   '0,/^ProtectProc=default/s@^ProtectProc=default@ProtectProc=invisible@' has_secrets_out_of_argv
 mutate "host /proc hidden again"           's@hidepid=0@hidepid=2@'                                               has_secrets_out_of_argv
 mutate "hidepid left to a warm host"       '/^  harden_proc$/d'                                                   has_secrets_out_of_argv
@@ -2220,7 +2191,8 @@ mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'          
 
 mutate "background on every slot"            's@if \[ "\$1" -le "\$BACKGROUND_SLOTS" \]; then@if true; then@'   slot_labels_behaves
 mutate "background on no slot"               "s@'%s,background'@'%s'@"                                              slot_labels_behaves
-mutate "every slot registers the pool list"  's@--labels "\$(slot_labels "\$idx")"@--labels "$LABELS"@'               slot_labels_behaves
+mutate "every slot registers the pool list"  's@all="self-hosted,Linux,X64,\$(slot_labels "\$1")"@all="$LABELS"@' slot_labels_behaves
+mutate "the minted labels ignore the slot"   's@labels=\$(jit_labels_json "\$idx") || return 1@labels=x@' slot_labels_behaves
 mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
 mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves
 mutate "interactive count never read"        '/^INTERACTIVE_SLOTS=\$(md /d'                                         slot_labels_behaves
@@ -2259,27 +2231,27 @@ mutate "a repeat claim moves the slot"      's@slot_to_write=\\\$R_SLOT@slot_to_
 mutate "a repeat claim may shorten a hold"  's@\[ "\\\$R_EXPIRY" -gt "\\\$expiry_to_write" \] \&\& expiry_to_write=\\\$R_EXPIRY@:@' has_pin_hold
 mutate "--ttl accepts no value again"       's@refusing: --ttl needs a value@a default will do@'                               has_pin_hold
 mutate "the prune forgets the boot"         's@\[ "\\\$h_boot" = "\\\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \]@true@' has_pin_hold
-mutate "teardown before the agent stops"    's@agent stopped before teardown@here we go@'                                     has_pin_hold
+mutate "a reserve=0 hold spares the slot"   's@\[ "\\\$h_reserve" = 1 \] && @@'                                    has_pin_hold
+mutate "teardown under a running job"     's|if systemctl is-active --quiet "ci-runner@\\\$slot.service"; then|if false; then|' has_pin_hold
 mutate "a failed docker ps reads as empty"  's@could not list the run.s containers@nothing to see@'                           has_pin_hold
-mutate "the record dies with a failed start" 's@the agent would not start — the hold stays in place@the agent would not start@' has_pin_hold
-mutate "the marker alone proves idle"       's@! pgrep -u "@pgrep -u "@'                                                      has_pin_hold
+mutate "the record dies with a failed teardown" 's@teardown incomplete -- the hold stays in place@teardown incomplete@' has_pin_hold
 
 # #278. Each of these is a way the count stops meaning "in a row, right now",
 # which is the only shape the take-out-of-service rule can read.
-mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns" "\\\$SLOT_STATE/\\\$idx/unclean-after-job"$@    :@'                                           has_slot_condemn
+mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns"$@    :@'                                         has_slot_condemn
 mutate "a burned job is not counted"        's@^  burn_add$@  :@'                                                             has_slot_condemn
 mutate "a failed reset is not counted"      's@^    burn_add$@    :@'                                                         has_slot_condemn
 mutate "the count is slot-writable"         's@burns="\\\$SLOT_STATE/\\\$idx/burns"@burns="\$home/burns"@'                    has_slot_condemn
 mutate "nothing is ever condemned"          's@^CONDEMN_MAX=3$@CONDEMN_MAX=999999@'                                           has_slot_condemn
-mutate "a condemned slot is put back"       's@\[ "\\\$reset_ok" = 0 \] \&\& \[ "\\\$burns" -ge "\\\$CONDEMN_MAX" \]@false@'  has_slot_condemn
+mutate "a condemned slot is put back"       's@if \[ "\$burns" -ge "\$CONDEMN_MAX" \]; then@if false; then@' has_slot_condemn
 mutate "a recovered slot stays down"        's@putting it back into service@still down, sorry@'                               has_slot_condemn
 mutate "an orphaned hold is only logged"    's@^  publish ""$@  true@'                                                        has_pin_hold
 mutate "a held slot pruned between jobs"    's@if \[ "\\\$stage" != started \] && \[ "\\\$prune" = 1 \]@if [ "\\\$stage" != started ]@' has_pin_hold
 mutate "the sweeper runs once at boot"      's@^OnUnitActiveSec=30$@@'                                                     has_pin_hold
 mutate "the sweep left to systemd to time"  's@^AccuracySec=5$@@'                                                          has_pin_hold
 mutate "the timer installed but not armed"  's@systemctl enable --now ci-pin-sweep.timer@systemctl enable ci-pin-sweep.timer@' has_pin_hold
-mutate "a busy slot stopped mid-job"        's@&& \[ -f "\\\$marker" \] &&@\&\&@'                       has_pin_hold
-mutate "the held slot never taken out"      's|systemctl stop "ci-runner@\\\$slot.service"|true|'                          has_pin_hold
+mutate "the sweep stops the agent again"  's|^if \[ "\\\$expiry" -gt "\\\$now" \]; then$|&\n  systemctl stop "ci-runner@\\\$slot.service"|' has_pin_hold
+mutate "a returned slot never re-registered" 's@the slot loop re-registers it@done@'           has_pin_hold
 mutate "the stack survives expiry"          's@docker rm --force@docker ps --filter@'                                      has_pin_hold
 mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
 
@@ -2302,7 +2274,7 @@ mutate "SIGPIPE left ignored in the unit"    's@^IgnoreSIGPIPE=no$@@'           
 mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
 mutate "a unit's own output is shipped"      's@^matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)$@matches+=(+ _PID=1 + _SYSTEMD_UNIT=ci-runner@3.service)@' has_log_shipper
 mutate "host-unit lines fall into the lifecycle log" 's@^UNIT_LOG_ID=ci-host-units$@UNIT_LOG_ID=ci-slot-lifecycle@'                   has_log_shipper
-mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-sweep @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
+mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-loop @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
 mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper
 mutate "a renamed slot tool is not followed" 's@logger -t ci-pin-sweep@logger -t ci-pin-reaper@'                     has_log_shipper
 mutate "the generated shipper does not parse" 's@^\[ -s "\$batch" \] || exit 0$@[ -s "$batch" ] || exit 0 )@'        has_log_shipper
@@ -2315,7 +2287,7 @@ mutate "absent daemon stops being logged"    's@no docker socket at \\\$sock -- 
 mutate "id lookup back to grep -q"           's@grep -cxF -- "\\\$id" >/dev/null@grep -qxF -- "\$id"@'                has_baked_image_audit
 mutate "a missing manifest made a finding"   's@elif \[ -f "\\\$manifest" \]@elif true@'                              has_baked_image_audit
 mutate "the hold cleared even on failure"   's@^if \[ "\\\$rc" != 0 \]; then$@if false; then@'                               has_pin_hold
-mutate "a failed teardown back in service"  's@the agent stays DOWN@the agent is restarted anyway@'                        has_pin_hold
+mutate "a failed teardown back in service"  's@the slot is not registered until it goes@it goes back into service@' has_pin_hold
 
 mutate "cache token published before it answered" 's@^  local tok$@  local tok; TURBO_TOKEN=x@; s@^      TURBO_TOKEN="\$tok"$@@'  has_turbo_cache
 mutate "slot told about a dead cache"     's@if \[ -n "\$TURBO_TOKEN" \]; then@if true; then@'                          has_turbo_cache
@@ -2330,7 +2302,7 @@ mutate "minutes read as seconds"            's@unit=60 ;;@unit=1 ;;@'           
 mutate "a one-slot host allowed to reserve" 's@refusing --reserve-slot: this host has one slot@reserving the only slot on@' has_pin_hold
 mutate "the hold forgets which boot"        's@boot=%s@host=%s@'                                              has_pin_hold
 mutate "a hold honoured across a reboot"    's@releasing it as orphaned@keeping it@'                                 has_pin_hold
-mutate "a plain pin takes its slot away"    's@\[ "\\\$reserve" = 1 \] && \[ -f@[ -f@'                                     has_pin_hold
+mutate "a plain pin takes its slot away"    's@if \[ "\\\$reserve" != 1 \]; then@if false; then@'                  has_pin_hold
 mutate "a lost hold PUT never republished"  's@\[ "\\\$have" = "\\\$want" \] || publish "\\\$want"@:@'                    has_pin_hold
 mutate "the republish trusts no read-back"  's@have=\\\$(published) || have=""@have=""@'                                  has_pin_hold
 mutate "a refused sweep PUT swallowed"      's@>/dev/null 2>&1 || { say "could not publish@>/dev/null 2>\&1 || true || { say "could not publish@' has_pin_hold
@@ -2341,31 +2313,28 @@ mutate "the lock taken but not waited for"  's@flock -w 300 9@flock -n 9@'      
 
 # the host half of the cordon (#948). Each of these is a mutation that leaves a
 # host cordoned, logging, deregistered — and still taking jobs.
-mutate "the cordon flag never read"         's@instance/attributes/ci-cordon@instance/attributes/ci-nonesuch@g'          has_host_cordon
-mutate "cordon fails CLOSED on a blip"      's@2>/dev/null) || return 1@2>/dev/null) || return 0@g'                      has_host_cordon
-mutate "the flag read once and cached off"  's@^cordoned && CORDONED=1$@true@'                                           has_host_cordon
-mutate "a cordoned host stops nothing"      's@^  if \[ "\\\$CORDONED" = 1 \]; then$@  if false; then@'                  has_host_cordon
-mutate "a stop that failed reads as stopped" 's@the host is cordoned but this slot.s agent would not stop@the host is cordoned and this slot is idle@' has_host_cordon
-mutate "the sweep puts a cordoned slot back" 's@not restarting its agent — the host is cordoned@putting it back anyway@' has_host_cordon
-mutate "the pin sweep puts it back"         's@left DOWN — the host is cordoned@back in service@'                        has_host_cordon
+mutate "the cordon flag never read"         's@attr ci-cordon@attr ci-nonesuch@'                       has_host_cordon
+mutate "the drain flag never read"          's@attr ci-drain@attr ci-nonesuch@'                        has_host_cordon
+mutate "cordon fails CLOSED on a blip"      's@\[ "\$c" = 1 \] && { echo "the host is cordoned"@[ "$c" != 0 ] \&\& { echo "the host is cordoned"@' has_host_cordon
+mutate "a cordoned host registers anyway"   's@echo "the host is cordoned"; return 0;@echo "the host is cordoned"; return 1;@' has_host_cordon
+mutate "a draining host registers anyway"   's@echo "the host is draining"; return 0@echo "the host is draining"; return 1@' has_host_cordon
+mutate "an unreadable drain reads as clear" 's@echo "ci-drain could not be read"; return 0@echo "ci-drain could not be read"; return 1@' has_host_cordon
 
 # the sweep
-mutate "the sweep not installed"          's@^  install_slot_sweep ||$@  true \&\& #@'                                  has_slot_sweep
-mutate "a failed sweep install kills boot"  's@^  install_slot_sweep ||$@  install_slot_sweep || die@'                    has_slot_sweep
-mutate "the sweep never runs"               's@systemctl enable --now ci-slot-sweep\.timer@systemctl enable ci-slot-sweep.timer@' has_slot_sweep
-mutate "a wedged sweep blocks every later one" 's@^TimeoutStartSec=900$@TimeoutStartSec=infinity@'                        has_slot_sweep
-mutate "dirty alone is enough to reset"     "s@pgrep -u \"\\\\\\\$u\" -f 'Runner\\\\.Worker'@false@"                       has_slot_sweep
-mutate "the marker no longer consulted"     's@^  if \[ -f "\\\$marker" \]; then$@  if false; then@'                       has_slot_sweep
-mutate "state read as a yes/no again"       's@state=\\\$(systemctl is-active "ci-runner@state=\$(systemctl is-active --quiet "ci-runner@' has_slot_sweep
-mutate "a slot mid-transition swept anyway" 's@    activating | deactivating | reloading) continue ;;@    esac_placeholder) : ;;@' has_slot_sweep
-mutate "one sample is enough"               's@^GRACE=60$@GRACE=0@'                                                       has_slot_sweep
-mutate "the grace never checked"            's@-ge "\\\$GRACE" \] || continue@-ge 0 ] || true@'                            has_slot_sweep
-mutate "unclean record ignored by sweep"   's@if \[ ! -f "\\\$dir/unclean-after-job" \]; then@if true; then@'           has_slot_sweep
-mutate "the agent left up during the reset" 's@systemctl stop "ci-runner@systemctl show "ci-runner@'                       has_slot_sweep
-mutate "no second look for a live job"      's@refusing to reset underneath one@resetting anyway@'                         has_slot_sweep
-mutate "a stop that failed treated as done" 's@its agent would not stop@its agent stopped@'                                has_slot_sweep
-mutate "a failed reset leaves the slot down" 's@it stays dirty and the next sweep retries@it stays dirty@'                  has_slot_sweep
-mutate "the sweep cleans it its own way"    's@/opt/ci/job-hooks/slot-reset\.sh completed "\\\$idx"@rm -rf "\$dir"@'        has_slot_sweep
+mutate "the loop not installed"           's@^  install_slot_loop || die@  true || die@'                          has_slot_sweep
+mutate "the loops enabled at boot"        's|^  for i in \$ready; do$|  systemctl enable ci-slot-loop@1.service\n&|' has_slot_sweep
+mutate "the loops never started"          's|systemctl start "ci-slot-loop@\$i\.service"|true|'                has_slot_sweep
+mutate "a dead loop stays dead"           's@^Restart=always$@Restart=no@'                                     has_slot_sweep
+mutate "dirty alone is enough to stop"    's@! job_running; then@true; then@'                                   has_slot_sweep
+mutate "a job is a name in the process table" 's@cg=\$(systemctl show -p ControlGroup --value "\$UNIT"@cg=$(pgrep -f Runner@' has_slot_sweep
+mutate "a runner stopped while assigned"  's@ \&\& delete_runner "\$id"; then@; then@'                          has_slot_sweep
+mutate "one sample is enough to stop"     's@-ge 12 \]@-ge 0 ]@'                                               has_slot_sweep
+mutate "reset under a previous loop's job" 's@^while agent_up; do sleep 5; done$@:@'                          has_slot_sweep
+mutate "the gate asked once"              '0,/if why=\$(gate); then/s@if why=\$(gate); then@if false; then@'     has_slot_sweep
+mutate "a gated runner started anyway"    's@delete_runner "\$id" || log "slot \$idx: could not withdraw runner@: || log "x@' has_slot_sweep
+mutate "the dead agent's runner kept"     's@^  delete_runner "\$id" || true$@  true@'                          has_slot_sweep
+mutate "a second stop path"               's@^  need_reset=1$@  systemctl stop "$UNIT"; need_reset=1@'           has_slot_sweep
+mutate "the loop cleans its own way"      's@timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx"@rm -rf "$dir"@' has_slot_sweep
 
 # --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
 #

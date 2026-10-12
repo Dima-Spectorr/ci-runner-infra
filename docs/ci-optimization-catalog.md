@@ -967,16 +967,13 @@ describing nothing.
    broken slot preferentially won the queue and re-running the workflow spread
    the outage rather than clearing it. IntegrateIT lost twelve of twenty-four
    slots to it on 2026-08-23, from an ordinary `fail-fast` cancellation.
-   `install_slot_sweep()` therefore runs `slot-sweep.sh` on a 30-second timer:
-   any slot with no marker, no `Runner.Worker`, and a settled systemd state for
-   two consecutive ticks has its agent stopped, is re-checked for a worker,
-   is reset through the same `slot-reset.sh` the hooks call, and comes back.
-   Recovery stops costing a job. Two witnesses and two ticks are both load-
-   bearing — the marker is absent for the whole length of a *live* job, so
-   "dirty" alone describes a running job exactly as well as an abandoned one —
-   and the reset now takes a per-slot `flock`, because the sweep made root a
-   second concurrent caller of a script that had only ever been called serially
-   by the runner.
+   Since #1481 every slot is run-once: `install_slot_loop()` runs a root loop
+   per slot that resets the slot through the same `slot-reset.sh` the hooks
+   call, mints a just-in-time runner good for ONE job, runs it, deletes it and
+   starts over. A slot whose job never reached its completed hook is reset
+   before its next registration, so recovery never costs a job. The reset takes
+   a per-slot `flock`, because the loop makes root a second concurrent caller
+   of a script the runner's hooks also call.
 
    **And a slot the timer cannot recover leaves the pool rather than eating
    it.** Retrying forever is right for a transient obstruction and wrong for a
@@ -986,9 +983,10 @@ describing nothing.
    `slot-reset.sh` therefore counts consecutive failures to reach a clean state
    into `$SLOT_STATE/<idx>/burns` — root-owned, beside the marker, because the
    subject of the measurement is the slot — and clears it the moment the slot
-   comes back clean. Past `CONDEMN_MAX=3` the sweep stops starting that slot's
-   agent. Not disabled and not deleted: the reset is still attempted every tick,
-   and a slot whose obstruction clears is put straight back into service.
+   comes back clean. Past `CONDEMN_MAX=3` the slot loop reports the slot
+   condemned and does not register it. Not disabled and not deleted: the reset
+   is retried every 30 seconds, and a slot whose obstruction clears is put
+   straight back into service.
 
    The fleet can already see this without a new API call or a new guest
    attribute. A stopped agent leaves the repository's runner list, and

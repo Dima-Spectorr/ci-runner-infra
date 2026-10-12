@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# What slot-reset.sh and slot-sweep.sh DO, as opposed to what they say.
+# What slot-reset.sh DOES, as opposed to what it says.
 #
 # `host-startup.selftest.sh` reads both scripts as text: a pattern must be
 # present, and a mutation of it must make the pattern go away. That is the right
@@ -63,8 +63,8 @@ fi
 # refused with "uid N is not a slot user", and the suite would then be testing
 # the refusal path twenty times over while reporting the reset as broken.
 #
-# Both callers this file models are root with no sudo in the picture: systemd's
-# ExecStartPre on the agent unit, and the sweep's own timer. Neither has these.
+# The caller this file models is root with no sudo in the picture: the slot
+# loop (ci-slot-loop@N), which resets before every registration. It has none.
 unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 
 PASS=0
@@ -112,6 +112,9 @@ SLOT_ROOT="$SB/slots"
 SLOT_STATE="$SB/state"
 SLOT_TEMPLATE="$SB/template"
 PIN_DIR="$SLOT_STATE/.pin"
+# Read by the pin-hold here-document (`SLOTS=$SLOTS`), through the eval in
+# expand_into that no static reader sees -- hence the directive, not a removal.
+# shellcheck disable=SC2034
 SLOTS=$IDX
 
 # The tool cache the reset hook REPORTS on. Bound here for the same reason
@@ -137,7 +140,6 @@ WORK="$SLOT_ROOT/$IDX/_work"
 WORKSPACE="$WORK/$OWNER/$REPO"
 MARKER="$SLOT_STATE/$IDX/clean"
 BURNS_1392="$SLOT_STATE/$IDX/burns"
-SINCE="$SLOT_STATE/$IDX/dirty-since"
 
 made_user=0
 made_unit=0
@@ -219,37 +221,25 @@ EOF
 SLOT_USER_PREFIX=$PREFIX
 
 RESET="$SB/slot-reset.sh"
-SWEEP="$SB/slot-sweep.sh"
 
 expand_into "$RESET" "$(body_of 'cat >/opt/ci/job-hooks/slot-reset\.sh <<EOF')" || {
   echo "FAIL: the slot-reset here-document did not expand"
   exit 1
 }
-expand_into "$SWEEP" "$(body_of 'cat >/opt/ci/job-hooks/slot-sweep\.sh <<EOF')" || {
-  echo "FAIL: the slot-sweep here-document did not expand"
-  exit 1
-}
-chmod 0755 "$RESET" "$SWEEP"
+chmod 0755 "$RESET"
 
 echo "extraction"
 check "the reset expanded to a non-empty script" test -s "$RESET"
 check "the reset parses"                         bash -n "$RESET"
-check "the sweep expanded to a non-empty script" test -s "$SWEEP"
-check "the sweep parses"                         bash -n "$SWEEP"
 check "the reset was told where the slots are"   grep -q "SLOT_ROOT=\"$SLOT_ROOT\"" "$RESET"
-check "the sweep was told how many slots there are" grep -q "^SLOTS=$SLOTS\$" "$SWEEP"
 # The #268 class, and the reason this suite found one on its first run: a
 # backtick pair inside a COMMENT is still a command substitution here.
 if [ -s "$NOISE" ]; then
-  bad "expanding the two scripts ran something and it complained:"
+  bad "expanding the reset ran something and it complained:"
   sed 's/^/       /' "$NOISE"
 else
-  ok "expanding the two scripts executed nothing"
+  ok "expanding the reset executed nothing"
 fi
-
-# The sweep calls the reset by its installed path. In the sandbox that path is
-# the extracted copy, so the one line naming it is rewritten and nothing else is.
-sed -i "s#/opt/ci/job-hooks/slot-reset\.sh#$RESET#" "$SWEEP"
 
 # --- the fixture --------------------------------------------------------------
 
@@ -441,6 +431,44 @@ check_not "no process of the slot outlives the reset" pgrep_slot
 check "nothing rewrote the home after the wipe"   test ! -e "$HOME_DIR/.pwned"
 check "the home is the template's again"          test -f "$HOME_DIR/.bashrc"
 check "and the marker means it"                   test -f "$MARKER"
+
+# A HOLD THAT RESERVES NOTHING SPARES NOTHING (#1481, review H-1). Any job can
+# write a live hold on its own slot with reserve=0 (`ci-pin-hold --run <any-id>`).
+# The slot loop does not hold the slot back for it -- held() counts reserve=1
+# only -- so a reset that spared the slot on such a record would hand the job's
+# stragglers to the next job, where they read its JIT config and step secrets
+# through /proc. The reserve=1 run is the control: it proves this record is the
+# one the reset reads, so the reserve=0 pass is not a record nobody looked at.
+hold_record() { # <reserve>
+  printf 'run=1481\nslot=%s\nexpiry=%s\nreserve=%s\nboot=%s\n' \
+    "$IDX" "$(($(date +%s) + 600))" "$1" "$(cat /proc/sys/kernel/random/boot_id)" >"$PIN_DIR/host"
+}
+straggler() {
+  sudo -u "$U" nohup bash -c 'while :; do sleep 0.2; done' >/dev/null 2>&1 &
+  sleep 1
+}
+
+seed_work
+hold_record 0
+straggler
+check "the straggler is running before the reset" pgrep_slot
+in_workspace completed
+rc=$?
+sleep 1
+check "the reset succeeds under a hold that reserves nothing" test "$rc" = 0
+check_not "a reserve=0 hold does not spare the slot's processes" pgrep_slot
+
+seed_work
+hold_record 1
+straggler
+in_workspace completed
+sleep 1
+check "the control: a reserve=1 hold does spare them" pgrep_slot
+pkill -KILL -u "$U" 2>/dev/null || :
+sleep 1
+rm -f -- "$PIN_DIR/host"
+in_workspace completed
+check "the slot is clean again once the hold is gone" test -f "$MARKER"
 
 # The suite goes on after a failed assertion, so a writer that DID survive would
 # keep rewriting the home under every case below and the report would blame
@@ -935,8 +963,10 @@ seed_units
 check "the job's service is running before the reset" unit_live probe-1395.service
 check "the job's timer is armed before the reset"     unit_live probe-1395t.timer
 
-# HELD first: a slot a live run holds keeps everything, exactly as before.
-printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=0\nboot=%s\n' "$IDX" \
+# HELD first: a slot a live run's hold RESERVES keeps everything, exactly as
+# before. reserve=1, because only a reserving hold spares a slot (#1481, H-1);
+# the reserve=0 case is asserted above, where its stragglers must die.
+printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=1\nboot=%s\n' "$IDX" \
   "$(( $(date +%s) + 600 ))" "$(cat /proc/sys/kernel/random/boot_id)" >"$PIN_DIR/host"
 reset_once "$RESET"
 settle
@@ -1031,58 +1061,6 @@ loginctl disable-linger "$U" >>"$HOOKLOG" 2>&1
 systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
 made_linger=0
 
-# --- the sweep ----------------------------------------------------------------
-#
-# Everything above is the reset in isolation. The sweep is what decides WHEN it
-# runs, and the property that matters is the one it was written for: a slot left
-# dirty by a job that never completed comes back without a job being spent on it.
-
-echo
-echo "sweep: a clean slot"
-seed_work
-"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
-printf '%s\n' 1 >"$SINCE"
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "a clean slot is left alone"                test -f "$MARKER"
-check "and its dirty clock is cleared"            test ! -f "$SINCE"
-
-echo
-echo "sweep: a dirty slot, first sight"
-seed_work
-rm -f -- "$MARKER"
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "the first tick does not act"               test ! -f "$MARKER"
-check "the first tick starts the clock"           test -f "$SINCE"
-check "the slot is left as it was"                test -f "$WORK/_actions/action.yml"
-
-echo
-echo "sweep: a dirty slot, still dirty a grace later"
-printf '%s\n' 1 >"$SINCE"
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "the slot is reset"                         test -f "$MARKER"
-check "and the leftovers are gone"                test ! -e "$WORK/_actions/action.yml"
-check "and the clock is cleared"                  test ! -f "$SINCE"
-check "no job was spent doing it"                 test -d "$WORK"
-
-echo
-echo "sweep: a dirty slot with a job on it"
-#
-# The one thing this must never do. A live job holds a worker process for its
-# whole length and the marker is absent for that whole length too, so 'dirty'
-# alone describes a running job exactly as well as it describes a dead one.
-seed_work
-rm -f -- "$MARKER"
-printf '%s\n' 1 >"$SINCE"
-sudo -u "$U" bash -c 'exec -a Runner.Worker sleep 20' &
-worker=$!
-sleep 1
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "a slot with a worker on it is not reset"   test -f "$WORK/_actions/action.yml"
-check "and it is not marked clean underneath one" test ! -f "$MARKER"
-check "and its clock is reset, not advanced"      test ! -f "$SINCE"
-kill "$worker" >/dev/null 2>&1
-wait "$worker" >/dev/null 2>&1
-
 # --- the burn count, and condemnation -----------------------------------------
 #
 # Everything above is about a slot that comes back. #278 is the slot that does
@@ -1144,39 +1122,37 @@ in_workspace completed >/dev/null 2>&1
 rm -rf -- "$WORK"
 sudo -u "$U" ln -s /tmp "$WORK"
 rm -f -- "$MARKER" "$BURNS" "$CONDEMNED"
-printf '%s\n' 1 >"$SINCE"
 
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "one failed sweep condemns nothing"          test ! -e "$CONDEMNED"
-check "and the sweep's own failure is counted"     grep -qx 1 "$BURNS"
-check "and the clock is left alone, so it retries" test -f "$SINCE"
+# The slot loop runs exactly this between jobs, and condemns the slot once the
+# count it leaves reaches CONDEMN_MAX (3). The count is the reset's own.
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "a failed reset is counted"                  grep -qx 1 "$BURNS"
+check "and is not marked clean"                    test ! -f "$MARKER"
 
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "two is still within the allowance"          test ! -e "$CONDEMNED"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "two failures count two"                     grep -qx 2 "$BURNS"
 
-"$SWEEP" >>"$HOOKLOG" 2>&1
-check "three takes the slot out of service"        test -f "$CONDEMNED"
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
+check "three reach the loop's condemn threshold"   grep -qx 3 "$BURNS"
 check "and the symlink target is still untouched"  test -d /tmp
 
 echo
 echo "condemnation: and the way back"
 #
-# Condemned is not disabled and not deleted. The sweep goes on trying the reset,
-# so a slot whose obstruction clears -- a wedged container finally reaped, a
-# disk that came back -- returns without anyone being paged.
+# Condemned is not disabled and not deleted. The slot loop goes on trying the
+# reset, so a slot whose obstruction clears -- a wedged container finally reaped,
+# a disk that came back -- returns without anyone being paged.
 rm -f -- "$WORK"
 seed_work
-"$SWEEP" >>"$HOOKLOG" 2>&1
+"$RESET" completed "$IDX" >>"$HOOKLOG" 2>&1
 check "a slot that reaches a clean state is clean" test -f "$MARKER"
-check "and it is put back into service"            test ! -e "$CONDEMNED"
 check "and it owes nothing"                        test ! -e "$BURNS"
-check "and its clock is cleared"                   test ! -f "$SINCE"
 
 # --- the pin hold's guest attribute (#1393) ------------------------------------
 #
 # ci-pin-hold publishes the hold to a guest attribute as best effort, and on a
 # host that never wrote ci/ a lost PUT reads to the controller as a FREE host
-# (#1384). The sweep is what republishes it. That is a property of two scripts
+# (#1384). The pin sweep is what republishes it. That is a property of two scripts
 # and a metadata server taking turns, so it is run, not grepped.
 #
 # THE METADATA SERVER IS A STUB, and it has to be. This suite runs on a real

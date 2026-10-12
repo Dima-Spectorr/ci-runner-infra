@@ -248,8 +248,8 @@ since #278.
 | | |
 |---|---|
 | **Controller** | on cordon, sets instance metadata `ci-cordon=1` on that host (`cordon_host()`) |
-| **Host** | the root `ci-slot-sweep.timer`, every 30s, reads the flag and — for any slot with no live `Runner.Worker` — stops `ci-runner@N.service` and does not restart it |
-| **Why it works** | units are `Restart=no`; a stopped agent is not long-polling, so it cannot be assigned work, and it leaves the repository's runner list |
+| **Host** | each slot's root loop (`ci-slot-loop@N`) reads `ci-cordon` and `ci-drain` from the metadata server before EVERY registration and after minting; a set flag means the slot is not registered again once its one job ends (#1481) |
+| **Why it works** | every registration is just-in-time and good for ONE job; a slot that is not re-registered has no runner to be assigned work, and it leaves the repository's runner list without anything being stopped |
 | **Terminating condition** | the controller's next tick reads `busy=0` → `retire:stale-template` → `drain_host`, and all five gates above still apply |
 
 The wait is now one **job** long instead of however long it takes a poll to

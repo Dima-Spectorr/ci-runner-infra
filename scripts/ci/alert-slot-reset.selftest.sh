@@ -131,6 +131,8 @@ check_all() (
     m="${m#*say \"}"; m="${m%\"*}"
     m="${m//'\$idx'/3}"; m="${m//'\$sock'//run/user/1003/docker.sock}"; m="${m//'\$dsock'/foreign}"
     m="${m//'\$burns'/4}"; m="${m//'\$left'/2}"; m="${m//'\$u'/ci-s3}"
+    # The slot loop's heredoc is quoted, so its say lines carry the bare names.
+    m="${m//'$idx'/3}"; m="${m//'$burns'/4}"
     printf '%s' "$m"
   }
   : >"$d/alerting"
@@ -221,10 +223,10 @@ mutate "the policy watches another metric" src 's@logging.googleapis.com/user/ci
 mutate "the filter reads another log"      src "s@'logName:\"logs/ci-slot-lifecycle\" AND@'logName:\"logs/ci-slot-reset\" AND@"
 mutate "the filter pages on recovery"      src 's@\[0-9\]+ consecutive failures to reach a clean state — taking it out of service rather than letting it keep winning jobs it will burn\$@[^ ]+ again after being condemned — putting it back into service$@'
 mutate "a phrase nobody prints"            src 's@refusing to call this slot clean\$"@refusing to call the slot clean$"@'
-mutate "a bare phrase beside the pairs"    src 's@ OR (jsonPayload.identifier="ci-slot-sweep"@ OR jsonPayload.message:"taking it out of service" OR (jsonPayload.identifier="ci-slot-sweep"@'
+mutate "a bare phrase beside the pairs"    src 's@ OR (jsonPayload.identifier="ci-slot-loop"@ OR jsonPayload.message:"taking it out of service" OR (jsonPayload.identifier="ci-slot-loop"@'
 mutate "a condition unanchored at the end" src 's@\[^ \]+ reads as foreign\$"@[^ ]+ reads as foreign"@'
 mutate "a wildcard where a field belongs"  src 's@\[^ \]+ reads as foreign\$"@.+ reads as foreign$"@'
-mutate "a condition under the wrong tag"   src 's@(jsonPayload.identifier="ci-slot-sweep" AND@(jsonPayload.identifier="ci-slot-reset" AND@'
+mutate "a condition under the wrong tag"   src 's@(jsonPayload.identifier="ci-slot-loop" AND@(jsonPayload.identifier="ci-slot-reset" AND@'
 # The forgeries alone: anchored at both ends, no .* or .+, the writer's own
 # line still matches -- only a planted phrase shows the field is too wide.
 mutate "a field wide enough to plant into" src 's@\[^ \]+ reads as foreign\$"@[^!]+ reads as foreign[^!]*$"@'
@@ -238,7 +240,7 @@ mutate "the reset rewords its refusal"    hs  's/-- refusing to call this slot c
 mutate "the sweep rewords its condemn"     hs  's/— taking it out of service rather/— removing it from service rather/'
 mutate "the reset stops saying reads as"   hs  's/reads as \\\$dsock"/is \\$dsock"/'
 mutate "the shipper renames its log"       hs  's/^LOG_ID=ci-slot-lifecycle$/LOG_ID=ci-host-journal/'
-mutate "the shipper drops the sweep's tag" hs  's/^IDENTIFIERS=(ci-slot-reset ci-slot-sweep /IDENTIFIERS=(ci-slot-reset /'
+mutate "the shipper drops the loop's tag" hs  's/^IDENTIFIERS=(ci-slot-reset ci-slot-loop /IDENTIFIERS=(ci-slot-reset /'
 
 printf '\nalert-slot-reset self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

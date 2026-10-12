@@ -129,7 +129,7 @@ fixture() { # <cursor> <identifier> <message-json> [<priority>]
 }
 base_journal() {
   fixture c1 ci-slot-reset '"slot 1: /run/user/1001/docker.sock reads as foreign"'
-  fixture c2 ci-slot-sweep '"slot 2: 4 consecutive failures to reach a clean state — taking it out of service"' 4
+  fixture c2 ci-slot-loop '"slot 2: 4 consecutive failures to reach a clean state — taking it out of service"' 4
   fixture c3 ci-slot-reset '"slot 3: a \"quoted\" name\nforged: host ready\u0007"'
   fixture c4 ci-pin-hold '[115,108,111,116,10,255,52]'
   fixture c5 ci-pin-sweep "\"$long\""
@@ -169,7 +169,7 @@ run_suite() {
   # own output (ci-runner@ carries job output).
   local want got
   want=$(printf '%s\n' _UID=0 SYSLOG_IDENTIFIER=ci-pin-hold SYSLOG_IDENTIFIER=ci-pin-sweep \
-    SYSLOG_IDENTIFIER=ci-slot-reset SYSLOG_IDENTIFIER=ci-slot-sweep + + _PID=1 \
+    SYSLOG_IDENTIFIER=ci-slot-reset SYSLOG_IDENTIFIER=ci-slot-loop + + _PID=1 \
     _SYSTEMD_UNIT=dbus.service _SYSTEMD_UNIT=systemd-logind.service | LC_ALL=C sort)
   got=$(grep -v -- '^--' "$SD/journalctl.argv" | LC_ALL=C sort)
   [ "$got" = "$want" ] || fail "journalctl matches are not exactly the slot-tool identifiers AND _UID=0, OR _PID=1, OR logind/dbus: $(printf '%s' "$got" | tr '\n' ' ')"
@@ -181,7 +181,7 @@ run_suite() {
   [ "$(jq -c .labels "$p")" = '{"pool":"pool-a","host":"host-a"}' ] || fail "the pool/host labels are $(jq -c .labels "$p")"
   [ "$(jq -r .partialSuccess "$p")" = true ] || fail "partialSuccess is off -- one bad entry would drop the batch"
   [ "$(jq '.entries | length' "$p")" = 5 ] || fail "$(jq '.entries | length' "$p") entries shipped, want 5"
-  [ "$(jq -r '[.entries[].jsonPayload.identifier] | join(",")' "$p")" = ci-slot-reset,ci-slot-sweep,ci-slot-reset,ci-pin-hold,ci-pin-sweep ] ||
+  [ "$(jq -r '[.entries[].jsonPayload.identifier] | join(",")' "$p")" = ci-slot-reset,ci-slot-loop,ci-slot-reset,ci-pin-hold,ci-pin-sweep ] ||
     fail "entries are not in journal order"
   [ "$(jq -r '.entries[0].jsonPayload.message' "$p")" = 'slot 1: /run/user/1001/docker.sock reads as foreign' ] ||
     fail "a plain message did not arrive intact"

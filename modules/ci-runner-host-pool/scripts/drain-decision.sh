@@ -52,7 +52,7 @@ mig_action_in_flight() {
 
 # drain_decision <instance_status> <busy_slots> <idle_seconds> <grace_seconds> \
 #                <pool_size> <min_hosts> <registration_state> \
-#                [age_seconds] [register_grace_seconds] [roster_state]
+#                [age_seconds] [register_grace_seconds] [roster_state] #                [absent_seconds]
 #
 #   instance_status     : GCE instanceStatus (RUNNING, TERMINATED, ...).
 #   busy_slots          : how many of this host's K runner agents are executing
@@ -90,6 +90,14 @@ mig_action_in_flight() {
 #                         is the ABSENCE of one, and a truncated listing
 #                         manufactures it for a host that is running jobs. See
 #                         rule 2b.
+#   absent_seconds      : how long this host has read `absent` WITHOUT
+#                         INTERRUPTION. Every slot registers for exactly one job
+#                         and is re-registered only after its reset, so a healthy
+#                         host whose slots all finished together -- or are all
+#                         held by a live run's pin -- reads absent for the length
+#                         of one reset. That is not death; persistence is. Default
+#                         is age_seconds, the same convention as above: a caller
+#                         with no clock gets the age-only rule.
 #
 # Echoes "drain:<reason>" or "keep:<reason>". Always exits 0 -- the verdict is
 # the output, not the status, so a `set -e` caller cannot be tripped by a keep.
@@ -104,6 +112,7 @@ drain_decision() {
   local age="${8:-0}"
   local reg_grace="${9:-0}"
   local roster="${10:-complete}"
+  local absent_for="${11:-$age}"
 
   # 1. A host in a terminal power state can hold no job. Delete unconditionally.
   #    This is the path that reclaims a host that crashed or was stopped out of
@@ -191,12 +200,22 @@ drain_decision() {
   #    which died with "The runner has received a shutdown signal".
   #
   #    So absent only means dead once the host has had time to register.
+  #
+  #    And once it has STAYED absent that long. A slot registers for ONE job and
+  #    is re-registered by its loop only after the next reset, so a working host
+  #    whose slots all finished in the same minute reads absent for one reset --
+  #    and draining it then shoots a host that is about to take the next job.
+  #    The absence has to outlast the same grace a boot is given.
   if [ "$reg" = "absent" ]; then
     if [ "$age" -lt "$reg_grace" ]; then
       echo "keep:booting age=${age}s<${reg_grace}s reg=absent"
       return 0
     fi
-    echo "drain:never-registered age=${age}s>=${reg_grace}s"
+    if [ "$absent_for" -lt "$reg_grace" ]; then
+      echo "keep:between-jobs absent=${absent_for}s<${reg_grace}s"
+      return 0
+    fi
+    echo "drain:never-registered age=${age}s>=${reg_grace}s absent=${absent_for}s"
     return 0
   fi
 

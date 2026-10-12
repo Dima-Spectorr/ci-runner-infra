@@ -67,9 +67,10 @@
 # DELETE is answered 422 while one that escalates to a kill drops a running job —
 # the one thing this whole two-phase design exists to prevent. The fix is in the
 # I/O layer instead: on cordon the controller sets `ci-cordon=1` on the instance,
-# and the host's own root slot sweep stops each agent as it goes idle. A stopped
-# agent is not long-polling, so it is not a scheduling target, and it leaves the
-# repository's runner list — so `busy` reaches 0 within one JOB duration rather
+# and the host's own slot loop stops re-registering each slot once its job ends.
+# A slot holds one single-use registration at a time, so one that is not
+# re-registered is not a scheduling target, and it leaves the repository's
+# runner list — so `busy` reaches 0 within one JOB duration rather
 # than whenever a sample happens to land. Same rule, an input that now converges.
 # Behind `recycle_cordon_stops_agents`, default false.
 #
@@ -77,7 +78,7 @@
 # interrupted, and a slot once removed from the pool never comes back. It does
 # NOT provide "no new job can ever reach this host again" on its own — only the
 # host-side half makes that true, and only on a pool whose hosts are new enough
-# to have the sweep that reads the flag. So the measurement added in #951 stays:
+# to have the slot loop that reads the flag. So the measurement added in #951 stays:
 # cordon_host() publishes ci_recycle_verdicts{outcome=cordon-no-progress} for a
 # cordon that has removed nothing since it started. With the flag off, or on a
 # pool still running older hosts, that series is the livelock being visible
@@ -149,7 +150,7 @@
 #                         parameter's absence meaning "no capacity-lost recycle
 #                         ever", the same way max_unavailable=0 does. Compared
 #                         against max(register_grace, 960s); the floor is the
-#                         slot sweep's own worst case, derived at rule 2.
+#                         slot loop's bounded reset, derived at rule 2.
 #   reserved_for_seconds: how long THIS host has held a reservation — its
 #                         replacement requested, its slots still serving. -1
 #                         (the default) when it holds none. A reserved host is
@@ -219,19 +220,21 @@ recycle_decision() {
   #    that never goes idle for the grace window — that path never fires.
   #
   #    HYSTERESIS, because `partial` is also a normal transient — and the window
-  #    is NOT simply reg_grace. ci-slot-sweep stops a dirty slot's agent while it
-  #    resets the workspace and starts it again, ordinarily inside about ninety
-  #    seconds. Ordinarily is not the bound. Its unit carries TimeoutStartSec=900
-  #    on a 30-second timer, deliberately generous so that one wedged docker call
-  #    cannot stop every later sweep on the host — so a slot that is coming back
-  #    can legitimately be missing for roughly 930 seconds, and the host reads
-  #    `partial` for every one of them.
+  #    is NOT simply reg_grace. Every slot registers for ONE job, and its slot
+  #    loop resets it before registering it again, so EVERY slot is missing
+  #    from the roster between every two jobs — ordinarily for about ninety
+  #    seconds. Ordinarily is not the bound. The loop runs that reset under
+  #    `timeout 900` and retries a failed one after 30 seconds, deliberately
+  #    generous so that one wedged docker call is survived rather than taking
+  #    the slot out of service — so a slot that is coming back can legitimately
+  #    be missing for roughly 930 seconds, and the host reads `partial` for
+  #    every one of them.
   #
   #    A recycle rule that fires inside that window RACES THE HOST'S OWN REPAIR
   #    and wins: the slot would have returned, and instead the pool cordons the
   #    host's remaining idle slots and deletes it. So the window is the larger of
   #    reg_grace — the same window that decides `absent` means dead, because it
-  #    answers the same question — and the sweep's own worst case plus its timer
+  #    answers the same question — and the loop's bounded reset plus its retry
   #    interval. The floor is what keeps a pool that has lowered reg_grace for
   #    faster scale-in from quietly buying host churn with it.
   local window="$reg_grace"
@@ -247,7 +250,7 @@ recycle_decision() {
   #    The two no-reason outcomes are reported apart, because they are not the
   #    same non-event. A host that is merely on a current template is the answer
   #    for every healthy host on every tick. A host reading `partial` INSIDE the
-  #    hysteresis window is the mechanism watching something: either a sweep
+  #    hysteresis window is the mechanism watching something: either a reset
   #    that is about to hand the slot back, or the first ticks of capacity that
   #    is gone for good. Collapsing the second into the first would publish the
   #    interesting case under the label of the boring one.
