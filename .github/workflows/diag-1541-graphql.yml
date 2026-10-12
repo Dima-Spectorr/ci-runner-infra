@@ -46,8 +46,7 @@ jobs:
           gh api "repos/$OWNER/$NAME/commits/$sha/check-suites?per_page=100"             --jq '.check_suites[] | "suite=\(.id) status=\(.status) app=\(.app.slug // "null")/\(.app.id // "null") runs=\(.latest_check_runs_count)"'
           echo "--- the same suites' app over GraphQL, one suite at a time"
           for id in $(gh api "repos/$OWNER/$NAME/commits/$sha/check-suites?per_page=100" --jq '.check_suites[].node_id'); do
-            gh api graphql -f id="$id" -f query='query($id: ID!) { node(id: $id) { ... on CheckSuite { databaseId app { slug databaseId } } } }' 2>&1 | tr -d '
-' | cut -c1-300; echo
+            gh api graphql -f id="$id" -f query='query($id: ID!) { node(id: $id) { ... on CheckSuite { databaseId app { slug databaseId } } } }' 2>&1 | tr -d '\n' | cut -c1-300; echo
           done
           for round in 1; do
             cur=null; page=0
