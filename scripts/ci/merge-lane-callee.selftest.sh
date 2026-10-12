@@ -92,7 +92,7 @@ run_case() {
   (
     export PATH="$WORK/bin:$PATH" CASE READ_TOKEN=t GITHUB_API_URL=https://api.example
     export GITHUB_REPOSITORY="$repo" GITHUB_WORKFLOW_REF="$wf_ref" GITHUB_WORKFLOW_SHA="$HERE"
-    export GITHUB_OUTPUT="$CASE/out" IMPLEMENTATION_REPOSITORY=Dima-Spectorr/ci-runner-infra
+    export GITHUB_OUTPUT="$CASE/out" IMPLEMENTATION_REPOSITORY=Example-Org/ci-runner-infra
     export IMPLEMENTATION_REF="$impl_ref" CALLEE_PATH=.github/workflows/merge-lane.yml
     bash "$BLOCK"
   ) >"$CASE/log" 2>&1
@@ -119,7 +119,7 @@ expect_refusal() { # <case name>
   fi
 }
 
-CONSUMER=Dima-Spectorr/Consumer
+CONSUMER=Example-Org/Consumer
 WF="$CONSUMER/.github/workflows/merge-lane.yml@refs/heads/main"
 
 # 1. The common case: a sha pin, exactly as consumers write it.
@@ -127,8 +127,8 @@ new_case sha-pin
 cat >"$CASE/caller.yml" <<EOF
 jobs:
   lane:
-    # uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B  (an old note)
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A # v5.124.0
+    # uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B  (an old note)
+    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A # v5.124.0
 EOF
 run_case "" "$CONSUMER" "" "$WF"
 expect_sha "a sha pin runs that sha (a commented-out uses: line is not a pin)" "$PIN_A"
@@ -138,7 +138,7 @@ fi
 
 # 2. A tag pin resolves through the API to its commit.
 new_case tag-pin
-printf '%s\n' "  - uses: 'dima-spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@v5.124.0'" >"$CASE/caller.yml"
+printf '%s\n' "  - uses: 'example-org/ci-runner-infra/.github/workflows/merge-lane.yml@v5.124.0'" >"$CASE/caller.yml"
 printf 'v5.124.0 %s\n' "$PIN_A" >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_sha "a quoted tag pin, owner in another case, resolves to its commit" "$PIN_A"
@@ -146,7 +146,7 @@ expect_sha "a quoted tag pin, owner in another case, resolves to its commit" "$P
 # 3. This repository calls itself with a local path: the commit that ran.
 new_case local-path
 printf '%s\n' "    uses: ./.github/workflows/merge-lane.yml" >"$CASE/caller.yml"
-run_case "" Dima-Spectorr/ci-runner-infra "" "Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane-self.yml@refs/heads/main"
+run_case "" Example-Org/ci-runner-infra "" "Example-Org/ci-runner-infra/.github/workflows/merge-lane-self.yml@refs/heads/main"
 expect_sha "a local uses: in this repository runs GITHUB_WORKFLOW_SHA" "$HERE"
 
 # 4. A local path in ANOTHER repository is that repository's file, not ours.
@@ -169,8 +169,8 @@ run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a caller file with no uses: line for this workflow (an intermediate reusable workflow)"
 
 new_case two-pins
-printf '%s\n' "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" \
-  "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" \
+  "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "two disagreeing pins in the caller"
 
@@ -179,23 +179,23 @@ run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "the caller's workflow file cannot be read"
 
 new_case no-workflow-ref
-printf '%s\n' "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" ""
 expect_refusal "GITHUB_WORKFLOW_REF unset"
 
 new_case foreign-workflow-ref
-printf '%s\n' "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" "Someone/Else/.github/workflows/x.yml@refs/heads/main"
 expect_refusal "GITHUB_WORKFLOW_REF naming another repository"
 
 new_case unknown-tag
-printf '%s\n' "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@v0.0.0" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@v0.0.0" >"$CASE/caller.yml"
 : >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a tag that does not resolve"
 
 new_case not-a-sha
-printf '%s\n' "    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/merge-lane.yml@v9" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@v9" >"$CASE/caller.yml"
 printf 'v9 %s\n' "<html>not a sha</html>" >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a ref whose resolution is not a 40-hex sha"

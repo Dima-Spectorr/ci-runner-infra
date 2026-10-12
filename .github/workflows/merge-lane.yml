@@ -630,7 +630,7 @@ jobs:
           from="input implementation-ref"
           if [ -z "$ref" ]; then
             caller=${GITHUB_WORKFLOW_REF:-}
-            [ -n "$caller" ] && [ -n "${GITHUB_WORKFLOW_SHA:-}" ] || die "GITHUB_WORKFLOW_REF or GITHUB_WORKFLOW_SHA is unset"
+            if [ -z "$caller" ] || [ -z "${GITHUB_WORKFLOW_SHA:-}" ]; then die "GITHUB_WORKFLOW_REF or GITHUB_WORKFLOW_SHA is unset"; fi
             path=${caller#"$GITHUB_REPOSITORY"/}
             path=${path%%@*}
             [ "$path" != "${caller%%@*}" ] || die "GITHUB_WORKFLOW_REF '$caller' names no file in $GITHUB_REPOSITORY"
@@ -655,13 +655,13 @@ jobs:
             ref=$refs
             from="$path"
           fi
-          if printf '%s\n' "$ref" | grep -qxE '[0-9a-f]{40}'; then
+          if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
             sha=$ref
           else
             sha=$(fetch application/vnd.github.sha "$api/repos/$IMPLEMENTATION_REPOSITORY/commits/$ref") ||
               die "cannot resolve ref '$ref' in $IMPLEMENTATION_REPOSITORY"
           fi
-          printf '%s\n' "$sha" | grep -qxE '[0-9a-f]{40}' || die "ref '$ref' resolved to '$sha', not a commit sha"
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "ref '$ref' resolved to '$sha', not a commit sha"
           echo "lane: implementation $IMPLEMENTATION_REPOSITORY@$sha, pinned by $from (ref $ref)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
