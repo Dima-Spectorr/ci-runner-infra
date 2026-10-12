@@ -1596,6 +1596,75 @@ lane_base_is_broken() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_base_rerun_failed — retry a red base ONCE before the halt waits on a person.
+#
+#   lane_base_rerun_failed <base-sha>        reads LANE_BASE_FAILING
+#
+# WHY (#1529). IntegrateIT, 2026-10-10: `main-health` on 37deab5d failed at
+# 13:26 because its runner was shut down mid-job ("The runner has received a
+# shutdown signal") — infrastructure, not the commit. The lane halted, as it
+# must on a red base, and then nothing moved: no merge means no new tip, so
+# nothing re-ran the check until a person did at 13:58. The halt ended at
+# 14:04, 38 minutes for a blip, and it set the repository's p90 green-to-merged
+# at 975s on its own.
+#
+# ONE retry, and GitHub keeps the count, not this file: only a run whose
+# `run_attempt` is 1 is re-run. The retry's own failure is attempt 2 and halts
+# exactly as before, so a real break costs one extra run of its workflow and
+# can never become a loop — across passes, lane runs or repositories, because
+# the attempt number lives on the run. `rerun-failed-jobs`, so the green jobs
+# of that run are not repeated. Only runs on THIS tip whose failed job carries
+# a failing base-health name, so nothing else on the base is touched.
+#
+# The halt itself is unchanged: while the retry runs the tip reads `unanswered`
+# and the lane waits, and it resumes on its own when the retry answers green.
+# The re-run uses the run's own GITHUB_TOKEN (LANE_RERUN_TOKEN; the lane job
+# holds `actions: write`), never the App, so no App permission is added. Best
+# effort — a refused re-run is a warning naming the grant, and the halt stands
+# as it did before this existed.
+lane_base_rerun_failed() { # <base-sha>
+  local base_sha="$1" runs id attempt names name hit err
+  [ "${#LANE_BASE_FAILING[@]}" -gt 0 ] || return 0
+  if ! runs="$(gh api "repos/$R/actions/runs?head_sha=$base_sha&status=completed&per_page=100" \
+    --jq '.workflow_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | "\(.id) \(.run_attempt)"' 2>/dev/null)"; then
+    echo "lane: could not list the workflow runs on ${base_sha:0:8} (actions/runs), so the red base is not retried — re-run it by hand if the failure was infrastructure"
+    return 0
+  fi
+  while read -r id attempt; do
+    [ -n "$id" ] || continue
+    names="$(gh api --paginate "repos/$R/actions/runs/$id/jobs?per_page=100" \
+      --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name' 2>/dev/null)" || continue
+    hit=''
+    for name in "${LANE_BASE_FAILING[@]}"; do
+      if grep -qxF -- "$name" <<<"$names"; then
+        hit="$name"
+        break
+      fi
+    done
+    [ -n "$hit" ] || continue
+    if [ "$attempt" != 1 ]; then
+      echo "lane: '$hit' failed on ${base_sha:0:8} on attempt $attempt of run $id — already retried once, so the halt waits for a fix"
+      continue
+    fi
+    if [ "$DRY_RUN" = "true" ]; then
+      echo "lane: dry-run — would re-run the failed jobs of run $id ('$hit' failed on ${base_sha:0:8}, attempt 1)"
+      continue
+    fi
+    if [ -z "${LANE_RERUN_TOKEN:-}" ]; then
+      echo "::warning::lane: no workflow token to re-run run $id ('$hit' on ${base_sha:0:8}) — re-run it by hand"
+      continue
+    fi
+    # The run's own GITHUB_TOKEN, not the App: re-running is an Actions write,
+    # which the lane job is granted (`actions: write`) and the App need not be.
+    if err="$(GH_TOKEN="$LANE_RERUN_TOKEN" gh api -X POST "repos/$R/actions/runs/$id/rerun-failed-jobs" 2>&1)"; then
+      echo "::notice::lane: re-running the failed jobs of run $id — '$hit' failed on ${base_sha:0:8} on its first attempt; one retry before the halt waits on a person (#1529)"
+    else
+      echo "::warning::lane: could not re-run the failed jobs of run $id ('$hit' on ${base_sha:0:8}): ${err//$'\n'/ } — the calling job must grant 'actions: write'; until then re-run it by hand"
+    fi
+  done <<<"$runs"
+}
+
+# ---------------------------------------------------------------------------
 # lane_base_fix_passed — how many of the base's failing checks PASSED on a head.
 #
 #   lane_base_fix_passed <sha> <states-file>
@@ -1906,6 +1975,7 @@ one_pass() {
     LANE_HALT_REASON="a required check is FAILING on the tip of $LANE_BASE ($base_sha)"
     echo "::warning::lane: not merging — $LANE_HALT_REASON. Merging onto a base that is already red buries the commit that broke it. Fix the base, or re-run its checks if the failure was infrastructure; the lane resumes on its own once they pass."
     mapfile -t LANE_BASE_FAILING < <(sed -n 's/^failed //p' "$LANE_BASE_STATES")
+    lane_base_rerun_failed "$base_sha"
     if [ "${#LANE_BASE_FAILING[@]}" -eq 0 ]; then
       return 1
     fi

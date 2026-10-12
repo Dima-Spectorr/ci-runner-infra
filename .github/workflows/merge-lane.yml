@@ -573,6 +573,10 @@ jobs:
       # out the default branch. Merging with it would trigger no downstream
       # workflow, which is the failure this whole design turns on.
       contents: read
+      # One write, and not a merge: re-running the failed jobs of a red
+      # base-health run once (#1529, `lane_base_rerun_failed`), with the run's
+      # own token so the App is not asked for Actions write.
+      actions: write
 
     steps:
       # THE IMPLEMENTATION REPOSITORY, NOT THE CALLER'S.
@@ -713,6 +717,9 @@ jobs:
           NEWER_INCOMPLETE_MAX_STALENESS: ${{ inputs.newer-incomplete-max-staleness-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}
+          # Only for re-running a red base-health run once (#1529); every
+          # merge, update and read stays on the App token above.
+          LANE_RERUN_TOKEN: ${{ github.token }}
         run: bash scripts/ci/merge-lane.sh
 
   # A FAILED PASS IS FOLLOWED BY ONE MORE, AS SOON AS THE APP'S QUOTA ANSWERS.
