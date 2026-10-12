@@ -768,7 +768,8 @@ check "regtoken: no --metadata value is interpolated onto the command line" 0 "$
 # diff that slides past because the assertion above happens to still hold.
 # shellcheck disable=SC2016
 r=$(grep -c -- '--metadata=' "$CTRL")
-check "regtoken: still only the two known --metadata arguments" 2 "$r"
+# The third is ci-drain=1 (#1481), a literal flag, not a credential.
+check "regtoken: still only the three known --metadata arguments" 3 "$r"
 # shellcheck disable=SC2016
 grep -q -- '--metadata="${REG_TOKEN_KEY}-issued=1"' "$CTRL" && r=yes || r=no
 check "regtoken: and it carries only the issued marker, never the token" yes "$r"
@@ -832,11 +833,13 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   # <busy> is how many of them the FRESH roster reports busy; NULL is a roster
   # with no busy field at all, and ROSTERFAIL is a roster that cannot be read.
   # <age> is how long this controller has known the host, in seconds.
-  # [emit]=events prints the structured events instead of the summary.
+  # [emit]=events prints the structured events instead of the summary;
+  # [emit]=flags prints the order of ci-drain set/clear, roster read and delete.
   # Env: GATE_CTRL_OS (the controller's own ci-host-os, default linux);
   # GATE_GA_ERR (stderr of a failing guest-attribute read); GATE_FRESH_RUNNERS
   # (agents in the fresh roster, default <runners>); GATE_DEL_CODE (GitHub's
-  # answer to a DELETE, default 204); GATE_MIG_RC (delete-instances status).
+  # answer to a DELETE, default 204); GATE_MIG_RC (delete-instances status);
+  # GATE_FLAG_RC (add-metadata status, i.e. whether ci-drain could be set).
   # -> ssh=<n> ga=<n> dereg=<n> del=<n> rc=<n> clear=<n> held=<n> und=<n> fb=<n> err=<n>
   local os="${1:-linux}" ga="${2:-}" garc="${3:-0}" derc="${4:-0}"
   local runners="${5:-1}" misses="${6:-0}" busy="${7:-0}" age="${8:-0}"
@@ -885,10 +888,11 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
   # is the real one: the proof is only as good as its insistence on reading the
   # roster to its END, and a stub that always says "complete" removes exactly
   # that. guest_attributes_denied is real for the same reason on the beacon side.
-  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+  code=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$(fn throttled_event)" "$(fn host_age_seconds)" "$(fn instance_host_os)" \
     "$(fn guest_attributes_denied)" "$(fn note_guest_attributes_denied)" \
-    "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_fail)" "$(fn drain_host)")
+    "$(fn beacon_gate)" "$(fn fetch_runner_roster)" "$(fn drain_fail)" "$(fn drain_host)" \
+    "$(fn drain_host_proven)")
   [ -n "$mut" ] && code=$(printf '%s\n' "$code" | sed "$mut")
 
   zone=test-zone-a
@@ -932,6 +936,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
       # The FRESH roster drain_host reads for itself. A failure is a non-zero
       # status with the reason on disk, which is how the real gh_api reports it.
       gh_api() {
+        echo ROSTER >>'$dir/calls'
         [ $rfail -eq 0 ] || { echo 503 >'$dir/api.status'; return 1; }
         cat '$dir/fresh.json'
       }
@@ -952,6 +957,7 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
             cat '$dir/meta.json'; return 0 ;;
           *'instances list'*) printf '%s\n' '$zone'; return 0 ;;
           *delete-instances*) return ${GATE_MIG_RC:-0} ;;
+          *add-metadata*) return ${GATE_FLAG_RC:-0} ;;
         esac
         return 0
       }
@@ -964,6 +970,13 @@ gate_seq() { # <os> <ga-csv> <ga-rc> <describe-rc> <runners> <misses> <busy>
 
   if [ "$emit" = "events" ]; then
     tr '\n' ';' <"$dir/events"
+    rm -rf "$dir"
+    return
+  fi
+  # [emit]=flags: the ORDER of the drain flag, the roster read and the delete.
+  if [ "$emit" = "flags" ]; then
+    grep -oE 'add-metadata.*ci-drain=1|remove-metadata.*ci-drain|^ROSTER$|delete-instances' "$dir/calls" |
+      sed 's/^add-metadata.*/set/; s/^remove-metadata.*/clear/; s/^ROSTER$/roster/; s/^delete-instances$/delete/' | tr '\n' ';'
     rm -rf "$dir"
     return
   fi
@@ -1124,6 +1137,28 @@ check "gate/windows: a read failure past the heartbeat is sent again" \
 check "gate/windows: a never-written namespace is not reported as a failure" \
   "INFO drain-probe;" \
   "$(GATE_GA_ERR="$GA_NS404" gate_seq windows '' 1 0 0 1 0 4000 '' events)"
+
+# --- the drain flag (#1481): up BEFORE the roster, down again on any abort ----
+# A slot registers for ONE job under a fresh name, so a roster read before the
+# flag can miss a runner minted a second later, and the delete would land under
+# its job. The host reads ci-drain before every registration and again after
+# minting; this pins the controller's half of that ordering.
+check "flag: an idle drain sets ci-drain, THEN reads the roster, then deletes" \
+  "set;roster;delete;" "$(gate_seq linux '' 0 0 1 0 0 0 '' flags)"
+check "flag: a busy host gets its flag cleared, so its slots take work again" \
+  "set;roster;clear;" "$(gate_seq linux '' 0 0 1 0 1 0 '' flags)"
+check "flag: an unreadable roster clears the flag too" \
+  "set;roster;clear;" "$(gate_seq linux '' 0 0 1 0 ROSTERFAIL 0 '' flags)"
+check "flag: a 422 mid-deregistration clears the flag" \
+  "set;roster;clear;" "$(GATE_DEL_CODE=422 gate_seq linux '' 0 0 1 0 0 0 '' flags)"
+check "flag: a failed delete after every agent is gone KEEPS the flag" \
+  "set;roster;delete;" "$(GATE_MIG_RC=1 gate_seq linux '' 0 0 1 0 0 0 '' flags)"
+check "flag: the kept flag FAILS when that arm stops keeping it" \
+  "set;roster;delete;clear;" "$(GATE_MIG_RC=1 gate_seq linux '' 0 0 1 0 0 0 's/DRAIN_KEEP_FLAG=1/:/' flags)"
+check "flag: ci-drain that cannot be set leaves every agent registered and reads nothing" \
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=0 fb=0 err=1" "$(GATE_FLAG_RC=1 gate_seq linux)"
+check "flag: ...and the roster is never read" \
+  "set;" "$(GATE_FLAG_RC=1 gate_seq linux '' 0 0 1 0 0 0 '' flags)"
 
 # --- the OS itself cannot be established: fail CLOSED, agents kept ------------
 check "gate/unknown: a ci-host-os this controller does not know keeps the host" \
@@ -1370,8 +1405,8 @@ check "partial_seconds: the marker is cleaned up with the host" yes "$r"
 # list; a name left off it becomes a global that survives into the next pool's
 # tick, so a host that was never partial could be recycled on the previous
 # pool's clock.
-grep -q '^  local host status .* partial_for reserved_for$' "$CTRL" && r=yes || r=no
-check "partial_seconds: partial_for and reserved_for are local to tick_pool" yes "$r"
+grep -q '^  local host status .* partial_for absent_for reserved_for$' "$CTRL" && r=yes || r=no
+check "partial_seconds: partial_for, absent_for and reserved_for are local to tick_pool" yes "$r"
 
 # --- pool_size accounting -----------------------------------------------------
 #
@@ -1976,7 +2011,7 @@ else
 fi
 check "restart: the tick lists and forgets after collect_mig and before any clock is read" yes "$r"
 # shellcheck disable=SC2016
-fn drain_host | grep -c '"\$STATE_DIR/boot-\$host"' >/dev/null && r=yes || r=no
+fn drain_host_proven | grep -c '"\$STATE_DIR/boot-\$host"' >/dev/null && r=yes || r=no
 check "restart: the boot record is removed with the host" yes "$r"
 grep -q '^HOST_BOOTS=""$' "$CTRL" && r=yes || r=no
 check "restart: HOST_BOOTS exists at file scope for a tick under set -u" yes "$r"

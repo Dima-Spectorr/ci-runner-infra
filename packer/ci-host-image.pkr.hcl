@@ -119,7 +119,7 @@ variable "tool_cache_node_version" {
     points it at, and until this existed that cache was the runner's default:
     `<work>/_tool`, inside the slot's own `_work` directory. That location is
     wrong twice over. It is per-slot, so four slots on one host each hold their
-    own copy; and it is inside the tree the slot sweep empties between jobs, so
+    own copy; and it is inside the tree the slot reset empties between jobs, so
     the copy does not survive to the next job. The download is therefore repaid
     per slot per job and amortised nowhere.
 
@@ -145,7 +145,7 @@ variable "tool_cache_node_version" {
         build rather than shipping.
       * the host boot. `provision_tool_cache` in host-startup.sh logs what it
         seeded, per slot, and logs a refusal when the image baked nothing.
-      * the slot sweep. `slot-reset.sh` reports any version a JOB wrote into the
+      * the slot reset. `slot-reset.sh` reports any version a JOB wrote into the
         slot's tool cache that this image did not bake — which, because the
         seeded cache is the only other thing in there, is precisely the set of
         cache misses. That is the signal that says "the pin drifted" without
@@ -154,7 +154,7 @@ variable "tool_cache_node_version" {
     Consuming repositories pin the same value in their workflows with a
     `runtime-pin` comment tying it to `services/*/Dockerfile`; this default
     tracks it. A pool whose repositories pin something else keeps today's
-    behaviour — a download, and a sweep line naming the version it wanted.
+    behaviour — a download, and a reset line naming the version it wanted.
   EOT
   # 24.21.0 because that is what the fleet's consumers pin today: six jobs in
   # one consumer's ci.yml carry `# runtime-pin: must match services/*/Dockerfile`.
@@ -566,7 +566,7 @@ build {
       "printf '%s  %s\n' \"$S\" \"$A\" >\"$D/SHA256SUMS\"",
       # tool, version, arch, archive — the four things a host needs to build the
       # `<cache>/node/<version>/x64` layout setup-node looks for, and the record
-      # the slot sweep compares a job's downloads against.
+      # the slot reset compares a job's downloads against.
       "printf 'node\t%s\tx64\t%s\n' \"$V\" \"$A\" >\"$D/MANIFEST\"",
       "chown -Rh root:root \"$D\"",
       # 0444 on the files and 0755 on the directory: every slot user reads all

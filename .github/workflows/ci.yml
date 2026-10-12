@@ -574,7 +574,7 @@ jobs:
       # that lives between three individually correct lines, which is what
       # condemned twelve of IntegrateIT's twenty-four slots on 2026-08-23 --
       # every structural assertion passed throughout the outage. This one
-      # extracts slot-reset.sh and slot-sweep.sh exactly as a host writes them
+      # extracts slot-reset.sh exactly as a host writes it
       # and drives boot/started/completed against a real slot tree.
       #
       # It needs root, which is why it lives in the ubuntu-latest job and not

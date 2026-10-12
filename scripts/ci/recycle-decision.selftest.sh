@@ -198,21 +198,21 @@ expect cordon:capacity-lost "and cordoned once its replacement has had its boot"
 expect retire:capacity-lost "the reason is reported, so the delete can be explained afterwards" \
   RUNNING current 0 partial 9999 600 0 1 0 3600
 
-# HYSTERESIS. ci-slot-sweep stops a dirty slot's agent, resets the workspace and
-# starts it again inside about ninety seconds — during which the host reads
+# HYSTERESIS. Every slot registers for ONE job and its slot loop resets it before
+# registering it again, inside about ninety seconds — during which the host reads
 # `partial` while doing exactly what it is built to do. A rule that acted on one
-# tick's read would delete hosts for sweeping.
-# THE WINDOW IS NOT reg_grace. ci-slot-sweep's unit carries TimeoutStartSec=900
-# on a 30-second timer — generous on purpose, so one wedged docker call cannot
-# stop every later sweep on the host. A slot that IS coming back can therefore be
+# tick's read would delete hosts for running jobs.
+# THE WINDOW IS NOT reg_grace. The loop bounds that reset at `timeout 900` and
+# retries a failed one after 30 seconds — generous on purpose, so one wedged
+# docker call is survived. A slot that IS coming back can therefore be
 # missing for ~930s, and the host reads `partial` throughout. A rule that fired
 # inside that window would race the host's own repair and win: the slot would
 # have returned, and instead the pool cordons the rest and deletes the host.
-expect skip:partial-grace "the default grace alone would race the host's own sweep" \
+expect skip:partial-grace "the default grace alone would race the host's own reset" \
   RUNNING current 0 partial 9999 600 0 1 0 700
-expect skip:partial-grace "the sweep's worst case is inside the window, not past it" \
+expect skip:partial-grace "the reset's worst case is inside the window, not past it" \
   RUNNING current 0 partial 9999 600 0 1 0 930
-expect retire "past the sweep's worst case, the slot is not coming back" \
+expect retire "past the reset's worst case, the slot is not coming back" \
   RUNNING current 0 partial 9999 600 0 1 0 961
 # ...and the floor is a floor, not a replacement: a pool that RAISED reg_grace
 # for slow-booting hosts gets its own longer window, not the constant.
@@ -221,7 +221,7 @@ expect skip:partial-grace "a longer register grace widens the window with it" \
 expect retire "and the longer window still ends" \
   RUNNING current 0 partial 9999 1800 0 1 0 1801
 
-expect skip:partial-grace "a slot mid-sweep is not capacity loss" \
+expect skip:partial-grace "a slot mid-reset is not capacity loss" \
   RUNNING current 0 partial 9999 600 0 1 0 90
 expect skip:partial-grace "one tick of partial is never enough" \
   RUNNING current 0 partial 9999 600 0 1 0 0
@@ -262,30 +262,29 @@ expect retire:stale-template "stale template outranks capacity-lost in the reaso
 
 # --- and the number is not a magic number --------------------------------------
 #
-# The 960s floor is DERIVED: ci-slot-sweep's TimeoutStartSec plus its timer
+# The 960s floor is DERIVED: the slot loop's reset timeout plus its retry
 # interval, both declared in host-startup.sh. Those two live in a different file
 # from the rule that depends on them, so nothing but this check stops somebody
-# raising the sweep's timeout to 1800 and, in the same release, teaching the
-# controller to delete every host whose sweep takes longer than sixteen minutes.
+# raising the reset's timeout to 1800 and, in the same release, teaching the
+# controller to delete every host whose reset takes longer than sixteen minutes.
 # Read out of the shipping text rather than restated, so the drift is the failure.
 HOST_STARTUP="$HERE/../../modules/ci-runner-host-pool/scripts/host-startup.sh"
-_sweep_timeout=$(sed -n '/ci-slot-sweep.service/,/^EOF$/p' "$HOST_STARTUP" |
-  sed -n 's/^TimeoutStartSec=\([0-9]*\).*/\1/p' | head -1)
-_sweep_interval=$(sed -n '/ci-slot-sweep.timer/,/^EOF$/p' "$HOST_STARTUP" |
-  sed -n 's/^OnUnitActiveSec=\([0-9]*\).*/\1/p' | head -1)
+_sweep_timeout=$(sed -n 's|^ *if ! timeout \([0-9]*\) /opt/ci/job-hooks/slot-reset.sh completed .*|\1|p' "$HOST_STARTUP" | head -1)
+_sweep_interval=$(awk '/if ! timeout [0-9]+ \/opt\/ci\/job-hooks\/slot-reset.sh completed/ { f = 1 }
+  f && /^ *sleep [0-9]+$/ { print $2; exit }' "$HOST_STARTUP")
 # shellcheck disable=SC2016  # the $window is the shipping source text being matched, not a variable to expand.
 _floor=$(sed -n 's/.*\$window" -lt \([0-9]*\).*/\1/p' \
   "$HERE/../../modules/ci-runner-host-pool/scripts/recycle-decision.sh" | head -1)
 
 if [ -z "$_sweep_timeout" ] || [ -z "$_sweep_interval" ] || [ -z "$_floor" ]; then
   FAIL=$((FAIL + 1))
-  printf 'FAIL: could not read the sweep bound or the rule floor — timeout=[%s] interval=[%s] floor=[%s]\n' \
+  printf 'FAIL: could not read the reset bound or the rule floor — timeout=[%s] interval=[%s] floor=[%s]\n' \
     "$_sweep_timeout" "$_sweep_interval" "$_floor"
 elif [ "$_floor" -ge $((_sweep_timeout + _sweep_interval)) ]; then
   PASS=$((PASS + 1))
 else
   FAIL=$((FAIL + 1))
-  printf 'FAIL: the hysteresis floor (%ss) no longer outlasts the slot sweep (%ss + %ss)\n' \
+  printf 'FAIL: the hysteresis floor (%ss) no longer outlasts the slot loop reset (%ss + %ss)\n' \
     "$_floor" "$_sweep_timeout" "$_sweep_interval"
 fi
 

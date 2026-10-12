@@ -466,7 +466,7 @@ check "and lets the default — base equal to the pool name — through" 1 \
   check "linux: the host's own name is the instance name" 1 \
     "$(grep -cF 'HOSTNAME_SHORT=$(md "instance/name")' "$HOST_SH")"
   check "linux: an agent is <instance>-s<N>" 1 \
-    "$(grep -cF 'local name="$HOSTNAME_SHORT-s$idx"' "$HOST_SH")"
+    "$(grep -cF 'name="$HOSTNAME_SHORT-s$idx-$(od -An -N4 -tx1 /dev/urandom' "$HOST_SH")"
   check "linux: the affinity label is host-<instance>" 1 \
     "$(grep -cF 'HOST_LABEL="host-$HOSTNAME_SHORT"' "$HOST_SH")"
   check "windows: the host's own name is the instance name" 1 \

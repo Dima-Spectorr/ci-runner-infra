@@ -3187,6 +3187,7 @@ index_host_boots() {
 #
 #   idle-        an idle streak the previous boot earned.
 #   partial-     likewise for the capacity-lost recycle.
+#   unreg-       likewise for rule 5's absence clock.
 #   beaconmiss-  consecutive beacon-less reads; the new boot has had none.
 #   beaconerr- / pinerr- / pinveto-   throttle state for events about the old boot.
 #
@@ -3219,7 +3220,7 @@ forget_restarted_hosts() {
     known=$(cat "$f" 2>/dev/null) || known=""
     [ "$known" = "$boot" ] && continue
     if [ -n "$known" ]; then
-      rm -f "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" \
+      rm -f "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" "$STATE_DIR/unreg-$name" \
         "$STATE_DIR/beaconmiss-$name" "$STATE_DIR/beaconerr-$name" \
         "$STATE_DIR/pinerr-$name" "$STATE_DIR/pinveto-$name"
       event INFO host-restarted "$name" "$name: cold-started since its clocks were stamped (was $known, now $boot) -- age, idle and beacon-miss clocks restart" was="$known" now="$boot"
@@ -3230,8 +3231,8 @@ forget_restarted_hosts() {
 }
 
 # adopt_flagged_cordons
-# A host whose `ci-cordon` metadata is already 1 IS cordoned: its own sweep is
-# stopping each slot as that slot goes idle, whatever this controller's disk
+# A host whose `ci-cordon` metadata is already 1 IS cordoned: its slot loop is
+# not re-registering any slot whose job has ended, whatever this controller's disk
 # says. The disk is what a controller restart loses — the VM is replaced on a
 # fleet apply, and with it every `cordon-` marker — so a restarted controller
 # met three half-drained hosts, found no marker, and RESERVED them from scratch:
@@ -3443,6 +3444,44 @@ partial_seconds() {
   # Same validation as idle_seconds(), and it matters more here: a marker read
   # as 0 would put this host's partial age at decades, clearing the hysteresis
   # window in one tick and retiring a host whose slot sweep was still running.
+  case "$since" in
+    "" | *[!0-9]*) echo "$now" >"$f"; echo 0; return 0 ;;
+  esac
+  local gap=$((now - since))
+  [ "$gap" -lt 0 ] && gap=0
+  echo "$gap"
+}
+
+# How long this host has read `absent` WITHOUT INTERRUPTION, for rule 5 of
+# drain_decision().
+#
+# A slot registers for ONE job and its loop re-registers it only after the
+# reset that follows, so a healthy host whose slots all finished in the same
+# minute -- or are all reserved by a live run's pin -- reads absent for about one
+# reset. Age alone cannot tell that from a host whose slots will never register
+# again; persistence can. Same shape as partial_seconds(), and any reading other
+# than `absent` clears the clock, `unknown` included: a blind tick is not
+# evidence the host is still empty.
+unreg_seconds() {
+  local host="$1" reg="$2"
+  local f="$STATE_DIR/unreg-$host"
+  local now
+  now=$(date +%s)
+
+  if [ "$reg" != "absent" ]; then
+    rm -f "$f"
+    echo 0
+    return 0
+  fi
+
+  if [ ! -f "$f" ]; then
+    echo "$now" >"$f"
+    echo 0
+    return 0
+  fi
+
+  local since
+  since=$(cat "$f" 2>/dev/null)
   case "$since" in
     "" | *[!0-9]*) echo "$now" >"$f"; echo 0; return 0 ;;
   esac
@@ -4359,8 +4398,50 @@ drain_fail() { # <host> <reason> <message>
   DRAIN_ABORTED=$((DRAIN_ABORTED + 1))
 }
 
+# drain_host <host>
+#
+# THE DRAIN FLAG GOES UP BEFORE THE ROSTER IS READ. A Linux slot registers for
+# ONE job at a time, under a name GitHub has never seen, so the agent ids read
+# below are not the host's for long: a slot that finishes its job between the
+# roster read and the delete registers a NEW runner, takes a job, and the host is
+# deleted under it -- the deregistration loop never knew that id existed. So
+# `ci-drain=1` is written first, and the host's slot loop reads it before every
+# registration and AGAIN after minting: a runner minted before the flag is
+# visible in the roster read that follows it, one minted after is withdrawn by
+# the host itself before it starts. Any abort takes the flag down again, so a
+# host the proof refused goes back to taking work. The one path that keeps it is
+# a delete that failed after every agent was deregistered: that host is going,
+# and re-registering it would only hand the retry a busy slot.
+#
+# The controller already holds instance-admin and actAs on this pool's host
+# account (ci-runner-identity), which is everything add-metadata needs.
 drain_host() {
-  local host="$1"
+  local host="$1" zone rc
+  zone=$(gcloud compute instances list --project="$PROJECT" \
+    --filter="name=$host" --format="value(zone)" 2>/dev/null | head -1)
+  DRAIN_KEEP_FLAG=0
+  if [ -n "$zone" ]; then
+    local drain_flag_err
+    if ! drain_flag_err=$(timeout 60 gcloud compute instances add-metadata "$host" \
+      --zone="$zone" --project="$PROJECT" --metadata=ci-drain=1 2>&1 >/dev/null); then
+      drain_fail "$host" drain-flag-refused "could not set ci-drain=1 (${drain_flag_err:0:200}) -- a slot could register past the roster read, every agent left registered"
+      return 1
+    fi
+  fi
+  drain_host_proven "$host" "$zone"
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$DRAIN_KEEP_FLAG" = 0 ] && [ -n "$zone" ]; then
+    timeout 60 gcloud compute instances remove-metadata "$host" \
+      --zone="$zone" --project="$PROJECT" --keys=ci-drain >>"$LOG" 2>&1 ||
+      log "drain $host: could not clear ci-drain after the abort -- its slots stay unregistered until the next drain attempt clears it or deletes the host"
+  fi
+  return "$rc"
+}
+
+# drain_host_proven <host> <zone> -- the idle proof, deregistration and delete,
+# run with the drain flag already up. See drain_host.
+drain_host_proven() {
+  local host="$1" zone="$2"
   local ids id tick_ids busy rc fresh tok code regs deregistered=0
 
   tok=$(gh_token) || {
@@ -4424,10 +4505,6 @@ drain_host() {
     '[.runners[]? | select(.name | startswith($h + "-s")) | select(.status == "offline")] | length' \
     <"$fresh" 2>/dev/null)
   case "${offline:-}" in '' | *[!0-9]*) offline=0 ;; esac
-
-  local zone
-  zone=$(gcloud compute instances list --project="$PROJECT" \
-    --filter="name=$host" --format="value(zone)" 2>/dev/null | head -1)
 
   # WHICH question to ask is a property of the HOST. See instance_host_os().
   local host_os="unknown"
@@ -4513,7 +4590,8 @@ drain_host() {
   gcloud compute instance-groups managed delete-instances "$MIG" \
     --region="$REGION" --project="$PROJECT" \
     --instances="$host" >>"$LOG" 2>&1 || {
-      drain_fail "$host" delete-failed "delete-instances failed after deregistering $deregistered agent(s) -- retried next tick"
+      DRAIN_KEEP_FLAG=1
+      drain_fail "$host" delete-failed "delete-instances failed after deregistering $deregistered agent(s) -- ci-drain stays up, retried next tick"
       return 1
     }
 
@@ -4522,7 +4600,7 @@ drain_host() {
   # -- so nothing is being forgotten, and a leftover file would be a veto with
   # no host to apply to.
   rm -f "$STATE_DIR/idle-$host" "$STATE_DIR/beaconmiss-$host" \
-    "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host" "$STATE_DIR/pinveto-$host" \
+    "$STATE_DIR/pinhold-$host" "$STATE_DIR/partial-$host" "$STATE_DIR/unreg-$host" "$STATE_DIR/pinveto-$host" \
     "$STATE_DIR/pinerr-$host" "$STATE_DIR/beaconerr-$host" "$STATE_DIR/boot-$host"
   event INFO drain-delete "$host" "drain $host: deregistered $deregistered agent(s) and deleted" deregistered="$deregistered"
   DRAINED=$((DRAINED + 1))
@@ -4567,17 +4645,17 @@ drain_host() {
 # org-only and these agents register at repository scope, and a deadline that
 # escalates to DELETE is answered 422 while one that escalates to a kill drops a
 # running job. So with `recycle_cordon_stops_agents` on, the cordon writes
-# `ci-cordon=1` to the instance and the HOST's own root slot sweep stops each
-# `ci-runner@N.service` as it goes idle. Units are Restart=no, a stopped agent
-# is not long-polling and therefore not a scheduling target, and it drops out of
-# the repository's runner list — so `busy` reaches 0 one JOB after the cordon
-# rather than one lucky sample later. Nothing running is interrupted either way.
+# `ci-cordon=1` to the instance and the HOST's own slot loop stops registering
+# each slot once its current job ends. A slot holds one single-use registration
+# at a time, so a slot that is not re-registered is not a scheduling target and
+# drops out of the repository's runner list — `busy` reaches 0 one JOB after the
+# cordon rather than one lucky sample later. Nothing running is interrupted.
 #
 # cordon_seconds() and the cordon-no-progress outcome (#951) stay, and they are
 # worth MORE now, not less: they were added to make a livelock visible while it
 # had no fix, and they are what will say whether the host-side half actually
 # landed on a given pool. A pool with the flag on that still reports
-# no-progress is a pool whose hosts predate the sweep that reads `ci-cordon`.
+# no-progress is a pool whose hosts predate the slot loop that reads `ci-cordon`.
 
 # How long this host has been cordoned, from the cordon marker's mtime-free
 # contents. Same write-once/validate/clear-on-state-change shape as
@@ -4679,7 +4757,7 @@ cordon_host() {
     elif flag_err=$(timeout 60 gcloud compute instances add-metadata "$host" \
       --project="$PROJECT" --zone="$zone" \
       --metadata=ci-cordon=1 2>&1 >/dev/null); then
-      event INFO cordon-flag "$host" "cordon $host: ci-cordon=1 set — its own sweep now stops each slot as that slot goes idle" zone="$zone"
+      event INFO cordon-flag "$host" "cordon $host: ci-cordon=1 set — its slot loop now stops re-registering each slot as that slot finishes its job" zone="$zone"
     else
       flag_reason=$(printf '%s\n' "$flag_err" | grep -m1 -E 'ERROR|denied|DENIED|not found' || printf '%s\n' "$flag_err" | head -n1)
       # An EVENT, not a log line: a refused write here was a log line, and every
@@ -4924,7 +5002,7 @@ tick_pool() {
   # about. slots_known is the denominator that goes with it: without it a blind
   # tick and a fleet-wide outage produce the same pair of numbers.
   local slots_registered=0 slots_known=0
-  local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for reserved_for
+  local host status host_tpl host_uri host_action busy idle age verdict hold tpl cordoned recycling partial_for absent_for reserved_for
   local skip_reason walked=0
   local -A skip_tally=()
 
@@ -4966,7 +5044,7 @@ tick_pool() {
   # and if the MIG's base name could not be read, nothing is swept at all.
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/reserve-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
     "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-* \
-    "$STATE_DIR"/pinveto-* "$STATE_DIR"/pinerr-* "$STATE_DIR"/beaconerr-*; do
+    "$STATE_DIR"/pinveto-* "$STATE_DIR"/pinerr-* "$STATE_DIR"/beaconerr-* "$STATE_DIR"/unreg-*; do
     [ -n "$live_hosts" ] || break
     [ -n "$MIG_BASE" ] || break
     [ -e "$f" ] || continue
@@ -4981,6 +5059,7 @@ tick_pool() {
     mname=${mname#pinveto-}
     mname=${mname#pinerr-}
     mname=${mname#beaconerr-}
+    mname=${mname#unreg-}
     case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
@@ -5121,6 +5200,7 @@ tick_pool() {
     # `cordoned` is read further up, with the slot accounting that also needs it.
 
     partial_for=$(partial_seconds "$host" "$HOST_REG")
+    absent_for=$(unreg_seconds "$host" "$HOST_REG")
     reserved_for=$(reserve_seconds "$host")
     # Whether the pre-walk already counted this host into the recycle set, so
     # the arms below add a host entering it exactly once and take out exactly
@@ -5293,7 +5373,7 @@ tick_pool() {
     esac
 
     verdict=$(drain_decision "$status" "$busy" "$idle" "$GRACE" "$pool_size" "$surge_floor" "$HOST_REG" \
-      "$age" "$REGISTER_GRACE" "$RUNNER_ROSTER")
+      "$age" "$REGISTER_GRACE" "$RUNNER_ROSTER" "$absent_for")
 
     # THE PIN HOLD VETO, second half. Same gate, same cache, the other path.
     case "$verdict" in

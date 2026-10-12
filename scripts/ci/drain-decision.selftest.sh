@@ -105,6 +105,22 @@ expect keep "a 44s-old host is never drainable as never-registered" \
 expect drain "no age/grace supplied falls back to the pre-grace rule" \
   RUNNING 0 5 900 3 0 absent
 
+# --- between jobs (#1481) -------------------------------------------------------
+# Every slot registers for ONE job and its loop re-registers it only after the
+# reset that follows, so an old, healthy host whose slots all finished in the
+# same minute reads absent for one reset. Argument 11 is how long the absence
+# has LASTED; only an absence that outlasts the register grace is death.
+expect keep "an old host absent for one reset is between jobs, not dead" \
+  RUNNING 0 5 900 3 0 absent 86400 600 complete 45
+expect keep "…one second short of the grace is still between jobs" \
+  RUNNING 0 5 900 3 0 absent 86400 600 complete 599
+expect drain "…and an absence that outlasts the grace is a host that will not come back" \
+  RUNNING 0 5 900 3 0 absent 86400 600 complete 600
+expect keep "…a young host is still booting whatever the absence clock says" \
+  RUNNING 0 5 900 3 0 absent 120 600 complete 120
+expect keep "…and a long absence on a truncated roster is still unproven" \
+  RUNNING 0 5 900 3 0 absent 86400 600 partial 86400
+
 # --- partial registration ------------------------------------------------------
 expect keep "partial registration with work in flight is left alone" \
   RUNNING 2 0 900 3 0 partial
