@@ -94,11 +94,11 @@ on:
         type: string
       implementation-ref:
         description: >-
-          The ref of that repository to check out. Defaults to
-          `github.job_workflow_sha`, the commit of this very workflow file,
-          which makes driver and workflow the same release by construction and
-          removes the second unchecked pin that a caller would otherwise repeat
-          below its own `uses:` line.
+          The ref of that repository to check out. LEAVE IT UNSET: empty means
+          the commit the caller's own `uses:` line pinned, which makes driver
+          and workflow the same release by construction. When that commit
+          cannot be determined the run FAILS — it never falls back to the
+          default branch (#1556).
         required: false
         default: ''
         type: string
@@ -180,6 +180,62 @@ jobs:
       pull-requests: write
 
     steps:
+      - name: Resolve the callee's own commit
+        id: callee
+        env:
+          READ_TOKEN: ${{ github.token }} # read-only: the caller file and a tag; never the gh CLI, which acts as the App
+          IMPLEMENTATION_REPOSITORY: ${{ inputs.implementation-repository }}
+          IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
+          CALLEE_PATH: .github/workflows/codex-review.yml
+        run: |
+          set -euo pipefail
+          die() {
+            echo "::error title=reusable workflow::cannot pin this workflow to its own commit: $*. Refusing to fall back to the default branch (#1555)."
+            exit 1
+          }
+          api=${GITHUB_API_URL:-https://api.github.com}
+          fetch() { # <accept> <url>
+            curl -sSfL --retry 3 --retry-delay 2 -H "Authorization: Bearer $READ_TOKEN" -H "Accept: $1" "$2"
+          }
+          ref=$IMPLEMENTATION_REF
+          from="input implementation-ref"
+          if [ -z "$ref" ]; then
+            caller=${GITHUB_WORKFLOW_REF:-}
+            if [ -z "$caller" ] || [ -z "${GITHUB_WORKFLOW_SHA:-}" ]; then die "GITHUB_WORKFLOW_REF or GITHUB_WORKFLOW_SHA is unset"; fi
+            path=${caller#"$GITHUB_REPOSITORY"/}
+            path=${path%%@*}
+            [ "$path" != "${caller%%@*}" ] || die "GITHUB_WORKFLOW_REF '$caller' names no file in $GITHUB_REPOSITORY"
+            body=$(fetch application/vnd.github.raw "$api/repos/$GITHUB_REPOSITORY/contents/$path?ref=$GITHUB_WORKFLOW_SHA") ||
+              die "cannot read the calling workflow $path at $GITHUB_WORKFLOW_SHA"
+            refs=$(printf '%s\n' "$body" | awk -v want="$IMPLEMENTATION_REPOSITORY/$CALLEE_PATH" \
+              -v self="$GITHUB_REPOSITORY" -v repo="$IMPLEMENTATION_REPOSITORY" \
+              -v here="$GITHUB_WORKFLOW_SHA" -v local_path="./$CALLEE_PATH" '
+              {
+                line = $0
+                sub(/^[ \t]*(-[ \t]+)?/, "", line)
+                if (line !~ /^uses:[ \t]/) next
+                sub(/^uses:[ \t]+/, "", line)
+                gsub(/["\047]/, "", line)
+                sub(/[ \t].*$/, "", line)
+                if (line == local_path && tolower(repo) == tolower(self)) { print here; next }
+                at = index(line, "@")
+                if (at && tolower(substr(line, 1, at - 1)) == tolower(want)) print substr(line, at + 1)
+              }' | sort -u)
+            n=$(printf '%s' "$refs" | grep -c . || true)
+            [ "$n" = 1 ] || die "$path at $GITHUB_WORKFLOW_SHA has $n distinct uses: refs for $IMPLEMENTATION_REPOSITORY/$CALLEE_PATH (need exactly 1): $(printf '%s' "$refs" | tr '\n' ' ')"
+            ref=$refs
+            from="$path"
+          fi
+          if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
+            sha=$ref
+          else
+            sha=$(fetch application/vnd.github.sha "$api/repos/$IMPLEMENTATION_REPOSITORY/commits/$ref") ||
+              die "cannot resolve ref '$ref' in $IMPLEMENTATION_REPOSITORY"
+          fi
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "ref '$ref' resolved to '$sha', not a commit sha"
+          echo "callee: implementation $IMPLEMENTATION_REPOSITORY@$sha, pinned by $from (ref $ref)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       # The IMPLEMENTATION repository, not the caller's. In a `workflow_call`
       # the `github` context belongs to the caller, so a bare checkout here
       # would clone a tree that does not contain the driver and the run would
@@ -188,7 +244,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.implementation-repository }}
-          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          ref: ${{ steps.callee.outputs.sha }}
           persist-credentials: false
 
       # The fleet's own images do not ship `gh`, and the driver is all `gh api`.

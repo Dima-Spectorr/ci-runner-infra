@@ -240,7 +240,9 @@ checks_out_its_own_implementation() {
   local code
   code=$(code_of "$1")
   matches "$code" '^          repository: \$\{\{ inputs\.implementation-repository \}\}$' || return 1
-  matches "$code" '^          ref: \$\{\{ inputs\.implementation-ref \|\| github\.job_workflow_sha \}\}$'
+  # Never the default branch (#1556): the resolver step names the commit.
+  ! matches "$code" 'job_workflow_sha' || return 1
+  matches "$code" '^          ref: \$\{\{ steps\.callee\.outputs\.sha \}\}$'
 }
 
 # Every declared knob has to actually reach the script. An input that is
@@ -455,7 +457,7 @@ ci_runs_both_self_tests() {
 # cannot see an input value, so an automatic update moves the workflow and
 # leaves the driver on the previous release.
 #
-# The workflow now defaults the ref to `github.job_workflow_sha`, the commit it
+# The workflow now resolves the ref from the caller's `uses:` line (#1556), the commit it
 # was itself called at, so a second sha in the example is not merely redundant:
 # a consumer who copies it reintroduces the skew by hand.
 documented_example_carries_one_pin() {
