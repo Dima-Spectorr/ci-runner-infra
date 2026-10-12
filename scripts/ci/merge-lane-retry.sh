@@ -117,10 +117,10 @@ quota_holds() {
 
 # One query, one repository: the default branch (read, never assumed — three
 # repositories in this fleet are not on `main`) and every open pull request's
-# draft flag, base and merge state. The first hundred, most recently updated
-# first; a repository with more open than that is judged on those.
+# draft flag, base and merge state. Paginated (`--paginate`, a hundred a page),
+# so a repository with more open than that is judged on all of them (#1475).
 # shellcheck disable=SC2016  # GraphQL variables, not shell ones
-PR_QUERY='query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(states:OPEN,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{number isDraft baseRefName mergeStateStatus}}}}'
+PR_QUERY='query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(states:OPEN,first:100,after:$endCursor,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number isDraft baseRefName mergeStateStatus}}}}'
 
 mode="DRY RUN"
 [ "$ARMED" = true ] && mode="ARMED"
@@ -142,7 +142,7 @@ while IFS=$'\t' read -r repo tier _; do
   case "$(lane_retry_verdict "tier=$tier")" in skip:tier-*) continue ;; esac
 
   facts="tier=$tier;retry_after=$RETRY_AFTER;max_retries=$MAX_RETRIES"
-  prf=$(gh api graphql -f query="$PR_QUERY" -f owner="$OWNER" -f name="$repo" </dev/null 2>/dev/null | lane_retry_pr_facts)
+  prf=$(gh api graphql --paginate -f query="$PR_QUERY" -f owner="$OWNER" -f name="$repo" </dev/null 2>/dev/null | lane_retry_pr_facts)
   facts="$facts;$prf"
   ready=$(_retry_fact "$prf" ready)
   default=$(_retry_fact "$prf" default)
