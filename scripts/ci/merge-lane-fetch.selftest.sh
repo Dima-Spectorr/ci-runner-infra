@@ -786,6 +786,10 @@ cases_retry() { # <fetch-file>
     d="$(mktemp -d "$WORK/retry.XXXXXX")"
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY=''
     unset LANE_STARTED PASS_BUDGET GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
+    # Git for Windows' gawk drops a trailing CR that Linux gawk keeps, so the
+    # CRLF case would pass here even with the CR left in. BINMODE=3 makes a
+    # local run read the bytes CI reads; on Linux gawk ignores it.
+    awk() { command awk -v BINMODE=3 "$@"; }
     # Every mutant runs this group again: each URL must be refused afresh.
     rm -f "$GH_STUB_STATE"/retry_*
     # Not `$d`: the retry has a local `d` of its own, and bash scoping is dynamic.
