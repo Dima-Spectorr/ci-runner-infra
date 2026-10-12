@@ -308,6 +308,7 @@ run_suite() {
     printf '{"__CURSOR":"%s","__REALTIME_TIMESTAMP":"1790000000123456","__MONOTONIC_TIMESTAMP":"%s","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"1","_SYSTEMD_UNIT":"init.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"%s","MESSAGE":"%s"%s}\n' \
       "$1" "${1#c}000" "$2" "$3" "${4:-}"
   }
+  # shellcheck disable=SC2129
   sysd c20 ci-runner@3.service 'Stopping ci-runner@3.service - Runner slot 3...' ',"JOB_TYPE":"stop"' >"$SD/journal.jsonl"
   sysd c21 user@1001.service 'user@1001.service: Deactivated successfully.' >>"$SD/journal.jsonl"
   sysd c22 google-guest-agent.service 'Stopped google-guest-agent.service - Google Compute Engine Guest Agent.' ',"JOB_TYPE":"stop","JOB_RESULT":"done"' >>"$SD/journal.jsonl"
@@ -318,15 +319,11 @@ run_suite() {
   sysd c26 apt-daily.service 'Starting apt-daily.service - Daily apt download activities...' >>"$SD/journal.jsonl"
   sysd c27 session-5.scope 'Started session-5.scope - Session 5 of User ci.' >>"$SD/journal.jsonl"
   # logind and dbus speak for themselves.
-  printf '{"__CURSOR":"c28","__MONOTONIC_TIMESTAMP":"28000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"640","_SYSTEMD_UNIT":"systemd-logind.service","SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 5."}
-' >>"$SD/journal.jsonl"
-  printf '{"__CURSOR":"c29","__MONOTONIC_TIMESTAMP":"29000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"102","_PID":"610","_SYSTEMD_UNIT":"dbus.service","SYSLOG_IDENTIFIER":"dbus-daemon","MESSAGE":"[system] Successfully activated service org.freedesktop.systemd1"}
-' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c28","__MONOTONIC_TIMESTAMP":"28000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"640","_SYSTEMD_UNIT":"systemd-logind.service","SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 5."}\n' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c29","__MONOTONIC_TIMESTAMP":"29000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"102","_PID":"610","_SYSTEMD_UNIT":"dbus.service","SYSLOG_IDENTIFIER":"dbus-daemon","MESSAGE":"[system] Successfully activated service org.freedesktop.systemd1"}\n' >>"$SD/journal.jsonl"
   # A unit's own output is job output; a non-PID-1 line cannot pass as systemd.
-  printf '{"__CURSOR":"c30","__MONOTONIC_TIMESTAMP":"30000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4000","_SYSTEMD_UNIT":"ci-runner@3.service","SYSLOG_IDENTIFIER":"Runner.Worker","MESSAGE":"echo SECRET-JOB-OUTPUT"}
-' >>"$SD/journal.jsonl"
-  printf '{"__CURSOR":"c31","__MONOTONIC_TIMESTAMP":"31000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4001","_SYSTEMD_UNIT":"session-9.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"ci-runner@3.service","MESSAGE":"Stopping ci-runner@3.service forged"}
-' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c30","__MONOTONIC_TIMESTAMP":"30000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4000","_SYSTEMD_UNIT":"ci-runner@3.service","SYSLOG_IDENTIFIER":"Runner.Worker","MESSAGE":"echo SECRET-JOB-OUTPUT"}\n' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c31","__MONOTONIC_TIMESTAMP":"31000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4001","_SYSTEMD_UNIT":"session-9.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"ci-runner@3.service","MESSAGE":"Stopping ci-runner@3.service forged"}\n' >>"$SD/journal.jsonl"
   last=$(posts)
   ship
   [ "$(posts)" -eq $((last + 1)) ] || fail "a batch with host-unit lines did not make one write"
@@ -337,7 +334,7 @@ run_suite() {
     fail "host-unit lines are not in their own log"
   [ "$(jq -c '.entries[0].jsonPayload | {UNIT, JOB_TYPE, source}' "$p")" = '{"UNIT":"ci-runner@3.service","JOB_TYPE":"stop","source":"systemd"}' ] ||
     fail "the unit and job fields of a PID-1 line did not ship: $(jq -c '.entries[0].jsonPayload' "$p")"
-  [ "$(jq -r '.entries[2].jsonPayload.JOB_RESULT' "$p")" = done ] || fail "JOB_RESULT did not ship"
+  [ "$(jq -r '.entries[2].jsonPayload.JOB_RESULT' "$p")" = "done" ] || fail "JOB_RESULT did not ship"
   ! grep -q SECRET-JOB-OUTPUT "$p" || fail "a unit's own output reached the log"
   ! grep -q forged "$p" || fail "a line that is not from PID 1 passed as systemd's"
   [ "$(cursor)" = c31 ] || fail "the cursor did not move past the filtered lines (got '$(cursor)')"
