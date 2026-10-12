@@ -2261,7 +2261,7 @@ mutate "the marker alone proves idle"       's@! pgrep -u "@pgrep -u "@'        
 
 # #278. Each of these is a way the count stops meaning "in a row, right now",
 # which is the only shape the take-out-of-service rule can read.
-mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns"$@    :@'                                             has_slot_condemn
+mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns" "\\\$SLOT_STATE/\\\$idx/unclean-after-job"$@    :@'                                           has_slot_condemn
 mutate "a burned job is not counted"        's@^  burn_add$@  :@'                                                             has_slot_condemn
 mutate "a failed reset is not counted"      's@^    burn_add$@    :@'                                                         has_slot_condemn
 mutate "the count is slot-writable"         's@burns="\\\$SLOT_STATE/\\\$idx/burns"@burns="\$home/burns"@'                    has_slot_condemn
