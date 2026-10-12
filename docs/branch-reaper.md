@@ -225,8 +225,8 @@ jobs:
         release/*
       # There is deliberately no `implementation-ref` here. The reaper's own
       # `actions/checkout` clones YOUR repository, so it must be told where its
-      # driver lives — but the ref defaults to `github.job_workflow_sha`, the
-      # commit the `uses:` line above resolved to. Repeating the sha is a second
+      # driver lives — but the ref is read from the `uses:` line above, the
+      # commit it pinned (the run fails if it cannot). Repeating the sha is a second
       # pin Dependabot cannot keep in step with the first.
       dry-run: ${{ vars.BRANCH_REAPER_ARMED != 'true' }}
     secrets:

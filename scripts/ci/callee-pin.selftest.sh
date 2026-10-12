@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-# merge-lane-callee.selftest.sh — the lane runs the release its caller pinned
+# callee-pin.selftest.sh — a reusable workflow runs the release its caller pinned
 #
-# WHY (#1555)
+# WHY (#1555, #1556)
 #   A consumer pins `merge-lane.yml@<sha>`, and that pinned only the workflow
 #   FILE. The scripts it runs were checked out at
 #   `inputs.implementation-ref || github.job_workflow_sha`, the second was empty
@@ -16,6 +16,12 @@
 #   This test extracts that exact block from the workflow and runs it against a
 #   stub `curl`, so what is tested is what ships.
 #
+#   #1556 found the same hole in pr-guard, branch-reaper, codex-review and
+#   support-windows. This test therefore covers EVERY reusable workflow in
+#   .github/workflows/ that checks out a repository other than the caller's:
+#   it is discovered, not listed, so a new one cannot reintroduce a default-branch
+#   checkout of itself without failing here (see `discover` at the bottom).
+#
 #   The property that matters most is the negative one: every way of NOT
 #   knowing the commit exits non-zero and writes no `sha=` output — because an
 #   empty output is precisely the empty ref that clones main.
@@ -23,16 +29,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CALLEE="$ROOT/.github/workflows/merge-lane.yml"
-STEP="Resolve the lane's own commit"
-
-PASS=0
-FAIL=0
-ok() { PASS=$((PASS + 1)); }
-bad() {
-  FAIL=$((FAIL + 1))
-  printf 'FAIL: %s\n' "$1"
-}
+STEP="Resolve the callee's own commit"
 
 # The `run: |` block of the named step, de-indented — the shell the runner gets.
 extract_block() { # <workflow> <step name>
@@ -47,6 +44,78 @@ extract_block() { # <workflow> <step name>
       if (RLENGTH < indent) exit
       print substr($0, indent + 1)
     }' "$1"
+}
+
+# Discovery mode (no argument): find every reusable workflow, hold each to the
+# structural rules, and run this script once per workflow that checks out
+# another repository.
+if [ $# -eq 0 ]; then
+  self="${BASH_SOURCE[0]}"
+  failed=0
+  checked=0
+  ref_sum=""
+  for f in "$ROOT"/.github/workflows/*.yml; do
+    grep -qE '^[[:space:]]*workflow_call:' "$f" || continue
+    name=$(basename "$f")
+    # A step is whatever starts at `      - ` up to the next; comments dropped.
+    verdict=$(awk '
+      function flush() {
+        if (step ~ /uses: actions\/checkout/ && step ~ /repository:/) {
+          checkouts++
+          if (step !~ /(steps\.callee\.outputs\.sha|needs\.[a-z-]+\.outputs\.callee-sha) \}\}/) bad = bad " checkout-of-another-repo-without-resolved-ref"
+        }
+        if (step ~ /- name: Resolve the callee.s own commit/) resolver = 1
+        step = ""
+      }
+      /^[ \t]*#/ { next }
+      /job_workflow_sha/ { bad = bad " job_workflow_sha" }
+      /^      - / { if (step != "") flush(); step = $0 "\n"; next }
+      step != "" { step = step $0 "\n" }
+      END { if (step != "") flush(); printf "%d %d%s\n", checkouts + 0, resolver + 0, bad }' "$f")
+    # shellcheck disable=SC2086
+    set -- $verdict
+    n=$1
+    has=$2
+    shift 2
+    if [ -n "$*" ]; then
+      printf 'FAIL: %s:%s — a reusable workflow that checks out a repository must pin it to the commit its caller named, never the default branch (#1556)\n' "$name" " $*"
+      failed=1
+    elif [ "$n" -gt 0 ] && [ "$has" -ne 1 ]; then
+      printf 'FAIL: %s checks out another repository but has no "%s" step (#1556)\n' "$name" "$STEP"
+      failed=1
+    elif [ "$n" -gt 0 ]; then
+      checked=$((checked + 1))
+      bash "$self" "$name" || failed=1
+    fi
+    if grep -q -- "- name: $STEP" "$f"; then
+      # The resolver is inlined (it runs before any checkout, so it cannot be a
+      # script): one rule, copied. The copies must be the SAME text.
+      sum=$(extract_block "$f" "$STEP" | cksum)
+      [ -n "$ref_sum" ] || ref_sum=$sum
+      [ "$sum" = "$ref_sum" ] || {
+        echo "FAIL: $name: its resolver block differs from the others (#1556)"
+        failed=1
+      }
+    fi
+  done
+  if [ "$checked" -lt 5 ]; then
+    echo "FAIL: discovered only $checked pinned reusable workflows, expected at least 5 — discovery is broken, so every check above is vacuous"
+    failed=1
+  fi
+  [ "$failed" -eq 0 ] && echo "callee-pin: $checked reusable workflows pinned"
+  exit "$failed"
+fi
+
+WFNAME="$1"
+CALLEE="$ROOT/.github/workflows/$WFNAME"
+CALLEE_PATH=".github/workflows/$WFNAME"
+
+PASS=0
+FAIL=0
+ok() { PASS=$((PASS + 1)); }
+bad() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: %s\n' "$1"
 }
 
 WORK=$(mktemp -d)
@@ -93,7 +162,7 @@ run_case() {
     export PATH="$WORK/bin:$PATH" CASE READ_TOKEN=t GITHUB_API_URL=https://api.example
     export GITHUB_REPOSITORY="$repo" GITHUB_WORKFLOW_REF="$wf_ref" GITHUB_WORKFLOW_SHA="$HERE"
     export GITHUB_OUTPUT="$CASE/out" IMPLEMENTATION_REPOSITORY=Example-Org/ci-runner-infra
-    export IMPLEMENTATION_REF="$impl_ref" CALLEE_PATH=.github/workflows/merge-lane.yml
+    export IMPLEMENTATION_REF="$impl_ref" CALLEE_PATH="$CALLEE_PATH"
     bash "$BLOCK"
   ) >"$CASE/log" 2>&1
   echo $? >"$CASE/rc"
@@ -120,40 +189,40 @@ expect_refusal() { # <case name>
 }
 
 CONSUMER=Example-Org/Consumer
-WF="$CONSUMER/.github/workflows/merge-lane.yml@refs/heads/main"
+WF="$CONSUMER/.github/workflows/$WFNAME@refs/heads/main"
 
 # 1. The common case: a sha pin, exactly as consumers write it.
 new_case sha-pin
 cat >"$CASE/caller.yml" <<EOF
 jobs:
   lane:
-    # uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B  (an old note)
-    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A # v5.124.0
+    # uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_B  (an old note)
+    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_A # v5.124.0
 EOF
 run_case "" "$CONSUMER" "" "$WF"
 expect_sha "a sha pin runs that sha (a commented-out uses: line is not a pin)" "$PIN_A"
-if grep -q "/repos/$CONSUMER/contents/.github/workflows/merge-lane.yml?ref=$HERE" "$CASE/urls"; then ok; else
+if grep -q "/repos/$CONSUMER/contents/.github/workflows/$WFNAME?ref=$HERE" "$CASE/urls"; then ok; else
   bad "the caller's workflow must be read at GITHUB_WORKFLOW_SHA, the commit that ran — asked for: $(tr '\n' ' ' <"$CASE/urls")"
 fi
 
 # 2. A tag pin resolves through the API to its commit.
 new_case tag-pin
-printf '%s\n' "  - uses: 'example-org/ci-runner-infra/.github/workflows/merge-lane.yml@v5.124.0'" >"$CASE/caller.yml"
+printf '%s\n' "  - uses: 'example-org/ci-runner-infra/.github/workflows/$WFNAME@v5.124.0'" >"$CASE/caller.yml"
 printf 'v5.124.0 %s\n' "$PIN_A" >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_sha "a quoted tag pin, owner in another case, resolves to its commit" "$PIN_A"
 
 # 3. This repository calls itself with a local path: the commit that ran.
 new_case local-path
-printf '%s\n' "    uses: ./.github/workflows/merge-lane.yml" >"$CASE/caller.yml"
+printf '%s\n' "    uses: ./.github/workflows/$WFNAME" >"$CASE/caller.yml"
 run_case "" Example-Org/ci-runner-infra "" "Example-Org/ci-runner-infra/.github/workflows/merge-lane-self.yml@refs/heads/main"
 expect_sha "a local uses: in this repository runs GITHUB_WORKFLOW_SHA" "$HERE"
 
 # 4. A local path in ANOTHER repository is that repository's file, not ours.
 new_case local-elsewhere
-printf '%s\n' "    uses: ./.github/workflows/merge-lane.yml" >"$CASE/caller.yml"
+printf '%s\n' "    uses: ./.github/workflows/$WFNAME" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" "$WF"
-expect_refusal "a consumer's local merge-lane.yml is not this callee"
+expect_refusal "a consumer's local $WFNAME is not this callee"
 
 # 5. The explicit input wins and the caller is not read.
 new_case input-ref
@@ -169,8 +238,8 @@ run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a caller file with no uses: line for this workflow (an intermediate reusable workflow)"
 
 new_case two-pins
-printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" \
-  "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_B" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_A" \
+  "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_B" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "two disagreeing pins in the caller"
 
@@ -179,29 +248,29 @@ run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "the caller's workflow file cannot be read"
 
 new_case no-workflow-ref
-printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_A" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" ""
 expect_refusal "GITHUB_WORKFLOW_REF unset"
 
 new_case foreign-workflow-ref
-printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@$PIN_A" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@$PIN_A" >"$CASE/caller.yml"
 run_case "" "$CONSUMER" "" "Someone/Else/.github/workflows/x.yml@refs/heads/main"
 expect_refusal "GITHUB_WORKFLOW_REF naming another repository"
 
 new_case unknown-tag
-printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@v0.0.0" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@v0.0.0" >"$CASE/caller.yml"
 : >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a tag that does not resolve"
 
 new_case not-a-sha
-printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/merge-lane.yml@v9" >"$CASE/caller.yml"
+printf '%s\n' "    uses: Example-Org/ci-runner-infra/.github/workflows/$WFNAME@v9" >"$CASE/caller.yml"
 printf 'v9 %s\n' "<html>not a sha</html>" >"$CASE/tags"
 run_case "" "$CONSUMER" "" "$WF"
 expect_refusal "a ref whose resolution is not a 40-hex sha"
 
 if [ "$FAIL" -gt 0 ]; then
-  echo "merge-lane-callee: $FAIL failed, $PASS passed"
+  echo "callee-pin ($WFNAME): $FAIL failed, $PASS passed"
   exit 1
 fi
-echo "merge-lane-callee: $PASS checks pass"
+echo "callee-pin ($WFNAME): $PASS checks pass"

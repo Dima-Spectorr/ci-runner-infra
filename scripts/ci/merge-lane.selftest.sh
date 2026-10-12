@@ -544,7 +544,7 @@ checks_out_its_own_implementation() {
 # `github.job_workflow_sha` was empty in every run measured — so every consumer
 # pin pinned the workflow file and none of the scripts. Both checkouts take the
 # commit the resolver step names, and nothing else; the resolver's own
-# behaviour is `merge-lane-callee.selftest.sh`.
+# behaviour is `callee-pin.selftest.sh`.
 pins_its_checkout_to_the_resolved_commit() {
   local code
   code=$(code_of "$1")

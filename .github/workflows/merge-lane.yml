@@ -612,18 +612,18 @@ jobs:
       # so a script would have to come from somewhere — and anywhere but the
       # pinned commit is the bug. curl, not gh: a pool image ships no gh until
       # `ensure-gh.sh`, which is itself in the checkout.
-      # `scripts/ci/merge-lane-callee.selftest.sh` runs this block.
-      - name: Resolve the lane's own commit
+      # `scripts/ci/callee-pin.selftest.sh` runs this block.
+      - name: Resolve the callee's own commit
         id: callee
         env:
           READ_TOKEN: ${{ github.token }} # read-only: the caller file and a tag; never the gh CLI, which acts as the App
           IMPLEMENTATION_REPOSITORY: ${{ inputs.implementation-repository }}
           IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
-          CALLEE_PATH: .github/workflows/merge-lane.yml
+          CALLEE_PATH: __PATH__
         run: |
           set -euo pipefail
           die() {
-            echo "::error title=merge lane::cannot pin the lane to its own commit: $*. Refusing to fall back to the default branch (#1555)."
+            echo "::error title=reusable workflow::cannot pin this workflow to its own commit: $*. Refusing to fall back to the default branch (#1555)."
             exit 1
           }
           api=${GITHUB_API_URL:-https://api.github.com}
@@ -666,7 +666,7 @@ jobs:
               die "cannot resolve ref '$ref' in $IMPLEMENTATION_REPOSITORY"
           fi
           [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "ref '$ref' resolved to '$sha', not a commit sha"
-          echo "lane: implementation $IMPLEMENTATION_REPOSITORY@$sha, pinned by $from (ref $ref)"
+          echo "callee: implementation $IMPLEMENTATION_REPOSITORY@$sha, pinned by $from (ref $ref)"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Check out the lane's implementation
