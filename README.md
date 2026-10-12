@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.137.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.139.0"
   # ...
 }
 ```
@@ -194,12 +194,11 @@ So a host whose registration reads `partial` and stays that way is recycled for
 the same `recycle_max_unavailable` budget and the same fail-safes — `unknown` is
 still not a reason to delete anything.
 
-**With hysteresis**, because `partial` is also a normal transient: every slot is
-run-once (#1481), so between two jobs its loop (`ci-slot-loop@N`) deletes the
-spent runner, resets the workspace and mints a fresh one, ordinarily inside
-about ninety seconds. Ordinarily is not the bound — the reset runs under
-`timeout 900` with a 30-second retry, deliberately generous so one wedged
-`docker` call cannot hold the slot out for ever. A slot that *is*
+**With hysteresis**, because `partial` is also a normal transient: `ci-slot-sweep`
+stops a dirty slot's agent while it resets the workspace and starts it again,
+ordinarily inside about ninety seconds. Ordinarily is not the bound — its unit
+carries `TimeoutStartSec=900` on a 30-second timer, deliberately generous so one
+wedged `docker` call cannot stop every later sweep on the host. A slot that *is*
 coming back can therefore be missing for roughly 930 seconds. A recycle firing
 inside that window would race the host's own repair and win, so the window is
 `max(register_grace, 960s)`: the grace, because it is the same question `absent`
@@ -1087,7 +1086,7 @@ One more watches the slots themselves rather than the pool:
   and the pin tools write through `logger`, and until #1403 nothing shipped a
   host's journal to Cloud Logging. Each Linux host now runs
   `ci-log-shipper.timer`: every 30 s it reads the journal from a saved cursor,
-  matching only the tags `ci-slot-reset`, `ci-slot-loop`, `ci-pin-hold` and
+  matching only the tags `ci-slot-reset`, `ci-slot-sweep`, `ci-pin-hold` and
   `ci-pin-sweep` AND `_UID=0`, so a job cannot write a line of its own (it can
   still get text quoted inside a root line — see the metric below). It sends up to 200
   entries in one `entries:write` to the log `ci-slot-lifecycle` (labels `pool`,
@@ -1104,6 +1103,19 @@ One more watches the slots themselves rather than the pool:
   one in 10 minutes. It keys on the host's `gce_instance`, so `--muted-pool` cannot
   reach it. `ci_slots_missing` still catches a condemned slot as lost
   capacity, 30 minutes later and without the reason.
+
+  The same shipper also sends a second, small class to the log `ci-host-units`
+  (#1480: google-guest-agent, `user@*`, `ci-dockerd@*` and `ci-runner@*` restart
+  together ~5 minutes after boot, and the cause was only in the host's journal).
+  It is exactly: PID 1's lines (`_PID=1`, which a job cannot forge) whose `UNIT` or
+  message names google-guest-agent, `user@N`, `user-runtime-dir@N`, `ci-dockerd@`,
+  `ci-runner@`, systemd-logind or dbus, or that are manager-level (`Reloading
+  requested from client PID …`, `Received SIG… from PID …`, `Requested transaction
+  …`, `A stop job …`, `Job …/stop|start|restart|reload …`); plus every line
+  systemd-logind and dbus write themselves. The entry carries `UNIT`, `JOB_TYPE`,
+  `JOB_RESULT` and `_SYSTEMD_UNIT` next to the message. A unit's own output is
+  never read (the runner units carry job output). Lines outside that set advance
+  the cursor and are not sent.
 
 Together those three were most of the mail this fleet produced. Measured over the
 week to 2026-08-29 across the three projects that have these policies, they

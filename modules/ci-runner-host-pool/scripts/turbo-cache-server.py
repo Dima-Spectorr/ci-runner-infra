@@ -59,20 +59,26 @@ the difference between what one pull request built and what the next one runs.
 """
 
 import errno
+import http.client
 import json
 import os
 import re
+import ssl
 import sys
+import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MD_ROOT = "http://169.254.169.254/computeMetadata/v1/"
 MD_HEADERS = {"Metadata-Flavor": "Google"}
-GCS_ROOT = "https://storage.googleapis.com/storage/v1/b/"
+STORE_HOST = "storage.googleapis.com"
+STORE_PATH = "/storage/v1/b/"
+# Artifacts move through this process in pieces of this size, in both
+# directions, so memory per request is one chunk whatever the artifact weighs.
+CHUNK = 1024 * 1024
 
 BUCKET = os.environ.get("CI_TURBO_BUCKET", "").strip()
 # Trailing slash included by the caller. The prefix is what confines this host
@@ -135,10 +141,17 @@ def _disk_path(hash_):
     return os.path.join(DISK_DIR, hash_)
 
 
-def _read_disk(hash_):
+def _open_disk(hash_):
+    """An open handle on this host's copy of the artifact, or None.
+
+    A handle rather than the bytes: an artifact can be hundreds of MiB, and a
+    server that reads each one whole into memory holds that much PER concurrent
+    request, on a host whose memory belongs to the slots' builds. The handle
+    also survives eviction: an unlinked file stays readable through an fd that
+    is already open, so a concurrent eviction cannot truncate a response.
+    """
     try:
-        with open(_disk_path(hash_), "rb") as fh:
-            data = fh.read()
+        fh = open(_disk_path(hash_), "rb")
     except OSError:
         return None
     # Touch on read: eviction below is by last use, and a hot artifact that was
@@ -147,28 +160,7 @@ def _read_disk(hash_):
         os.utime(_disk_path(hash_), None)
     except OSError:
         pass
-    return data
-
-
-def _write_disk(hash_, data):
-    """Best effort, and silent on failure: this is a cache of a cache.
-
-    Written to a temporary name in the same directory and renamed, because two
-    slots can miss on the same hash at the same moment and a partially written
-    file served to the second one is a corrupt artifact unpacked into a build.
-    """
-    tmp = _disk_path(hash_) + ".%d.tmp" % os.getpid()
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, _disk_path(hash_))
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return
-    _evict_if_over_budget()
+    return fh
 
 
 def _evict_if_over_budget():
@@ -178,6 +170,10 @@ def _evict_if_over_budget():
     slot's workspace and every image layer. A cache that fills that disk does
     not slow a build down, it fails every job on the host at once — which is a
     worse outcome than the cold reads this directory exists to avoid.
+
+    A download still in progress (a `.tmp` name) counts toward the total but is
+    never evicted: it is not an artifact yet, and unlinking it under its writer
+    turns a fetch that was going to succeed into a miss.
     """
     with _disk_lock:
         try:
@@ -189,8 +185,9 @@ def _evict_if_over_budget():
                         st = entry.stat()
                     except OSError:
                         continue
-                    entries.append((st.st_atime, st.st_size, entry.path))
                     total += st.st_size
+                    if not entry.name.endswith(".tmp"):
+                        entries.append((st.st_atime, st.st_size, entry.path))
             if total <= DISK_BUDGET:
                 return
             # Down to 80% rather than to exactly the budget: evicting one file
@@ -209,57 +206,176 @@ def _evict_if_over_budget():
             pass
 
 
-def _fetch(hash_):
-    """The artifact bytes, from disk if this host has them, else from the store.
+def _new_store_connection():
+    # Certificate and hostname verification are the default context's, stated
+    # explicitly: every request carries the host identity's bearer token, so the
+    # peer must be the storage service and not anything that answers on 443.
+    return http.client.HTTPSConnection(
+        STORE_HOST, timeout=30, context=ssl.create_default_context()
+    )
 
-    Returns None for a miss. A miss is the normal case for a build the warmer
-    has not run yet and must be cheap and quiet; an ERROR is also returned as a
-    miss, because a cache that fails a build when its backing store is
-    unreachable is worse than no cache at all.
+
+class _StorePool:
+    """Keep-alive TLS connections to the store, shared by every request thread.
+
+    A fresh connection per artifact is a TCP and TLS handshake for each of the
+    hundreds of artifacts one build asks for. A connection is lent for exactly
+    one request/response and taken back only once that response has been read
+    to its end: a half-read response left on a pooled connection is the next
+    request reading the previous artifact's tail as its own.
+
+    At most `size` idle connections are kept. ThreadingHTTPServer has no worker
+    cap, so a burst can open more than that; the surplus is closed on return
+    instead of being held for the life of the process.
     """
-    data = _read_disk(hash_)
-    if data is not None:
-        return data
 
+    def __init__(self, size):
+        self._size = size
+        self._idle = []
+        self._lock = threading.Lock()
+
+    def take(self):
+        """(connection, reused) — an idle one if there is one, else a new one."""
+        with self._lock:
+            if self._idle:
+                return self._idle.pop(), True
+        return _new_store_connection(), False
+
+    def give_back(self, conn):
+        with self._lock:
+            if len(self._idle) < self._size:
+                self._idle.append(conn)
+                return
+        conn.close()
+
+
+_pool = _StorePool(16)
+
+# What a keep-alive connection the store has already closed produces on the next
+# request, before any response byte. Retried only on a REUSED connection, and
+# only then: on a fresh one the same error is a real fault.
+_STALE = (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError)
+
+
+def _store_get(hash_):
+    """GET the object; returns (connection, response), the status not yet acted on."""
     url = (
-        GCS_ROOT
+        STORE_PATH
         + urllib.parse.quote(BUCKET, safe="")
         + "/o/"
         + urllib.parse.quote(_object_name(hash_), safe="")
         + "?alt=media"
     )
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": "Bearer " + _host_token(),
-            # Not an optimisation: an object stored with Content-Encoding gzip
-            # is transcoded on the way out unless the client says it takes gzip,
-            # and a transcoded response arrives with no Content-Length. The
-            # bytes turbo hashed are the bytes as stored.
-            "Accept-Encoding": "gzip",
-        },
-    )
+    headers = {
+        "Authorization": "Bearer " + _host_token(),
+        # Not an optimisation: an object stored with Content-Encoding gzip
+        # is transcoded on the way out unless the client says it takes gzip,
+        # and a transcoded response arrives with no Content-Length. The
+        # bytes turbo hashed are the bytes as stored.
+        "Accept-Encoding": "gzip",
+    }
+    while True:
+        conn, reused = _pool.take()
+        try:
+            conn.request("GET", url, headers=headers)
+            return conn, conn.getresponse()
+        except _STALE:
+            conn.close()
+            if not reused:
+                raise
+        except BaseException:
+            conn.close()
+            raise
+
+
+def _spool(hash_, resp):
+    """Copy the body to the disk cache in chunks; True only if it is complete.
+
+    The body lands under a temporary name and is renamed into place only once
+    every declared byte has arrived, so the disk never holds — and this server
+    never serves — a truncated artifact. A mid-stream failure raises, leaves
+    nothing behind, and the request becomes a miss: turbo builds the task.
+    Returns False, without reading the body, for an object over the size bound.
+    """
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            declared = resp.headers.get("Content-Length")
-            if declared is not None and int(declared) > MAX_ARTIFACT:
-                return None
-            # Bounded regardless of what the header claimed: read one byte past
-            # the cap and refuse if it arrives, so a chunked response cannot put
-            # an unbounded object into this process's memory.
-            data = resp.read(MAX_ARTIFACT + 1)
-            if len(data) > MAX_ARTIFACT:
-                return None
-    except urllib.error.HTTPError as exc:
-        if exc.code not in (403, 404):
-            sys.stderr.write("[ci-turbo-cache] fetch %s: HTTP %d\n" % (hash_, exc.code))
-        return None
+        declared = int(resp.getheader("Content-Length"))
+    except (TypeError, ValueError):
+        # No length means a chunked response: http.client raises on a cut chunk
+        # stream, and the byte bound below still caps it.
+        declared = None
+    if declared is not None and declared > MAX_ARTIFACT:
+        return False
+
+    # A unique name per download, not per process: request threads share one
+    # pid, and two slots missing on the same hash at once is the normal case.
+    fd, tmp = tempfile.mkstemp(dir=DISK_DIR, prefix=hash_ + ".", suffix=".tmp")
+    try:
+        written = 0
+        with os.fdopen(fd, "wb") as fh:
+            while True:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                # Bounded whatever the header claimed, so a chunked response
+                # cannot put an unbounded object onto the disk.
+                if written > MAX_ARTIFACT:
+                    raise ValueError("object larger than %d bytes" % MAX_ARTIFACT)
+                fh.write(chunk)
+        if declared is not None and written != declared:
+            raise ValueError("body ended at %d of %d bytes" % (written, declared))
+        os.replace(tmp, _disk_path(hash_))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _fetch(hash_):
+    """An open handle on the artifact: this host's copy, else fetched from the store.
+
+    Returns None for a miss. A miss is the normal case for a build the warmer
+    has not run yet and must be cheap and quiet; an ERROR is also returned as a
+    miss, because a cache that fails a build when its backing store is
+    unreachable is worse than no cache at all. That includes a disk that cannot
+    take the download: an artifact is only ever served from a complete copy on
+    disk, never held whole in memory.
+    """
+    fh = _open_disk(hash_)
+    if fh is not None:
+        return fh
+
+    conn = None
+    try:
+        conn, resp = _store_get(hash_)
+        if resp.status == 200:
+            ok = _spool(hash_, resp)
+            # An oversize object was refused unread; only a body read to its
+            # end leaves the connection fit to lend again.
+            reusable = ok
+        else:
+            resp.read()
+            if resp.status not in (403, 404):
+                sys.stderr.write("[ci-turbo-cache] fetch %s: HTTP %d\n" % (hash_, resp.status))
+            ok, reusable = False, True
     except Exception as exc:  # noqa: BLE001 - a miss, never a failed build
         sys.stderr.write("[ci-turbo-cache] fetch %s: %s\n" % (hash_, exc))
+        if conn is not None:
+            conn.close()
         return None
 
-    _write_disk(hash_, data)
-    return data
+    if reusable and not resp.will_close:
+        _pool.give_back(conn)
+    else:
+        conn.close()
+
+    if not ok:
+        return None
+    _evict_if_over_budget()
+    return _open_disk(hash_)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -278,13 +394,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _bytes(self, data, head_only=False):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        if not head_only:
-            self.wfile.write(data)
+    def _send_file(self, fh, head_only=False):
+        """Serve a complete on-disk artifact in chunks, under its true length.
+
+        The length is the open file's, and only a complete download is ever
+        renamed into place (_spool). If the client goes away mid-body the write
+        raises and the connection drops: a short body under a full
+        Content-Length, which turbo reads as an error, never as an artifact.
+        """
+        with fh:
+            size = os.fstat(fh.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if head_only:
+                return
+            remaining = size
+            while remaining > 0:
+                chunk = fh.read(min(remaining, CHUNK))
+                if not chunk:
+                    # Nothing in this server shrinks a published file, but a
+                    # short body must end the connection rather than leave it
+                    # mis-framed for the next request on it.
+                    self.close_connection = True
+                    return
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _authorized(self):
         """The token is a misconfiguration check, not the boundary.
@@ -340,11 +476,11 @@ class Handler(BaseHTTPRequestHandler):
             if hash_ is None:
                 self._json(400, {"error": "bad artifact hash"})
                 return
-            data = _fetch(hash_)
-            if data is None:
+            fh = _fetch(hash_)
+            if fh is None:
                 self._json(404, {"error": "artifact not found"})
                 return
-            self._bytes(data, head_only=head_only)
+            self._send_file(fh, head_only=head_only)
             return
 
         self._json(404, {"error": "not a turbo cache path"})
@@ -379,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 1024 * 1024))
+            chunk = self.rfile.read(min(remaining, CHUNK))
             if not chunk:
                 break
             remaining -= len(chunk)
@@ -414,6 +550,14 @@ def main():
         if exc.errno != errno.EEXIST:
             sys.stderr.write("[ci-turbo-cache] cannot use %s: %s\n" % (DISK_DIR, exc))
             return 2
+    # A download cut short by a restart leaves its temporary file behind. It is
+    # never served (only a rename publishes an artifact), but it holds disk.
+    for name in os.listdir(DISK_DIR):
+        if name.endswith(".tmp"):
+            try:
+                os.unlink(os.path.join(DISK_DIR, name))
+            except OSError:
+                pass
 
     server = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
     sys.stderr.write(
