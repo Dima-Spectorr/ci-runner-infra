@@ -46,11 +46,16 @@ lane_fetch_count() {
 
 # True when a `gh api` call would WRITE. A fetch job never makes one, whatever
 # the walk asks for: every mutation belongs to the deciding walk, serially.
+#
+# `api graphql` is a READ here: its query travels in `-f`/`-F` fields, and the
+# lane sends no GraphQL mutation. Any `-X` / `--method` / `--input` still writes.
 lane_gh_mutates() {
-  local arg
+  local arg graphql=''
+  [ "${1:-}" = api ] && [ "${2:-}" = graphql ] && graphql=1
   for arg in "$@"; do
     case "$arg" in
-      -X | --method | -X?* | --method=* | -f | -F | --field | --raw-field | --field=* | --raw-field=* | --input | --input=*) return 0 ;;
+      -X | --method | -X?* | --method=* | --input | --input=*) return 0 ;;
+      -f | -F | --field | --raw-field | --field=* | --raw-field=*) [ -n "$graphql" ] || return 0 ;;
     esac
   done
   return 1
@@ -169,17 +174,22 @@ lane_hdr_window() {
     }'
 }
 
-# <headers> — writes the LAST block's core window to LANE_QUOTA. A block for
-# another bucket (`graphql`, `search`) says nothing about the REST quota the
-# lane spends, and is ignored.
+# <headers> — writes the LAST block's window to LANE_QUOTA when it is the core
+# bucket, and to LANE_QUOTA.graphql when it is the graphql bucket: the lane
+# spends both, the open list from graphql (#1541) and everything else from
+# core. A block for any other bucket (`search`) is ignored.
 lane_quota_note() {
-  local w limit remaining used reset res
+  local w limit remaining used reset res file
   [ -n "${LANE_QUOTA:-}" ] || return 0
   w="$(lane_hdr_window "$1")"
   [ -n "$w" ] || return 0
   read -r limit remaining used reset res <<<"$w"
-  case "$res" in core | '?') ;; *) return 0 ;; esac
-  printf '%s %s %s %s\n' "$limit" "$remaining" "$used" "$reset" >"$LANE_QUOTA.$$.$BASHPID" && mv -f "$LANE_QUOTA.$$.$BASHPID" "$LANE_QUOTA"
+  case "$res" in
+    core | '?') file="$LANE_QUOTA" ;;
+    graphql) file="$LANE_QUOTA.graphql" ;;
+    *) return 0 ;;
+  esac
+  printf '%s %s %s %s\n' "$limit" "$remaining" "$used" "$reset" >"$file.$$.$BASHPID" && mv -f "$file.$$.$BASHPID" "$file"
 }
 
 # <dir> <gh-args...> — one real call: output to <dir>/out, error text to
@@ -428,4 +438,180 @@ lane_fetch_unused() {
     if [ -e "$dir/$i/diverged" ]; then diverged=$((diverged + 1)); fi
   done
   printf '%s %s' "$unused" "$diverged"
+}
+
+# ---------------------------------------------------------------------------
+# ONE GRAPHQL READ A PAGE ANSWERS THE WHOLE OPEN LIST, CHECKS AND ALL (#1541).
+#
+# The walk used to pay per open pull request: its check-runs, its check-suites,
+# its workflow runs, its commit statuses and its detail, every pass. On a
+# repository with ~60 open pull requests that was hundreds of calls a pass from
+# the merge App's shared installation quota, and draining it stalled every lane
+# in the fleet (#1540). `lane_snapshot` asks GraphQL, once per page of 25, for
+# every open pull request on the base with its head, its mergeability and every
+# check suite on that head with its check runs, its workflow and its event, and
+# writes what it learned as the REST bodies the walk already reads. The walk is
+# unchanged: `lane_snap_serve`, in the `gh` wrapper, answers a read from those
+# bodies through the read's own `--jq` program, so the projections, the
+# authority rules and every verdict are the same lines of code.
+#
+# Measured on a consumer repository, 2026-10-12, 61 open pull requests: 3
+# pages, 13 points of the `graphql` bucket each, and for one head each of the
+# four bodies matched the REST read of the same instant (runs by suite and
+# name, suites by id and status, runs by workflow and event).
+#
+# WHAT IS NOT SERVED IS READ LIVE, AS BEFORE.
+#   * A head with more than 50 suites, or a suite with more than 100 check
+#     runs, is not written: a body cut at a page edge would count a required
+#     check that fell off the end ABSENT. That head's reads go to REST, paged.
+#   * A head whose newest commit is not the listed head is not written either.
+#   * Mergeability is written only when GraphQL has computed it. `UNKNOWN` is
+#     what the detail read's wait-and-re-read exists for, and that read asks
+#     REST, which is also what starts GitHub computing it.
+#   * A read that exists to be FRESH — the mergeability re-read, the pre-merge
+#     read — is made with `LANE_SNAP` emptied, so it never meets an answer from
+#     the start of the pass.
+#
+# AN APP THE TOKEN CANNOT SEE is `app: null` in GraphQL where REST names it.
+# Its suite keeps its own id as the app key (`app-<suite id>`), so two hidden
+# apps are never merged into one; measured, none of them posts a check run. A
+# Bot author's login is `name` in GraphQL and `name[bot]` in REST; the REST
+# form is written, because `pin-bump-actor` is configured in it.
+# ---------------------------------------------------------------------------
+LANE_SNAP=''
+# shellcheck disable=SC2016 # GraphQL variables, not shell ones
+LANE_SNAP_QUERY='query($owner: String!, $name: String!, $base: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, baseRefName: $base, first: 25, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft title headRefOid mergeable
+        author { __typename login }
+        labels(first: 100) { nodes { name } }
+        commits(last: 1) { nodes { commit {
+          oid
+          status { contexts { context state createdAt } }
+          checkSuites(first: 50) {
+            pageInfo { hasNextPage }
+            nodes {
+              databaseId status conclusion createdAt
+              app { slug databaseId }
+              workflowRun { event workflow { databaseId } }
+              checkRuns(first: 100, filterBy: {checkType: LATEST}) {
+                pageInfo { hasNextPage }
+                nodes { name status conclusion startedAt completedAt }
+              }
+            }
+          }
+        } } }
+      }
+    }
+  }
+}'
+
+# <url> — the file name a url's body is written under.
+lane_snap_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
+
+# <nodes-file> <repo> <dir> — the pull request nodes, one JSON object a line,
+# turned into the walk's six list fields a pull request (on stdout, in the order
+# the REST list read printed them) and the REST bodies (under <dir>, one file a
+# url, named as `lane_snap_key` names it).
+lane_snap_write() {
+  local nodes="$1" repo="$2" dir="$3" key body fields
+  fields="$(jq -r '
+    (.number | tostring), .headRefOid, (.isDraft | tostring),
+    ((.labels.nodes // []) | map(.name) | join(",")),
+    ((.title // "") | gsub("[\r\n]"; " ")),
+    (if .author == null then "" elif .author.__typename == "Bot" then .author.login + "[bot]" else .author.login end)
+  ' "$nodes")" || return 1
+  # A jq built for Windows ends its lines CRLF; no body or name may keep the CR.
+  [ -z "$fields" ] || printf '%s\n' "${fields//$'\r'/}"
+  while IFS= read -r key && IFS= read -r body; do
+    key="${key%$'\r'}"
+    printf '%s\n' "${body%$'\r'}" >"$dir/$key"
+  done < <(jq -r --arg r "$repo" '
+    def key: gsub("[^A-Za-z0-9]"; "_");
+    def low: if . == null then null else ascii_downcase end;
+    . as $pr
+    | (if .mergeable == "MERGEABLE" then true elif .mergeable == "CONFLICTING" then false else null end) as $m
+    | ((.commits.nodes // [])[0].commit // null) as $c
+    | (if $m != null then
+        [("repos/\($r)/pulls/\(.number)" | key),
+         ({mergeable: $m, state: "open", draft: .isDraft, head: {sha: .headRefOid}, title: .title,
+           labels: ((.labels.nodes // []) | map({name}))} | tojson)]
+      else empty end),
+      ( select($c != null and $c.oid == $pr.headRefOid)
+      | select(($c.checkSuites.pageInfo.hasNextPage | not)
+               and ([($c.checkSuites.nodes // [])[] | .checkRuns.pageInfo.hasNextPage] | any | not))
+      | ($c.checkSuites.nodes // []) as $s
+      | $pr.headRefOid as $sha
+      | [("repos/\($r)/commits/\($sha)/check-runs?per_page=100" | key),
+         ({check_runs: [$s[] as $x | ($x.checkRuns.nodes // [])[]
+            | {name, status: (.status | low), conclusion: (.conclusion | low),
+               started_at: .startedAt, completed_at: .completedAt,
+               app: {slug: ($x.app.slug // "app-\($x.databaseId)"), id: $x.app.databaseId},
+               check_suite: {id: $x.databaseId}}]} | tojson)],
+        [("repos/\($r)/commits/\($sha)/check-suites?per_page=100" | key),
+         ({check_suites: [$s[] | {id: .databaseId, status: (.status | low), conclusion: (.conclusion | low),
+            created_at: .createdAt, app: {slug: (.app.slug // "app-\(.databaseId)"), id: .app.databaseId}}]} | tojson)],
+        [("repos/\($r)/actions/runs?head_sha=\($sha)&per_page=100" | key),
+         ({workflow_runs: [$s[] | select(.workflowRun != null)
+            | {check_suite_id: .databaseId, workflow_id: .workflowRun.workflow.databaseId, event: .workflowRun.event}]} | tojson)],
+        [("repos/\($r)/commits/\($sha)/status?per_page=100" | key),
+         ({statuses: [($c.status.contexts // [])[]
+            | {context, state: (if .state == "EXPECTED" then "pending" else (.state | low) end),
+               created_at: .createdAt, updated_at: .createdAt}]} | tojson)] )
+    | .[0], .[1]
+  ' "$nodes")
+}
+
+# <dir> — reads the open list into <dir> and prints the six list fields a pull
+# request. One `gh api graphql` call a page, counted and header-noted by the
+# `gh` wrapper like any other read. Fails, with gh's error text on stderr, when
+# the read does; the caller treats that as a blind lane, as it did the REST list.
+lane_snapshot() {
+  local dir="$1" rc=0
+  gh api graphql --paginate -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" \
+    -f query="$LANE_SNAP_QUERY" --jq '.data.repository.pullRequests.nodes[]' >"$dir/nodes" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  lane_snap_write "$dir/nodes" "$R" "$dir"
+}
+
+# `gh api [--paginate] <url> [--jq <program>]` answered from the snapshot, or
+# return 1 for anything else — another shape, a write, a url not in it. Not
+# counted: no call was made. `--jq` is applied the way gh applies it: a string
+# raw, anything else as compact JSON.
+lane_snap_serve() {
+  [ -n "$LANE_SNAP" ] && [ "${1:-}" = api ] || return 1
+  shift
+  local url='' prog='' file
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --paginate) shift ;;
+      --jq)
+        [ $# -ge 2 ] || return 1
+        prog="$2"
+        shift 2
+        ;;
+      -*) return 1 ;;
+      *)
+        [ -z "$url" ] || return 1
+        url="$1"
+        shift
+        ;;
+    esac
+  done
+  [ -n "$url" ] || return 1
+  file="$LANE_SNAP/$(lane_snap_key "$url")"
+  [ -f "$file" ] || return 1
+  [ -n "$prog" ] || {
+    cat "$file"
+    return 0
+  }
+  # Whole or not at all: a program that fails on the body falls through to the
+  # live read rather than leaving half an answer in the caller's stream. A jq
+  # built for Windows ends its lines CRLF; gh does not.
+  local out
+  out="$(jq -rc "$prog" "$file" 2>/dev/null)" || return 1
+  [ -z "$out" ] || printf '%s\n' "${out//$'\r'/}"
 }

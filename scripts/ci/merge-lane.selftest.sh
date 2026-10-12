@@ -545,8 +545,13 @@ reads_every_page() {
   local code
   code=$(code_of "$1")
   matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/check-runs' || return 1
-  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/status' || return 1
-  matches "$code" 'gh api --paginate "repos/\$R/pulls\?state=open'
+  matches "$code" 'gh api --paginate "repos/\$R/commits/\$sha/status'
+}
+
+# The open list is ONE GraphQL query a page (#1541), and every page of it is
+# read: an open pull request past the first 25 is invisible forever otherwise.
+reads_every_page_of_the_open_list() {
+  matches "$(code_of "$1")" '^  gh api graphql --paginate -F owner='
 }
 
 # `gh api` PRINTS THE ERROR BODY TO STDOUT, so `|| true` on a check read does
@@ -1103,7 +1108,7 @@ fails_closed_on_an_unreadable_pull_request_list() {
   # `gh api` writes the error body to stdout, so a list read that dropped its
   # exit status would hand back a JSON document and then — because that is not
   # five fields per record — either report a healthy quiet day or read garbage.
-  matches "$code" 'if ! prs_raw="\$\(gh api --paginate "repos/\$R/pulls\?state=open' || return 1
+  matches "$code" '\|\| ! prs_raw="\$\(lane_snapshot "\$LANE_SNAP" 2>"\$list_err"\)"; then$' || return 1
   matches "$code" '\$\{#pr_fields\[@\]\} % 6\)\) -ne 0' || return 1
   [ "$(printf '%s\n' "$code" | grep -cE 'LANE_FATAL=1')" -ge 4 ]
 }
@@ -1551,7 +1556,7 @@ halts_when_the_base_itself_is_red() {
   # per-pull-request reads — `/pulls/<n>/reviews`, `/pulls/<n>/files` — and the
   # first of those to appear in the file would be compared instead, which
   # answers a different question and can only answer it by accident.
-  walk_line=$(grep -n 'gh api --paginate "repos/\$R/pulls?state=open' "$1" | head -n1 | cut -d: -f1)
+  walk_line=$(grep -n 'prs_raw="$(lane_snapshot ' "$1" | head -n1 | cut -d: -f1)
   [ -n "$halt_line" ] && [ -n "$walk_line" ] && [ "$halt_line" -lt "$walk_line" ]
 }
 
@@ -1989,6 +1994,35 @@ stops_short_of_an_exhausted_quota() {
   ! matches "$code" 'rate_limit'
 }
 
+# ONE GRAPHQL READ A PAGE ANSWERS THE WALK (#1541). The `gh` wrapper asks the
+# snapshot before anything else — before a fetch job records and before the
+# call is counted, so a served read is neither — and the two reads that exist
+# to be fresh empty `LANE_SNAP` and go to the network. The snapshot is this
+# pass's: replaced at the start of every pass, emptied when the list fails.
+serves_the_walk_from_one_snapshot_a_pass() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^    if lane_snap_serve "\$@"; then return 0; fi$' || return 1
+  before "$code" '^    if lane_snap_serve "\$@"; then return 0; fi$' '^    if \[ -n "\$LANE_RECORD" \]; then$' || return 1
+  before "$code" '^    if lane_snap_serve "\$@"; then return 0; fi$' '^    printf \. >>"\$LANE_CALLS"$' || return 1
+  matches "$code" '^  LANE_SNAP="\$LANE_TMP/snap"$' || return 1
+  matches "$code" '^  rm -rf "\$LANE_SNAP"$' || return 1
+  matches "$code" 'reread="\$\(LANE_SNAP='"''"' gh api "repos/\$R/pulls/\$num"' || return 1
+  matches "$code" 'mapfile -t fresh < <\(LANE_SNAP='"''"' gh api "repos/\$R/pulls/\$action_num"'
+}
+
+# The open list is read from the graphql bucket, so a KNOWN graphql window under
+# the floor holds the pass like the core one. An unknown one does not: it is
+# never probed, and the list read that would tell is the pass itself.
+holds_on_a_graphql_window_under_the_floor() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  q="\$\(lane_quota graphql\)"$' || return 1
+  matches "$code" '^  \[ -n "\$q" \] \|\| return 0$' || return 1
+  matches "$code" '^  if \[ "\$verdict" = hold:below-floor \]; then$' || return 1
+  matches "$code" '^  \[ "\$\{1:-\}" != graphql \] \|\| f="\$LANE_QUOTA.graphql"$'
+}
+
 passes_the_quota_floor_to_the_driver() {
   local code
   code=$(code_of "$1")
@@ -2066,6 +2100,7 @@ check treats_a_non_verdict_as_a_failure "$DRIVER" "a skipped or neutral required
 check reads_both_check_surfaces "$DRIVER" "only one check surface is read, so a required commit status can never be satisfied"
 check fails_closed_on_empty_configuration "$DRIVER" "empty configuration does not stop the lane"
 check reads_every_page "$DRIVER" "a list endpoint is read unpaginated, so a required check or a whole pull request can be invisible"
+check reads_every_page_of_the_open_list "$FETCH" "the open-list GraphQL query reads one page, so a pull request past the first 25 is never seen"
 check fails_closed_on_an_unreadable_comparison "$DRIVER" "a failed base comparison reads as up-to-date, which is the one answer that lets a merge through"
 check fails_closed_on_an_unreadable_check_surface "$DRIVER" "a failed check read is swallowed into the stream as a nameless object, and every required check on a green pull request then counts as FAILED"
 check fails_closed_on_an_unreadable_check_suite_surface "$DRIVER" "a failed check-suites read is not treated as blindness, so the lane keeps trusting a success it can no longer verify against the current suite"
@@ -2128,6 +2163,8 @@ check the_pin_waiver_is_asked_only_when_the_label_is_missing "$DRIVER" "the waiv
 check the_pin_waiver_is_off_by_default "$DRIVER" "a repository that never asked for the waiver gets it anyway, and its label gate is no longer a gate"
 check passes_the_pin_waiver_to_the_driver "$CALLEE" "the waiver is configured on the caller and never reaches the driver, so Dependabot's bump still waits for a label nobody applies"
 check stops_walking_when_the_pass_runs_out_of_time "$DRIVER" "a pass has no deadline of its own, so it is killed by the job's timeout-minutes instead — and that kill reports as 'cancelled', which is indistinguishable from an operator cancelling it and leaves no annotation, no summary and no queue update (#444)"
+check serves_the_walk_from_one_snapshot_a_pass "$DRIVER" "the walk is not answered from the pass's GraphQL snapshot first, or a fresh read is answered from it, so a pass pays five reads a pull request again or acts on a mergeability read at its start"
+check holds_on_a_graphql_window_under_the_floor "$DRIVER" "a graphql window under the floor does not hold the pass, so it starts blind on its first read"
 check fails_closed_on_an_unreadable_pull_request_list "$DRIVER" "a failed list read falls through as 'no open pull requests', so a lane that cannot see the queue reports a quiet day"
 check passes_the_pass_budget_to_the_driver "$CALLEE" "pass-budget-seconds is declared but never reaches the driver, so setting it does nothing"
 check the_lane_runs_out_of_time_before_the_job_does "$CALLEE" "the pass budget does not leave the lane two minutes to finish inside the job's timeout-minutes — raise the timeout or lower the budget, but never let the job's ceiling arrive first: that kill reports as 'cancelled' and publishes nothing"
@@ -2354,8 +2391,20 @@ mutate "the empty-configuration guard is removed" "$DRIVER" \
   's%^if \[ "..#REQUIRED\[@\]." -eq 0 \]; then%if false; then%' fails_closed_on_empty_configuration
 mutate "the check-run read stops paginating" "$DRIVER" \
   's@gh api --paginate "repos/\$R/commits/\$sha/check-runs@gh api "repos/$R/commits/$sha/check-runs@' reads_every_page
-mutate "the pull request list stops paginating" "$DRIVER" \
-  's@gh api --paginate "repos/\$R/pulls?state=open@gh api "repos/$R/pulls?state=open@' reads_every_page
+mutate "the pull request list stops paginating" "$FETCH" \
+  's@^  gh api graphql --paginate @  gh api graphql @' reads_every_page_of_the_open_list
+mutate "the wrapper calls before it asks the snapshot" "$DRIVER" \
+  's#^    if lane_snap_serve "\$@"; then return 0; fi$#    :#' serves_the_walk_from_one_snapshot_a_pass
+mutate "the pre-merge read is answered from the snapshot" "$DRIVER" \
+  "s@mapfile -t fresh < <(LANE_SNAP='' gh api@mapfile -t fresh < <(gh api@" serves_the_walk_from_one_snapshot_a_pass
+mutate "the mergeability re-read is answered from the snapshot" "$DRIVER" \
+  "s@reread=\"\$(LANE_SNAP='' gh api@reread=\"\$(gh api@" serves_the_walk_from_one_snapshot_a_pass
+mutate "one snapshot serves every pass" "$DRIVER" \
+  's@^  rm -rf "\$LANE_SNAP"$@  :@' serves_the_walk_from_one_snapshot_a_pass
+mutate "the graphql window is never read" "$DRIVER" \
+  's@^  q="\$(lane_quota graphql)"$@  q=""@' holds_on_a_graphql_window_under_the_floor
+mutate "an unknown graphql window holds the pass" "$DRIVER" \
+  's@^  \[ -n "\$q" \] || return 0$@  :@' holds_on_a_graphql_window_under_the_floor
 mutate "an unreadable comparison falls back to up-to-date" "$DRIVER" \
   's@^      if ! behind=@      behind=0; if false; behind=@' fails_closed_on_an_unreadable_comparison
 
@@ -2698,7 +2747,7 @@ mutate "the truncation stops saying how much of the list it read" "$DRIVER" \
   stops_walking_when_the_pass_runs_out_of_time
 
 mutate "the pull request list swallows its exit status, so a blind lane reports a quiet day" "$DRIVER" \
-  's@if ! prs_raw="\$(gh api --paginate@if false; prs_raw="$(gh api --paginate@' \
+  's@|| ! prs_raw="\$(lane_snapshot @|| prs_raw="$(lane_snapshot @' \
   fails_closed_on_an_unreadable_pull_request_list
 mutate "the record-shape assertion is dropped, so a short read slides every field" "$DRIVER" \
   's|pr_fields\[@\]} % 6)) -ne 0|pr_fields[@]} % 6)) -ne 999|' \
