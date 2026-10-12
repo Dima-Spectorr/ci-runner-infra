@@ -2079,6 +2079,31 @@ fails (the merge App lacks **Actions: read**) the pre-#967 hold stands and the
 lane warns once naming the permission. The #955 re-dispatch shape is the same
 workflow, so it is still held.
 
+**Since [ci-runner-infra#1542](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1542)
+the hold also covers a `skipped` answer, and the ruleset's own `pull_request`
+suite holds whatever answered first.** The branch ruleset reads the
+`pull_request`-event run of the workflow, never a `workflow_dispatch` one, and
+until that run posts the name GitHub refuses the merge with 405 "required status
+check `ci` is expected". Measured on a consumer repository (28 refusals over 5
+pull requests, every one merging minutes after its own `pull_request` run
+posted `ci`), two shapes slipped past the pre-#1542 hold:
+
+- **Shape A** — the `ci` the draft-time run SKIPPED was the authority, and the
+  hold downgraded only `success`; the lane logged "required and SKIPPED,
+  counted as passing" and attempted the merge while the ready-time run was
+  still in progress.
+- **Shape B** — the queued `pull_request` suite was created BEFORE the dispatch
+  suite that went green, so no suite was "newer" than the authority.
+
+The lineage read now records each run's `event` as well as its workflow, and is
+made whenever an unfinished suite of the authority's app exists, not only a
+newer one. A `skipped` or `success` answer is held `pending` while an
+unfinished suite of the same workflow has not posted the name and is newer than
+the authority — or, whatever its age, is the `pull_request`-event suite while
+the authority came from another event. The why line carries the named cause
+`(cause: ruleset-suite-unposted)`. The hold is bounded by the same
+`newer-incomplete-max-staleness-seconds` as above.
+
 **The base-health read now says what it retrieved.** On any base-health verdict
 other than `healthy` (and on `inert` only when the grace clock is armed) the
 lane log carries, per required name, the raw rows the read returned — origin,

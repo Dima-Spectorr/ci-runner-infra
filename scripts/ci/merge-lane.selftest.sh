@@ -635,6 +635,20 @@ picks_the_authoritative_suite_per_check_name() {
 # and skips the hold, resurrecting the 405 through the one path that never
 # consulted it. Guarding it on `$state` = `success` is what keeps a `failure`
 # from the authoritative suite red (#1582) instead of softening it to a wait.
+# #1542: the hold also covers a SKIP, and the ruleset's own `pull_request` suite
+# holds a dispatch run's green even when it was created first. The behavioural
+# shapes A and B below are the measured responses; these are the lines they
+# depend on, so a mutant that drops one is caught here as well.
+holds_a_skip_and_the_rulesets_own_suite() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" 'if \{ \[ "\$state" = "success" \] \|\| \[ "\$state" = "skipped" \]; \} && \[ "\$auth_newer" = "true" \]; then' || return 1
+  matches "$code" 'and \$ev\[\(\.id \| tostring\)\] == "pull_request"' || return 1
+  matches "$code" "jq '\[\.\[\]\[\] \| \.any_incomplete\] \| any'" || return 1
+  matches "$code" 'event: \.event\}' || return 1
+  matches "$code" '\(cause: ruleset-suite-unposted\)'
+}
+
 holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
   local code
   code=$(code_of "$1")
@@ -647,7 +661,7 @@ holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
   matches "$code" '\[\.created_at, \.id\]' || return 1
   matches "$code" '\[\$w\.created_at, \$w\.suite\]' || return 1
   ! matches "$code" '\.created_at > \$w\.created_at' || return 1
-  matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then' || return 1
+  matches "$code" 'if \{ \[ "\$state" = "success" \] \|\| \[ "\$state" = "skipped" \]; \} && \[ "\$auth_newer" = "true" \]; then' || return 1
   ! matches "$code" 'elif \[ "\$auth_newer" = "true" \]; then'
 }
 
@@ -659,7 +673,7 @@ holds_a_success_while_a_later_suite_of_the_app_is_unfinished() {
 only_downgrades_a_success_from_a_run() {
   local code
   code=$(code_of "$1")
-  matches "$code" 'if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]' || return 1
+  matches "$code" 'if \{ \[ "\$state" = "success" \] \|\| \[ "\$state" = "skipped" \]; \} && \[ "\$winner_origin" = "run" \]' || return 1
   # And the two outcomes that fix a consumer's PR #1354 (not yet posted,
   # wait) and PR #1582 (posted as a failure, over a stale success, do not
   # attempt) both exist.
@@ -1831,7 +1845,7 @@ the_newer_incomplete_hold_is_bounded() {
 the_bound_can_only_decline_the_downgrade() {
   local code arm
   code=$(code_of "$1")
-  matches "$code" '^        if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then$' || return 1
+  matches "$code" '^        if \{ \[ "\$state" = "success" \] \|\| \[ "\$state" = "skipped" \]; \} && \[ "\$auth_newer" = "true" \]; then$' || return 1
   # SLICED TO THE ESCAPE'S OWN ARM, NOT GREPPED OVER THE WHOLE FUNCTION. A bare
   # `else` and a bare `state="pending"` also occur in the superseded-suite arm
   # above, so assertions written on them alone stayed GREEN when the downgrade
@@ -1868,7 +1882,7 @@ the_bound_reads_the_newest_holding_suite() {
 the_expired_hold_warns() {
   local code
   code=$(code_of "$1")
-  matches "$code" '^            echo "::warning::lane: \$sha — check .\$name. is green and app .\$winner_app. has suite \$auth_newer_id still unfinished' || return 1
+  matches "$code" '^            echo "::warning::lane: \$sha — check .\$name. is \$state and app .\$winner_app. has suite \$auth_newer_id still unfinished' || return 1
   matches "$code" 'past the \$\{NEWER_INCOMPLETE_MAX_STALENESS\}s bound.*" >&2$'
 }
 
@@ -2058,6 +2072,7 @@ check fails_closed_on_an_unreadable_check_suite_surface "$DRIVER" "a failed chec
 check reads_every_page_of_check_suites "$DRIVER" "the check-suites read is not paginated, so a commit with more than a hundred suites loses the newest one past the first page — the exact suite the correlation exists to find"
 check picks_the_authoritative_suite_per_check_name "$DRIVER" "the authoritative suite is picked per app rather than per check name, so a sibling suite of the same app speaks for checks it never posted and deletes them"
 check holds_a_success_while_a_later_suite_of_the_app_is_unfinished "$DRIVER" "a later, unfinished suite of the same app no longer holds a name, so PR #1354's shape resolves back to the stale success that produced the 405"
+check holds_a_skip_and_the_rulesets_own_suite "$DRIVER" "a skip is counted as passing while the pull request's own later run has not posted the name, or a queued pull_request run no longer holds a later dispatch run's green — the #1542 405s on 5 IntegrateIT pull requests"
 check only_downgrades_a_success_from_a_run "$DRIVER" "the correlation touches a state other than a check-run's success, so a state that was already non-green changes meaning and the fix is no longer provably one-directional"
 check asks_the_authoritative_suite_for_the_same_name "$DRIVER" "a stale success is discarded without asking what the authoritative suite itself posted for the same name, so PR #1582's genuine failure resolves to a hold instead of red"
 check holds_rather_than_trusts_an_unverifiable_success "$DRIVER" "an app with no check_suite in the read is trusted as green by default, which is the silent fallback this file's own rule forbids"
@@ -2369,11 +2384,23 @@ mutate "the authority key collapses from (app, name) back to app" "$DRIVER" \
 mutate "the sort that feeds the grouping drops part of the grouping key" "$DRIVER" \
   's@sort_by(\[\.app, \.name, \.created_at, \.suite\])@sort_by([.created_at])@' \
   picks_the_authoritative_suite_per_check_name
+mutate "a skip is no longer held under an unfinished later suite (#1542 shape A)" "$DRIVER" \
+  's@ || \[ "\$state" = "skipped" \]; } && \[ "\$auth_newer" = "true" \]; then@; } \&\& [ "$auth_newer" = "true" ]; then@' \
+  holds_a_skip_and_the_rulesets_own_suite
+mutate "an older queued pull_request run no longer holds a dispatch run's green (#1542 shape B)" "$DRIVER" \
+  's@and \$ev\[(\.id | tostring)\] == "pull_request"@and false@' \
+  holds_a_skip_and_the_rulesets_own_suite
+mutate "the lineage is read only when a LATER suite holds, so shape B never learns the events (#1542)" "$DRIVER" \
+  's@\.any_incomplete\] | any@.newer_incomplete] | any@' \
+  holds_a_skip_and_the_rulesets_own_suite
+mutate "the lineage read drops the run event (#1542)" "$DRIVER" \
+  's@, event: \.event}@}@' \
+  holds_a_skip_and_the_rulesets_own_suite
 mutate "the hold on a later unfinished suite of the same app is dropped" "$DRIVER" \
   's@&& \[ "\$auth_newer" = "true" \]; then@\&\& false; then@' \
   holds_a_success_while_a_later_suite_of_the_app_is_unfinished
 mutate "the hold becomes an elif on the superseded-suite branch, so it is skipped when the authority is a different suite" "$DRIVER" \
-  's@if \[ "\$state" = "success" \] && \[ "\$auth_newer" = "true" \]; then@elif [ "$auth_newer" = "true" ]; then@' \
+  's@if { \[ "\$state" = "success" \] || \[ "\$state" = "skipped" \]; } && \[ "\$auth_newer" = "true" \]; then@elif [ "$auth_newer" = "true" ]; then@' \
   holds_a_success_while_a_later_suite_of_the_app_is_unfinished
 mutate "the later-suite test orders suites by the timestamp alone, so a same-second sibling never holds" "$DRIVER" \
   's@\[\.created_at, \.id\]@[.created_at]@' \
@@ -2382,7 +2409,7 @@ mutate "the later-suite test stops scoping itself to the winning app" "$DRIVER" 
   's@select(\.app == \$w\.app$@select(true or .app == $w.app@' \
   does_not_wait_on_an_unrelated_apps_suite
 mutate "the downgrade stops checking the winner's origin, so a legacy status could be correlated too" "$DRIVER" \
-  's@if \[ "\$state" = "success" \] && \[ "\$winner_origin" = "run" \]; then@if [ "$state" = "success" ]; then@' \
+  's@if { \[ "\$state" = "success" \] || \[ "\$state" = "skipped" \]; } && \[ "\$winner_origin" = "run" \]; then@if { [ "$state" = "success" ] || [ "$state" = "skipped" ]; }; then@' \
   only_downgrades_a_success_from_a_run
 mutate "a stale success is discarded to absent instead of asking the authoritative suite for the same name" "$DRIVER" \
   's@printf .%s. "\$auth_filtered"@printf "%s" "\$auth_filtered_UNUSED"@' \
@@ -3425,6 +3452,53 @@ behavioural_check_counts_cases() {
   else
     printf 'PASS %s\n' "#1443 state record: a read with no sink writes nothing"
   fi
+
+  # #1542: 405 "required status check ci is expected" ON A HEAD THE LANE CALLED
+  # GREEN. Both shapes are IntegrateIT's own check suites and runs, ids and
+  # times as GitHub returned them for the head at the moment of the refusal;
+  # workflow 283712350 is its `pr-check`.
+  #
+  # Shape A, #25498 head d49eb8c0 at 13:36Z on 2026-10-11 (also #25382,
+  # #25595, #25600). Suite ...5007 is the `pull_request` run fired while the
+  # pull request was a draft: it posted `ci` SKIPPED. Suite ...4948 is a
+  # `workflow_dispatch` run: `ci` success. Suite ...5533 is the `pull_request`
+  # run that marking it ready started, still running, with no `ci` job yet.
+  # The skip was counted as passing and the merge refused 7 times.
+  local wfA suitesA runsA
+  wfA='{"workflow_runs":[{"check_suite_id":103341004948,"workflow_id":283712350,"event":"workflow_dispatch"},{"check_suite_id":103341005007,"workflow_id":283712350,"event":"pull_request"},{"check_suite_id":103344165533,"workflow_id":283712350,"event":"pull_request"}]}'
+  suitesA="{\"check_suites\":[$(_bh_suite 103341004948 github-actions completed 2026-10-11T13:16:33Z),$(_bh_suite 103341005007 github-actions completed 2026-10-11T13:16:33Z),$(_bh_suite 103344165533 github-actions in_progress 2026-10-11T13:34:19Z)]}"
+  runsA="{\"check_runs\":[$(_bh_run ci completed '"success"' '"2026-10-11T13:33:11Z"' github-actions 103341004948),$(_bh_run ci completed '"skipped"' '"2026-10-11T13:17:08Z"' github-actions 103341005007)]}"
+  case_ "#1542 shape A: a draft-time skip is held while the ready-for-review run has not posted the name" \
+    "0 0 0 1" ci "$suitesA" "$runsA" 0 '' "$wfA"
+  case_ "#1542 shape A: the held skip is not announced as a counted pass" \
+    "0 0 0 1" ci "$suitesA" "$runsA" 0 '!SKIPPED' "$wfA"
+  # And once that run posts `ci` (13:48:55, success) the hold lifts.
+  local suitesA2 runsA2
+  suitesA2="{\"check_suites\":[$(_bh_suite 103341004948 github-actions completed 2026-10-11T13:16:33Z),$(_bh_suite 103341005007 github-actions completed 2026-10-11T13:16:33Z),$(_bh_suite 103344165533 github-actions completed 2026-10-11T13:34:19Z)]}"
+  runsA2="{\"check_runs\":[$(_bh_run ci completed '"success"' '"2026-10-11T13:33:11Z"' github-actions 103341004948),$(_bh_run ci completed '"skipped"' '"2026-10-11T13:17:08Z"' github-actions 103341005007),$(_bh_run ci completed '"success"' '"2026-10-11T13:48:55Z"' github-actions 103344165533)]}"
+  case_ "#1542 shape A: the hold lifts once the ready-for-review run posts the name" \
+    "1 0 0 0" ci "$suitesA2" "$runsA2" 0 '' "$wfA"
+
+  # Shape B, #25376 head 0121c09c at 06:08Z. The `pull_request` run ...6509
+  # was created at 05:06:02 and sat queued until 06:33; the dispatch run ...0911
+  # was created LATER, at 05:25:36, and posted `ci` success at 05:50. The newest
+  # suite that posted the name is the dispatch one, so no later suite held it,
+  # yet the ruleset reads the `pull_request` run and refused the merge 6 times.
+  local wfB suitesB runsB
+  wfB='{"workflow_runs":[{"check_suite_id":103261700333,"workflow_id":283712350,"event":"pull_request"},{"check_suite_id":103261737809,"workflow_id":283712350,"event":"workflow_dispatch"},{"check_suite_id":103264636509,"workflow_id":283712350,"event":"pull_request"},{"check_suite_id":103267380911,"workflow_id":283712350,"event":"workflow_dispatch"}]}'
+  suitesB="{\"check_suites\":[$(_bh_suite 103261700333 github-actions completed 2026-10-11T04:45:11Z),$(_bh_suite 103261737809 github-actions completed 2026-10-11T04:45:26Z),$(_bh_suite 103264636509 github-actions queued 2026-10-11T05:06:02Z),$(_bh_suite 103267380911 github-actions completed 2026-10-11T05:25:36Z)]}"
+  runsB="{\"check_runs\":[$(_bh_run ci completed '"skipped"' '"2026-10-11T04:45:43Z"' github-actions 103261700333),$(_bh_run ci completed '"success"' '"2026-10-11T05:04:56Z"' github-actions 103261737809),$(_bh_run ci completed '"success"' '"2026-10-11T05:50:02Z"' github-actions 103267380911)]}"
+  case_ "#1542 shape B: a queued pull_request run holds a later dispatch run's green" \
+    "0 0 0 1" ci "$suitesB" "$runsB" 0 '' "$wfB"
+  # The controls. An older unfinished suite that is NOT a `pull_request` run
+  # is still no reason to distrust the green, and nor is one whose event the
+  # lineage did not return — only the ruleset's own suite holds.
+  case_ "#1542 shape B control: an older unfinished dispatch run does not hold" \
+    "1 0 0 0" ci "$suitesB" "$runsB" 0 '' "${wfB//103264636509,\"workflow_id\":283712350,\"event\":\"pull_request\"/103264636509,\"workflow_id\":283712350,\"event\":\"workflow_dispatch\"}"
+  case_ "#1542 shape B control: an older unfinished suite of unknown event does not hold" \
+    "1 0 0 0" ci "$suitesB" "$runsB" 0 '' '{"workflow_runs":[]}'
+  case_ "#1542 shape B control: an older pull_request run of ANOTHER workflow does not hold" \
+    "1 0 0 0" ci "$suitesB" "$runsB" 0 '' "${wfB//103264636509,\"workflow_id\":283712350/103264636509,\"workflow_id\":1}"
 
   rm -rf "$fix"
 }
