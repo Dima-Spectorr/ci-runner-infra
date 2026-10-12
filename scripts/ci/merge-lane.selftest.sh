@@ -2394,7 +2394,7 @@ mutate "the check-run read stops paginating" "$DRIVER" \
 mutate "the pull request list stops paginating" "$FETCH" \
   's@^  gh api graphql --paginate @  gh api graphql @' reads_every_page_of_the_open_list
 mutate "the wrapper calls before it asks the snapshot" "$DRIVER" \
-  's@^    if lane_snap_serve "\$@"; then return 0; fi$@    :@' serves_the_walk_from_one_snapshot_a_pass
+  's#^    if lane_snap_serve "\$@"; then return 0; fi$#    :#' serves_the_walk_from_one_snapshot_a_pass
 mutate "the pre-merge read is answered from the snapshot" "$DRIVER" \
   "s@mapfile -t fresh < <(LANE_SNAP='' gh api@mapfile -t fresh < <(gh api@" serves_the_walk_from_one_snapshot_a_pass
 mutate "the mergeability re-read is answered from the snapshot" "$DRIVER" \
@@ -2747,7 +2747,7 @@ mutate "the truncation stops saying how much of the list it read" "$DRIVER" \
   stops_walking_when_the_pass_runs_out_of_time
 
 mutate "the pull request list swallows its exit status, so a blind lane reports a quiet day" "$DRIVER" \
-  's@if ! prs_raw="\$(gh api --paginate@if false; prs_raw="$(gh api --paginate@' \
+  's@|| ! prs_raw="\$(lane_snapshot @|| prs_raw="$(lane_snapshot @' \
   fails_closed_on_an_unreadable_pull_request_list
 mutate "the record-shape assertion is dropped, so a short read slides every field" "$DRIVER" \
   's|pr_fields\[@\]} % 6)) -ne 0|pr_fields[@]} % 6)) -ne 999|' \
