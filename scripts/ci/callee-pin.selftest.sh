@@ -88,6 +88,15 @@ if [ $# -eq 0 ]; then
       bash "$self" "$name" || failed=1
     fi
     if grep -q -- "- name: $STEP" "$f"; then
+      # The cases below export CALLEE_PATH themselves, so they cannot see the
+      # value the workflow really passes. A wrong one resolves zero `uses:`
+      # refs in every caller and fails every run (#1568 shipped `__PATH__`).
+      paths=$(grep -E '^[[:space:]]*CALLEE_PATH:' "$f" | sed -E 's/^[[:space:]]*CALLEE_PATH:[[:space:]]*//; s/[[:space:]]+$//' | sort -u)
+      if [ "$paths" != ".github/workflows/$name" ]; then
+        printf 'FAIL: %s: CALLEE_PATH is "%s", expected ".github/workflows/%s"
+' "$name" "$paths" "$name"
+        failed=1
+      fi
       # The resolver is inlined (it runs before any checkout, so it cannot be a
       # script): one rule, copied. The copies must be the SAME text.
       sum=$(extract_block "$f" "$STEP" | cksum)
