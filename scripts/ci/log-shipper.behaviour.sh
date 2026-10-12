@@ -164,12 +164,15 @@ run_suite() {
   [ "$(cursor)" = c5 ] || fail "an accepted write did not move the cursor to its last entry (got '$(cursor)')"
   grep -qx -- '--boot' "$SD/journalctl.argv" || fail "a first run (no cursor) does not start from this boot"
 
-  # The match set: the four slot tools, root only, and nothing else.
+  # The match set: the four slot tools AND root, OR what PID 1 says (_PID=1), OR
+  # what logind and dbus say about themselves -- trusted fields only, no unit's
+  # own output (ci-runner@ carries job output).
   local want got
   want=$(printf '%s\n' _UID=0 SYSLOG_IDENTIFIER=ci-pin-hold SYSLOG_IDENTIFIER=ci-pin-sweep \
-    SYSLOG_IDENTIFIER=ci-slot-reset SYSLOG_IDENTIFIER=ci-slot-sweep | LC_ALL=C sort)
+    SYSLOG_IDENTIFIER=ci-slot-reset SYSLOG_IDENTIFIER=ci-slot-sweep + + _PID=1 \
+    _SYSTEMD_UNIT=dbus.service _SYSTEMD_UNIT=systemd-logind.service | LC_ALL=C sort)
   got=$(grep -v -- '^--' "$SD/journalctl.argv" | LC_ALL=C sort)
-  [ "$got" = "$want" ] || fail "journalctl matches are not exactly the four slot-tool identifiers AND _UID=0: $(printf '%s' "$got" | tr '\n' ' ')"
+  [ "$got" = "$want" ] || fail "journalctl matches are not exactly the slot-tool identifiers AND _UID=0, OR _PID=1, OR logind/dbus: $(printf '%s' "$got" | tr '\n' ' ')"
   grep -qx -- '--output=json' "$SD/journalctl.argv" || fail "journalctl is not asked for JSON"
 
   [ "$(jq -r .logName "$p")" = projects/proj-x/logs/ci-slot-lifecycle ] || fail "logName is $(jq -r .logName "$p")"
@@ -297,6 +300,53 @@ run_suite() {
   [ "$(jq '.entries | length' "$SD/post.$(posts).json")" = 40 ] || fail "a batch over 64 KiB was not shipped whole"
   [ "$(cursor)" = c139 ] || fail "a batch over 64 KiB did not move the cursor to its end"
 
+  # 11. The host-unit class (#1480): what PID 1 says about the watched units,
+  # and logind/dbus, and nothing a job can write.
+  : >"$SD/journal.jsonl"
+  rm -f "$st/cursor"
+  sysd() { # <cursor> <unit-field-or-empty> <message> [<extra json members>]
+    printf '{"__CURSOR":"%s","__REALTIME_TIMESTAMP":"1790000000123456","__MONOTONIC_TIMESTAMP":"%s","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"1","_SYSTEMD_UNIT":"init.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"%s","MESSAGE":"%s"%s}\n' \
+      "$1" "${1#c}000" "$2" "$3" "${4:-}"
+  }
+  sysd c20 ci-runner@3.service 'Stopping ci-runner@3.service - Runner slot 3...' ',"JOB_TYPE":"stop"' >"$SD/journal.jsonl"
+  # shellcheck disable=SC2129
+  sysd c21 user@1001.service 'user@1001.service: Deactivated successfully.' >>"$SD/journal.jsonl"
+  sysd c22 google-guest-agent.service 'Stopped google-guest-agent.service - Google Compute Engine Guest Agent.' ',"JOB_TYPE":"stop","JOB_RESULT":"done"' >>"$SD/journal.jsonl"
+  sysd c23 ci-dockerd@3.service 'ci-dockerd@3.service: Main process exited, code=killed, status=15/TERM' >>"$SD/journal.jsonl"
+  sysd c24 '' "Reloading requested from client PID 812 ('systemctl') (unit session-3.scope)..." >>"$SD/journal.jsonl"
+  sysd c25 '' 'Requested transaction contradicts existing jobs: Transaction for ci-runner@3.service/start is destructive' >>"$SD/journal.jsonl"
+  # Not about a watched unit: PID 1's ordinary chatter, never shipped.
+  sysd c26 apt-daily.service 'Starting apt-daily.service - Daily apt download activities...' >>"$SD/journal.jsonl"
+  sysd c27 session-5.scope 'Started session-5.scope - Session 5 of User ci.' >>"$SD/journal.jsonl"
+  # logind and dbus speak for themselves.
+  printf '{"__CURSOR":"c28","__MONOTONIC_TIMESTAMP":"28000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"640","_SYSTEMD_UNIT":"systemd-logind.service","SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 5."}\n' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c29","__MONOTONIC_TIMESTAMP":"29000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"102","_PID":"610","_SYSTEMD_UNIT":"dbus.service","SYSLOG_IDENTIFIER":"dbus-daemon","MESSAGE":"[system] Successfully activated service org.freedesktop.systemd1"}\n' >>"$SD/journal.jsonl"
+  # A unit's own output is job output; a non-PID-1 line cannot pass as systemd.
+  printf '{"__CURSOR":"c30","__MONOTONIC_TIMESTAMP":"30000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4000","_SYSTEMD_UNIT":"ci-runner@3.service","SYSLOG_IDENTIFIER":"Runner.Worker","MESSAGE":"echo SECRET-JOB-OUTPUT"}\n' >>"$SD/journal.jsonl"
+  printf '{"__CURSOR":"c31","__MONOTONIC_TIMESTAMP":"31000","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"1001","_PID":"4001","_SYSTEMD_UNIT":"session-9.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"ci-runner@3.service","MESSAGE":"Stopping ci-runner@3.service forged"}\n' >>"$SD/journal.jsonl"
+  last=$(posts)
+  ship
+  [ "$(posts)" -eq $((last + 1)) ] || fail "a batch with host-unit lines did not make one write"
+  p="$SD/post.$(posts).json"
+  [ "$(jq -r '[.entries[].jsonPayload.message | .[0:12]] | join("|")' "$p")" = 'Stopping ci-|user@1001.se|Stopped goog|ci-dockerd@3|Reloading re|Requested tr|Removed sess|[system] Suc' ] ||
+    fail "the shipped host-unit lines are not exactly the watched ones, in order: $(jq -c '[.entries[].jsonPayload.message | .[0:12]]' "$p")"
+  [ "$(jq -r '[.entries[].logName] | unique | join(",")' "$p")" = projects/proj-x/logs/ci-host-units ] ||
+    fail "host-unit lines are not in their own log"
+  [ "$(jq -c '.entries[0].jsonPayload | {UNIT, JOB_TYPE, source}' "$p")" = '{"UNIT":"ci-runner@3.service","JOB_TYPE":"stop","source":"systemd"}' ] ||
+    fail "the unit and job fields of a PID-1 line did not ship: $(jq -c '.entries[0].jsonPayload' "$p")"
+  [ "$(jq -r '.entries[2].jsonPayload.JOB_RESULT' "$p")" = "done" ] || fail "JOB_RESULT did not ship"
+  ! grep -q SECRET-JOB-OUTPUT "$p" || fail "a unit's own output reached the log"
+  ! grep -q forged "$p" || fail "a line that is not from PID 1 passed as systemd's"
+  [ "$(cursor)" = c31 ] || fail "the cursor did not move past the filtered lines (got '$(cursor)')"
+
+  # Only chatter in a batch: no write, but the cursor still moves.
+  last=$(posts)
+  sysd c32 apt-daily.service 'Finished apt-daily.service.' >>"$SD/journal.jsonl"
+  sysd c33 session-6.scope 'Started session-6.scope.' >>"$SD/journal.jsonl"
+  ship
+  [ "$(posts)" -eq "$last" ] || fail "a batch with nothing to ship still wrote"
+  [ "$(cursor)" = c33 ] || fail "a batch of only filtered lines left the cursor behind -- the same lines would be read forever (got '$(cursor)')"
+
   cat "$f"
 }
 
@@ -332,11 +382,16 @@ mutate "a backlog is shipped from its end"   's/"--lines=+\$MAX"/"--lines=$MAX"/
 mutate "the cursor goes on any failure"      's/if \[ -n "\$cursor" \] && grep -q .Failed to seek to cursor. "\$errf" 2>\/dev\/null; then/if [ -n "$cursor" ]; then/'
 mutate "a refused cursor is kept"            's/^      rm -f "\$cursor_file"$/      :/'
 mutate "a timed-out read is discarded"       's/-- shipping the complete entries it wrote" ;;/-- retrying"; exit 0 ;;/'
-mutate "one bad line fails the whole batch"  's/\[inputs | fromjson? | select(type == "object")\] | map(/[inputs | fromjson] | map(/'
+mutate "one bad line fails the whole batch"  's/\[inputs | fromjson? | select(type == "object") | select(kind)\] | map(/[inputs | fromjson] | map(/'
 mutate "control characters pass through"     's/map(if \. < 32 or \. == 127 then 32 else \. end)/map(.)/'
 mutate "messages are not cut"                's/| implode | \.\[0:\$n\];/| implode;/'
 mutate "the token goes in argv"              's/-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")/-H "Authorization: Bearer $token"/'
 mutate "no insertId"                         '/^      insertId: /d'
+mutate "any PID is taken for systemd"         's/elif \$pid == "1" then/elif true then/'
+mutate "every PID-1 line is shipped"         's/ or (\$m | test(\$mgr))) then "systemd" else empty end/ or true) then "systemd" else empty end/'
+mutate "a unit's own output is shipped"      's/matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)/matches+=(+ _PID=1 + _SYSTEMD_UNIT=ci-runner@3.service)/'
+mutate "filtered-only batches never advance" 's/^if \[ "\${n:-0}" = 0 \]; then advance; /if [ "${n:-0}" = 0 ]; then /'
+mutate "host-unit lines share the lifecycle log" 's/else {logName: \$ulg} end/else {} end/'
 mutate "a first run skips the boot"          's/else opts+=(--boot); fi/fi/'
 
 printf 'log-shipper behaviour: %d passed, %d failed\n' "$PASS" "$FAIL"
