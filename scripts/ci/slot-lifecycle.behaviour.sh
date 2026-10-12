@@ -112,6 +112,10 @@ SLOT_ROOT="$SB/slots"
 SLOT_STATE="$SB/state"
 SLOT_TEMPLATE="$SB/template"
 PIN_DIR="$SLOT_STATE/.pin"
+# Read by the pin-hold here-document (`SLOTS=$SLOTS`), through the eval in
+# expand_into that no static reader sees -- hence the directive, not a removal.
+# shellcheck disable=SC2034
+SLOTS=$IDX
 
 # The tool cache the reset hook REPORTS on. Bound here for the same reason
 # SLOT_USER_PREFIX is bound further down: host-startup.sh bakes these three into
@@ -959,8 +963,10 @@ seed_units
 check "the job's service is running before the reset" unit_live probe-1395.service
 check "the job's timer is armed before the reset"     unit_live probe-1395t.timer
 
-# HELD first: a slot a live run holds keeps everything, exactly as before.
-printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=0\nboot=%s\n' "$IDX" \
+# HELD first: a slot a live run's hold RESERVES keeps everything, exactly as
+# before. reserve=1, because only a reserving hold spares a slot (#1481, H-1);
+# the reserve=0 case is asserted above, where its stragglers must die.
+printf 'run=4242\nslot=%s\nttl=600\nexpiry=%s\nreserve=1\nboot=%s\n' "$IDX" \
   "$(( $(date +%s) + 600 ))" "$(cat /proc/sys/kernel/random/boot_id)" >"$PIN_DIR/host"
 reset_once "$RESET"
 settle
