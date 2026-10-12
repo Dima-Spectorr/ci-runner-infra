@@ -1534,6 +1534,11 @@ has_log_shipper() { # <file>
   # Root only: _UID is stamped by journald from the socket's credentials, so a
   # job cannot forge a line the alert counts.
   matches "$code" '^matches\+=\(_UID=0\)$' || return 1
+  # And the host-unit class (#1480): what PID 1 says (_PID=1) and what logind and
+  # dbus say about themselves -- trusted fields only, never a unit's own output
+  # (ci-runner@ and ci-dockerd@ carry job output), and its own log.
+  matches "$code" '^matches\+=\(\+ _PID=1 \+ _SYSTEMD_UNIT=systemd-logind\.service _SYSTEMD_UNIT=dbus\.service\)$' || return 1
+  matches "$code" '^UNIT_LOG_ID=ci-host-units$' || return 1
   # The journal is read through the match set and nothing else, oldest first,
   # into a FILE: a service starts with SIGPIPE ignored, so a `| head` reader
   # that stops early leaves journalctl failing or running into the deadline.
@@ -2267,6 +2272,8 @@ mutate "the whole journal is read"           's@ "\${matches\[\@\]}" >"\$batch"@
 mutate "journalctl piped into head again"    's@ "\${matches\[\@\]}" >"\$batch" 2>"\$errf"$@ "${matches[\@]}" 2>"$errf" | head -n "$MAX" >"$batch"@' has_log_shipper
 mutate "SIGPIPE left ignored in the unit"    's@^IgnoreSIGPIPE=no$@@'                                                  has_log_shipper
 mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
+mutate "a unit's own output is shipped"      's@^matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)$@matches+=(+ _PID=1 + _SYSTEMD_UNIT=ci-runner@3.service)@' has_log_shipper
+mutate "host-unit lines fall into the lifecycle log" 's@^UNIT_LOG_ID=ci-host-units$@UNIT_LOG_ID=ci-slot-lifecycle@'                   has_log_shipper
 mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-loop @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
 mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper
 mutate "a renamed slot tool is not followed" 's@logger -t ci-pin-sweep@logger -t ci-pin-reaper@'                     has_log_shipper
