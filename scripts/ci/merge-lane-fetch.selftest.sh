@@ -71,23 +71,27 @@ mkdir "$WORK/bin" "$WORK/fix"
 #
 # Anything that is not a plain read — a method, a field, a body — is refused
 # with a status of its own and written to the log as a WRITE, so a write that
-# reached the network from a fetch job cannot hide among the reads.
+# reached the network from a fetch job cannot hide among the reads. The one
+# exception is `api graphql`, whose query and variables travel as `-f`/`-F`
+# fields: it is answered from the fixture `graphql`, one JSON document a page,
+# and its header block names the graphql bucket.
 # ---------------------------------------------------------------------------
 cat >"$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -u
 [ "${1:-}" = api ] || exit 2
 shift
-url='' prog='' include=''
+url='' prog='' include='' paginate=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) prog="$2"; shift 2 ;;
-    --paginate) shift ;;
+    --paginate) paginate=1; shift ;;
     # `-i`: the answer's header block first, in `gh`'s own shape — a status line,
     # CR LF header lines, a lone CR LF. The window it reports is set by the case
     # (GH_STUB_REMAINING / _RESET / _RESOURCE); GH_STUB_NO_HEADERS answers with
     # none, the way an API that is not answering at all would.
     -i) include=1; shift ;;
+    -f | -F) if [ "$url" = graphql ] && [ $# -ge 2 ]; then shift 2; continue; fi ;;&
     # A write is logged and refused. With GH_STUB_RATE_LIMIT_WRITES it is
     # refused the way a drained installation quota refuses it, to show the
     # retry does not repeat it.
@@ -115,7 +119,7 @@ esac
 if [ -n "$include" ] && [ -z "${GH_STUB_NO_HEADERS:-}" ]; then
   printf 'HTTP/2.0 200 OK\n'
   printf 'X-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: %s\r\nX-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: %s\r\nX-Ratelimit-Used: 10\r\n\r\n' \
-    "${GH_STUB_REMAINING:-4990}" "${GH_STUB_QUOTA_RESET:-1900000000}" "${GH_STUB_RESOURCE:-core}"
+    "${GH_STUB_REMAINING:-4990}" "${GH_STUB_QUOTA_RESET:-1900000000}" "${GH_STUB_RESOURCE:-$([ "$url" = graphql ] && echo graphql || echo core)}"
 fi
 printf '%s\n' "$url" >>"$GH_STUB_LOG"
 # The one read that moves the clock, for the pass that runs out of time: see
@@ -150,6 +154,11 @@ printf . >>"$GH_STUB_STATE/$key"
 seen="$(cat "$GH_STUB_STATE/$key")"
 file="$GH_STUB_FIXTURES/$key.${#seen}"
 [ -e "$file" ] || file="$GH_STUB_FIXTURES/$key"
+# A GraphQL fixture holds one page a line; without `--paginate`, gh reads one.
+if [ "$url" = graphql ] && [ -z "$paginate" ] && [ -e "$file" ]; then
+  head -n 1 "$file" >"$GH_STUB_STATE/graphql.first-page"
+  file="$GH_STUB_STATE/graphql.first-page"
+fi
 if [ ! -e "$file" ]; then
   printf '{"message":"Not Found","status":"404"}\n'
   printf 'gh: Not Found (HTTP 404)\n' >&2
@@ -583,12 +592,17 @@ build_fixtures() {
       2) labels='[]' ;;
       10) labels='[{"name":"queue"},{"name":"merge-lane/priority-5"}]' ;;
     esac
-    list="$list${list:+,}{\"number\":$n,\"head\":{\"sha\":\"$(sha_of "$n")\"},\"draft\":$draft,\"labels\":$labels,\"title\":\"change $n\",\"user\":{\"login\":\"someone\"}}"
+    # A GraphQL page holds ten; mergeability is UNKNOWN and no commit node is
+    # given, so the snapshot answers for nothing but the list and every head is
+    # read from the REST fixtures below, as the cases here were written.
+    [ "$n" -ne 11 ] || list="$list]}}}}"$'\n''{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":['
+    [ "$n" -eq 1 ] || [ "$n" -eq 11 ] || list="$list,"
+    list="$list{\"number\":$n,\"headRefOid\":\"$(sha_of "$n")\",\"isDraft\":$draft,\"labels\":{\"nodes\":$labels},\"title\":\"change $n\",\"mergeable\":\"UNKNOWN\",\"author\":{\"__typename\":\"User\",\"login\":\"someone\"},\"commits\":{\"nodes\":[]}}"
     fx_checks "$(sha_of "$n")" completed '"success"'
     fx_detail "$n" true "$labels"
     fx "repos/$REPO/compare/main...$(sha_of "$n")" '{"behind_by":0}'
   done
-  fx "repos/$REPO/pulls" "[$list]"
+  fx graphql '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true},"nodes":['"$list"']}}}}'
   # 3, 11: settled red. 7: still running. 14: reports nothing at all.
   fx_checks "$(sha_of 3)" completed '"failure"'
   fx_checks "$(sha_of 11)" completed '"failure"'
@@ -913,12 +927,129 @@ cases_quota() { # <fetch-file>
     say quota-noted-from-a-refusal $?
 
     GH_STUB_RESOURCE=graphql lane_gh_retry api ok/q2 >/dev/null
+    GH_STUB_RESOURCE=search lane_gh_retry api ok/q4 >/dev/null
     GH_STUB_NO_HEADERS=1 lane_gh_retry api ok/q3 >/dev/null
     [ "$(cat "$d/quota" 2>/dev/null)" = '5000 0 10 1900000123' ]
     say quota-kept-over-another-bucket-and-a-bare-answer $?
+    # The open list is read from the graphql bucket (#1541): its window is kept
+    # apart, for the guard to hold on.
+    [ "$(cat "$d/quota.graphql" 2>/dev/null)" = '5000 4990 10 1900000000' ]
+    say quota-graphql-noted-apart $?
 
     [ "$(grep -c '^RATE_LIMIT' "$GH_STUB_LOG")" -eq 0 ]
     say quota-never-asks-rate-limit $?
+  )
+}
+
+# ---------------------------------------------------------------------------
+# THE OPEN LIST IS ONE GRAPHQL READ A PAGE (#1541), AND IT ANSWERS THE WALK.
+#
+# Two pages of the shape GitHub answers the query with, the second reached by
+# `--paginate`: one pull request whose head is fully known, and around it every
+# shape the snapshot must NOT answer for — a null rollup, a suite list cut at a
+# page edge, a head that moved, mergeability not computed yet. The fixture
+# pages are what `gh api graphql --paginate` prints before `--jq`: one JSON
+# document a page, which the stand-in passes through the caller's program.
+# ---------------------------------------------------------------------------
+snap_node() { # <number> <sha> <mergeable> <author-json> <commits-json>
+  printf '{"number":%s,"isDraft":false,"title":"change %s\\r\\nmore","headRefOid":"%s","mergeable":"%s","author":%s,"labels":{"nodes":[{"name":"queue"}]},"commits":{"nodes":%s}}' \
+    "$1" "$1" "$2" "$3" "$4" "$5"
+}
+snap_suite() { # <id> <app-json> <workflow-run-json> <more-runs> <runs-json>
+  printf '{"databaseId":%s,"status":"COMPLETED","conclusion":"SUCCESS","createdAt":"2026-01-02T00:00:00Z","app":%s,"workflowRun":%s,"checkRuns":{"pageInfo":{"hasNextPage":%s},"nodes":%s}}' \
+    "$1" "$2" "$3" "$4" "$5"
+}
+build_snap_fixture() { # <dir>
+  local a b c d e f run hidden s1 s2 s3
+  a="$(sha_of 21)" b="$(sha_of 22)" c="$(sha_of 23)" d="$(sha_of 24)" e="$(sha_of 25)" f="$(sha_of 26)"
+  run='[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02T00:00:00Z","completedAt":"2026-01-02T00:01:00Z"}]'
+  s1="$(snap_suite 101 '{"slug":"github-actions","databaseId":15368}' '{"event":"pull_request","workflow":{"databaseId":9}}' false "$run")"
+  hidden="$(snap_suite 102 null null false '[]')"
+  s2="$(snap_suite 103 '{"slug":"github-actions","databaseId":15368}' null true "$run")"
+  s3="$(snap_suite 104 '{"slug":"github-actions","databaseId":15368}' null false "$run")"
+  {
+    printf '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"x"},"nodes":['
+    # 21: fully known. A hidden app beside the visible one; an EXPECTED status.
+    snap_node 21 "$a" MERGEABLE '{"__typename":"User","login":"someone"}' \
+      "[{\"commit\":{\"oid\":\"$a\",\"status\":{\"contexts\":[{\"context\":\"legacy\",\"state\":\"EXPECTED\",\"createdAt\":\"2026-01-02T00:00:00Z\"}]},\"checkSuites\":{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$s1,$hidden]}}}]"
+    printf ','
+    # 22: a null rollup — no status, no suite — written as the empty answer it is.
+    snap_node 22 "$b" CONFLICTING '{"__typename":"Bot","login":"pin-bot"}' \
+      "[{\"commit\":{\"oid\":\"$b\",\"status\":null,\"checkSuites\":{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[]}}}]"
+    printf ']}}}}\n'
+    printf '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":['
+    # 23: a suite cut at a page edge of its runs. 24: the head moved.
+    snap_node 23 "$c" UNKNOWN null \
+      "[{\"commit\":{\"oid\":\"$c\",\"status\":null,\"checkSuites\":{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$s2]}}}]"
+    printf ','
+    snap_node 24 "$d" UNKNOWN '{"__typename":"User","login":"x"}' \
+      "[{\"commit\":{\"oid\":\"$(sha_of 240)\",\"status\":null,\"checkSuites\":{\"pageInfo\":{\"hasNextPage\":false},\"nodes\":[$s3]}}}]"
+    printf ','
+    # 25: no commit node at all. 26: more suites than one page holds.
+    snap_node 25 "$e" UNKNOWN '{"__typename":"User","login":"x"}' '[]'
+    printf ','
+    snap_node 26 "$f" UNKNOWN '{"__typename":"User","login":"x"}' \
+      "[{\"commit\":{\"oid\":\"$f\",\"status\":null,\"checkSuites\":{\"pageInfo\":{\"hasNextPage\":true},\"nodes\":[$s3]}}}]"
+    printf ']}}}}\n'
+  } >"$1/graphql"
+}
+
+# SC2034: the LANE_* globals and R are read by the sourced fetch file.
+# shellcheck disable=SC2034
+cases_snap() { # <fetch-file>
+  (
+    # shellcheck source=/dev/null
+    source "$1"
+    d="$(mktemp -d "$WORK/snap.XXXXXX")"
+    mkdir "$d/fix" "$d/snap"
+    build_snap_fixture "$d/fix"
+    LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota" R="$REPO" LANE_BASE=main
+    unset GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
+    : >"$GH_STUB_LOG"
+    a="$(sha_of 21)" b="$(sha_of 22)"
+    has() { [ -e "$d/snap/$(lane_snap_key "repos/$REPO/$1")" ]; }
+
+    fields="$(GH_STUB_FIXTURES="$d/fix" lane_snapshot "$d/snap")"
+    rc=$?
+    [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$fields" | wc -l | tr -d ' ')" -eq 36 ] \
+      && [ "$(printf '%s\n' "$fields" | sed -n '1p;7p;13p;19p;25p;31p' | tr '\n' ' ')" = '21 22 23 24 25 26 ' ] \
+      && [ "$(grep -cx graphql "$GH_STUB_LOG")" -eq 1 ] && [ "$(wc -l <"$GH_STUB_LOG" | tr -d ' ')" -eq 1 ]
+    say snap-reads-every-page-in-one-call $?
+
+    [ "$(printf '%s\n' "$fields" | sed -n '2,6p' | tr '\n' '|')" = "$a|false|queue|change 21  more|someone|" ]
+    say snap-list-fields-in-rest-order $?
+
+    [ "$(printf '%s\n' "$fields" | sed -n '12p')" = 'pin-bot[bot]' ] && [ -z "$(printf '%s\n' "$fields" | sed -n '18p')" ]
+    say snap-bot-login-in-rest-form $?
+
+    LANE_SNAP="$d/snap"
+    [ "$(lane_snap_serve api --paginate "repos/$REPO/commits/$a/check-runs?per_page=100" --jq '.check_runs[] | .name + " " + .status + " " + .conclusion + " " + .app.slug')" = 'ci completed success github-actions' ] \
+      && [ "$(lane_snap_serve api --paginate "repos/$REPO/commits/$a/check-suites?per_page=100" --jq '[.check_suites[].app.slug] | join(",")')" = 'github-actions,app-102' ] \
+      && [ "$(lane_snap_serve api --paginate "repos/$REPO/actions/runs?head_sha=$a&per_page=100" --jq '.workflow_runs[] | "\(.check_suite_id) \(.workflow_id) \(.event)"')" = '101 9 pull_request' ] \
+      && [ "$(lane_snap_serve api --paginate "repos/$REPO/commits/$a/status?per_page=100" --jq '.statuses[] | .context + " " + .state')" = 'legacy pending' ] \
+      && [ "$(lane_snap_serve api "repos/$REPO/pulls/21" --jq '(.mergeable|tostring), (.labels|map(.name)|join(",")), .head.sha')" = "$(printf 'true\nqueue\n%s' "$a")" ] \
+      && [ "$(wc -l <"$GH_STUB_LOG" | tr -d ' ')" -eq 1 ]
+    say snap-serves-the-rest-bodies-without-a-call $?
+
+    [ "$(lane_snap_serve api "repos/$REPO/pulls/22" --jq '.mergeable|tostring')" = false ] \
+      && [ "$(lane_snap_serve api --paginate "repos/$REPO/commits/$b/check-runs?per_page=100" --jq '.check_runs | length')" = 0 ] \
+      && [ "$(lane_snap_serve api --paginate "repos/$REPO/commits/$b/status?per_page=100" --jq '.statuses | length')" = 0 ]
+    say snap-null-rollup-is-the-empty-answer $?
+
+    ! has "commits/$(sha_of 23)/check-runs?per_page=100" && ! has "commits/$(sha_of 26)/check-suites?per_page=100" \
+      && ! has "commits/$(sha_of 24)/check-runs?per_page=100" && ! has "commits/$(sha_of 25)/check-runs?per_page=100"
+    say snap-cut-moved-or-missing-head-is-read-live $?
+
+    ! has pulls/23 && ! has pulls/24 && has pulls/21 && has pulls/22
+    say snap-unknown-mergeability-is-read-live $?
+
+    ! lane_snap_serve api --method=PUT "repos/$REPO/pulls/21" && ! lane_snap_serve api "repos/$REPO/pulls/99" \
+      && ! LANE_SNAP='' lane_snap_serve api "repos/$REPO/pulls/21" && ! lane_snap_serve api "repos/$REPO/pulls/21" --jq '.nope | error'
+    say snap-serves-nothing-else $?
+
+    ! lane_gh_mutates api graphql --paginate -F owner=o -f query=q --jq . \
+      && lane_gh_mutates api "repos/$REPO/issues/1/comments" -f body=x && lane_gh_mutates api graphql -X POST -f query=q
+    say snap-graphql-read-is-not-a-write $?
   )
 }
 
@@ -966,12 +1097,37 @@ tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 tally_lines "$(cases_retry "$FETCH" 2>&1)" 12 retry
-tally_lines "$(cases_quota "$FETCH" 2>&1)" 5 quota
+tally_lines "$(cases_quota "$FETCH" 2>&1)" 6 quota
+tally_lines "$(cases_snap "$FETCH" 2>&1)" 9 snap
 
 mutant "the header block reaches the caller" cases_quota "$FETCH"   's|^    inh { if ([$]0 == "[\]r" [|][|] [$]0 == "") { inh = 0 } else { print > hdr }; next }$|    inh { print; if (length($0) < 2) inh = 0; next }|' quota-headers-never-reach-the-caller
 mutant "a call goes out without its headers" cases_quota "$FETCH"   's|command gh api -i "\${@:2}"|command gh api "${@:2}"|' quota-noted-from-the-answer
 mutant "a refusal's headers are dropped" cases_quota "$FETCH"   's|^  lane_quota_note "\$d/hdr"$|  [ "$rc" -ne 0 ] \|\| lane_quota_note "$d/hdr"|' quota-noted-from-a-refusal
-mutant "another bucket's window is taken for the REST quota" cases_quota "$FETCH"   "s/^  case \"\\\$res\" in core | '?') ;; \\*) return 0 ;; esac\$/  :/" quota-kept-over-another-bucket-and-a-bare-answer
+mutant "another bucket's window is taken for the REST quota" cases_quota "$FETCH"   's|^    graphql) file="\$LANE_QUOTA.graphql" ;;$|    graphql) file="$LANE_QUOTA" ;;|' quota-kept-over-another-bucket-and-a-bare-answer
+mutant "the graphql window is dropped" cases_quota "$FETCH"   's|^    graphql) file="\$LANE_QUOTA.graphql" ;;$|    graphql) return 0 ;;|' quota-graphql-noted-apart
+
+mutant "the list reads one page" cases_snap "$FETCH" \
+  's|^  gh api graphql --paginate |  gh api graphql |' snap-reads-every-page-in-one-call
+mutant "a Bot author keeps the GraphQL form" cases_snap "$FETCH" \
+  's|then .author.login + "\[bot\]" else|then .author.login else|' snap-bot-login-in-rest-form
+mutant "a hidden app is keyed by nothing" cases_snap "$FETCH" \
+  's|(.app.slug // "app-\\(.databaseId)")|.app.slug|' snap-serves-the-rest-bodies-without-a-call
+mutant "an EXPECTED status is passed through" cases_snap "$FETCH" \
+  's|if .state == "EXPECTED" then "pending" else (.state \| low) end|.state \| low|' snap-serves-the-rest-bodies-without-a-call
+mutant "a null rollup is not written" cases_snap "$FETCH" \
+  's|(\$c.checkSuites.nodes // \[\]) as \$s$|($c.checkSuites.nodes // empty) as $s \| select($s \| length > 0)|' snap-null-rollup-is-the-empty-answer
+mutant "a suite cut at a page edge is served" cases_snap "$FETCH" \
+  's|and (\[(\$c.checkSuites.nodes // \[\])\[\] \| .checkRuns.pageInfo.hasNextPage\] \| any \| not))|)|' snap-cut-moved-or-missing-head-is-read-live
+mutant "a moved head is served" cases_snap "$FETCH" \
+  's|select(\$c != null and \$c.oid == \$pr.headRefOid)|select($c != null)|' snap-cut-moved-or-missing-head-is-read-live
+mutant "an uncomputed mergeability is written" cases_snap "$FETCH" \
+  's#^    | (if \$m != null then$#    | (if true then#' snap-unknown-mergeability-is-read-live
+mutant "a write is answered from the snapshot" cases_snap "$FETCH" \
+  '/^lane_snap_serve() {$/,/^}$/s|^      -\*) return 1 ;;$|      -*) shift ;;|' snap-serves-nothing-else
+mutant "a failed program serves half an answer" cases_snap "$FETCH" \
+  's|^  out="\$(jq -rc "\$prog" "\$file" 2>/dev/null)" \|\| return 1$|  out="$(jq -rc "$prog" "$file" 2>/dev/null)"|' snap-serves-nothing-else
+mutant "a graphql read counts as a write" cases_snap "$FETCH" \
+  's|^  \[ "\${1:-}" = api \] \&\& \[ "\${2:-}" = graphql \] \&\& graphql=1$|  :|' snap-graphql-read-is-not-a-write
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
@@ -1031,7 +1187,7 @@ mutant "a recording with a read missing is accepted" cases_core "$FETCH" \
 mutant "a fetch job makes the write it is asked for" cases_core "$FETCH" \
   's|^  if lane_gh_mutates "\$@"; then$|  if false; then|' write-never-reaches-the-network
 mutant "a body field is not recognised as a write" cases_core "$FETCH" \
-  's/ | -f | -F | / | /' write-never-reaches-the-network
+  's/) \[ -n "\$graphql" \] || return 0 ;;$/) ;;/' write-never-reaches-the-network
 mutant "a refused write is written down as a read" cases_core "$FETCH" \
   '/^  if lane_gh_mutates "\$@"; then$/a\    printf . >>"$LANE_RECORD/seq"; : >"$LANE_RECORD/1.args"' write-never-recorded
 mutant "a head whose walk asked for a write is replayed all the same" cases_core "$FETCH" \
