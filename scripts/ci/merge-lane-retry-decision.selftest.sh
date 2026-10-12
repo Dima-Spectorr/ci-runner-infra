@@ -164,8 +164,8 @@ if command -v jq >/dev/null 2>&1; then
     "$(pr 7 false master DIRTY)" \
     "$(pr 8 false master UNKNOWN)" \
     "$(pr 9 false master BEHIND)")
-  facts_is "readable=1;default=master;open=9;ready=3" \
-    "ready counts clean, unstable and has-hooks on the default branch only" \
+  facts_is "readable=1;default=master;open=9;ready=4" \
+    "ready counts clean, unstable, has-hooks and behind on the default branch only" \
     "$(printf '%s' "$PRS" | lane_retry_pr_facts)"
   facts_is "readable=1;default=main;open=1;ready=0" "a lone draft is not ready" \
     "$(repo_json main "$(pr 4 true main CLEAN)" | lane_retry_pr_facts)"
@@ -175,6 +175,13 @@ if command -v jq >/dev/null 2>&1; then
     "$(repo_json main "$(pr 6 false main BLOCKED)" | lane_retry_pr_facts)"
   facts_is "readable=1;default=main;open=0;ready=0" "no open pull requests" \
     "$(repo_json main | lane_retry_pr_facts)"
+  facts_is "readable=1;default=main;open=1;ready=1" "a lone BEHIND pull request is ready (#1475)" \
+    "$(repo_json main "$(pr 9 false main BEHIND)" | lane_retry_pr_facts)"
+  # --paginate prints one document per page: all of them count (#1475).
+  facts_is "readable=1;default=main;open=1;ready=2" "ready is counted across every page, not the first" \
+    "$({ repo_json main "$(pr 1 false main BLOCKED)"; repo_json main "$(pr 2 false main CLEAN)" "$(pr 3 false main BEHIND)"; } | lane_retry_pr_facts)"
+  facts_is "readable=0" "one unreadable page makes the whole answer unreadable" \
+    "$({ repo_json main "$(pr 1 false main CLEAN)"; printf '{"data":{"repository":null},"errors":[{"message":"x"}]}'; } | lane_retry_pr_facts)"
   facts_is "readable=0" "an empty answer is unreadable, not zero ready" "$(printf '' | lane_retry_pr_facts)"
   facts_is "readable=0" "a GraphQL error with a null repository" \
     "$(printf '{"data":{"repository":null},"errors":[{"message":"x"}]}' | lane_retry_pr_facts)"
@@ -344,7 +351,7 @@ if command -v jq >/dev/null 2>&1; then
     's/select\(\.baseRefName == \$d\)/select(true)/' \
     "readable=1;default=main;open=1;ready=0" 'printf "%s" "$ONE_OFFBASE" | lane_retry_pr_facts'
   mutant "every merge state counts as ready" \
-    's/select\(\.mergeStateStatus \| IN\("CLEAN", "UNSTABLE", "HAS_HOOKS"\)\)/select(true)/' \
+    's/select\(\.mergeStateStatus \| IN\("CLEAN", "UNSTABLE", "HAS_HOOKS", "BEHIND"\)\)/select(true)/' \
     "readable=1;default=main;open=1;ready=0" 'printf "%s" "$ONE_BLOCKED" | lane_retry_pr_facts'
   mutant "a disabled workflow reads as active" \
     's/elif \$s == "active" then "1" else "disabled" end/else "1" end/' \
@@ -364,6 +371,15 @@ if command -v jq >/dev/null 2>&1; then
   mutant "a queued corpse holds the retry forever" \
     's/select\(\(\$now - \.created\) < \$inflight_max\)/select(true)/' \
     "inflight=0;last_success_age=;retries=0" 'printf "%s" "$CORPSE" | lane_retry_run_facts "$NOW" "$BOT" 21600 1800'
+fi
+
+# The driver must ask for every page (#1475): the facts function can count all of
+# them, but only `--paginate` and the cursor make GitHub send them.
+RETRY_SH="$HERE/merge-lane-retry.sh"
+if grep -q 'gh api graphql --paginate' "$RETRY_SH" \
+  && grep -q 'after:\$endCursor' "$RETRY_SH" \
+  && grep -q 'pageInfo{hasNextPage endCursor}' "$RETRY_SH"; then ok
+else bad "the retry driver reads one page of open pull requests (--paginate/cursor missing)"
 fi
 
 printf 'merge-lane-retry-decision: %d passed, %d failed\n' "$PASS" "$FAIL"

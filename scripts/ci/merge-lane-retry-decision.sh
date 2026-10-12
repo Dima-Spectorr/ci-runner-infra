@@ -211,24 +211,31 @@ lane_retry_verdict() {
 # would call FAILURE (DataRetrival merges with a non-required suite red). An
 # UNKNOWN state is not ready this tick; asking is what makes GitHub compute it,
 # so the next tick has the answer.
+# BEHIND is ready: on a strict base the lane's own action for it is `update`,
+# so a lost pass leaves exactly that state (#1475).
 lane_retry_pr_facts() {
   local out
-  out=$(jq -r '
-    .data.repository as $r
-    | if ($r | type) != "object" then "readable=0"
-      elif (($r.pullRequests.nodes | type) != "array") then "readable=0"
-      else
-        ($r.defaultBranchRef.name // "") as $d
-        | if $d == "" or ($d | test("[;= ]")) then "readable=0"
-          else
-            ([ $r.pullRequests.nodes[]
-               | select(.isDraft == false)
-               | select(.baseRefName == $d)
-               | select(.mergeStateStatus | IN("CLEAN", "UNSTABLE", "HAS_HOOKS"))
-             ] | length) as $ready
-            | "readable=1;default=\($d);open=\($r.pullRequests.totalCount // 0);ready=\($ready)"
-          end
-      end' 2>/dev/null) || out=""
+  # `-s`: `gh api graphql --paginate` prints one document per page, so the
+  # answer is the nodes of ALL of them, not the first hundred (#1475). Any page
+  # that is not a readable repository makes the whole answer unreadable - a
+  # half-read list would undercount ready and hold a retry that is owed.
+  out=$(jq -rs '
+    if length == 0 then "readable=0"
+    elif any(.[]; (.data.repository | type) != "object"
+                  or ((.data.repository.pullRequests.nodes | type) != "array")) then "readable=0"
+    else
+      .[0].data.repository as $r
+      | ($r.defaultBranchRef.name // "") as $d
+      | if $d == "" or ($d | test("[;= ]")) then "readable=0"
+        else
+          ([ .[].data.repository.pullRequests.nodes[]
+             | select(.isDraft == false)
+             | select(.baseRefName == $d)
+             | select(.mergeStateStatus | IN("CLEAN", "UNSTABLE", "HAS_HOOKS", "BEHIND"))
+           ] | length) as $ready
+          | "readable=1;default=\($d);open=\($r.pullRequests.totalCount // 0);ready=\($ready)"
+        end
+    end' 2>/dev/null) || out=""
   printf '%s\n' "${out:-readable=0}"
 }
 
