@@ -104,13 +104,10 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   rate_limit)
-    # Only the retry's wait asks `rate_limit` (core used + reset). The quota
-    # guard never does (#1543): anything else asking is refused, so a guard that
-    # went back to it would read nothing and the cases below would say so.
-    if [ "$prog" = '"\(.resources.core.used) \(.resources.core.reset)"' ]; then
-      echo "${GH_STUB_USED:-10} ${GH_STUB_RESET:-1}"
-      exit 0
-    fi
+    # Nothing in the lane asks `rate_limit` any more (#1543, #1548): the guard
+    # and the retry's wait both read the answers' own headers. A read here is
+    # logged and refused, so code that went back to it would read nothing and
+    # the cases below would say so.
     printf 'RATE_LIMIT %s\n' "$prog" >>"$GH_STUB_LOG"
     exit 3
     ;;
@@ -788,7 +785,7 @@ cases_retry() { # <fetch-file>
     source "$1"
     d="$(mktemp -d "$WORK/retry.XXXXXX")"
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY=''
-    unset LANE_STARTED PASS_BUDGET GH_STUB_RESET GH_STUB_USED
+    unset LANE_STARTED PASS_BUDGET GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
     # Every mutant runs this group again: each URL must be refused afresh.
     rm -f "$GH_STUB_STATE"/retry_*
     # Not `$d`: the retry has a local `d` of its own, and bash scoping is dynamic.
@@ -812,24 +809,41 @@ cases_retry() { # <fetch-file>
     # The clock is read again here: earlier cases take seconds on a slow shell.
     fresh
     now="$(date -u +%s)"
-    out="$(GH_STUB_RESET=$((now + 30)) lane_gh_retry api limit/a 2>"$d/err")"
+    # The wait is the reset the REFUSAL carried (#1548) — and `rate_limit` is
+    # never asked: the stub refuses it, and logs the attempt.
+    out="$(GH_STUB_REMAINING=0 GH_STUB_QUOTA_RESET=$((now + 30)) lane_gh_retry api limit/a 2>"$d/err")"
     rc=$?
     w="$(slept)"
-    [ "$rc" -eq 0 ] && [ "$out" = 'out:limit/a' ] && [ "${w:-0}" -ge 25 ] && [ "${w:-0}" -le 31 ]
+    [ "$rc" -eq 0 ] && [ "$out" = 'out:limit/a' ] && [ "${w:-0}" -ge 25 ] && [ "${w:-0}" -le 31 ] \
+      && [ "$(grep -c '^RATE_LIMIT' "$GH_STUB_LOG")" -eq 0 ]
     say retry-primary-waits-for-the-reset $?
 
     fresh
-    GH_STUB_RESET=$((now + 600)) lane_gh_retry api limit/b >/dev/null 2>"$d/err"
+    GH_STUB_REMAINING=0 GH_STUB_QUOTA_RESET=$((now + 600)) lane_gh_retry api limit/b >/dev/null 2>"$d/err"
     [ $? -ne 0 ] && [ -z "$(slept)" ] && [ "$(calls limit/b)" -eq 1 ] && grep -q 'not retried' "$d/err"
     say retry-not-past-the-cap $?
 
-    # A refusal while `rate_limit` reports a FRESH window (used=0, reset an hour
-    # out) did not come from that window: waiting for its reset would hold the
-    # pass an hour for a window already open. One more call after a minute.
+    # A refusal whose own window still has quota left (remaining=4990, reset an
+    # hour out) was not refused by that window: waiting for its reset would hold
+    # the pass an hour for a window already open. One more call after a minute.
     fresh
-    out="$(GH_STUB_USED=0 GH_STUB_RESET=$((now + 3600)) lane_gh_retry api limit/c 2>"$d/err")"
+    out="$(GH_STUB_QUOTA_RESET=$((now + 3600)) lane_gh_retry api limit/c 2>"$d/err")"
     [ $? -eq 0 ] && [ "$out" = 'out:limit/c' ] && [ "$(slept)" = 60 ] && [ "$(calls limit/c)" -eq 2 ]
-    say retry-a-fresh-window-after-a-minute $?
+    say retry-quota-left-after-a-minute $?
+
+    # A refusal with no header block says nothing about any window: a minute.
+    fresh
+    out="$(GH_STUB_NO_HEADERS=1 lane_gh_retry api limit/d 2>"$d/err")"
+    [ $? -eq 0 ] && [ "$out" = 'out:limit/d' ] && [ "$(slept)" = 60 ] && [ "$(calls limit/d)" -eq 2 ]
+    say retry-no-headers-after-a-minute $?
+
+    # The shape GitHub answers a drained installation with: `gh api -i` prints
+    # the status line, CR LF header lines, then the body. Exact to the second.
+    fresh
+    printf 'gh: API rate limit exceeded for installation ID 1. (HTTP 403)\n' >"$d/e403"
+    printf 'HTTP/2.0 403 Forbidden\r\nX-Github-Request-Id: AB12:3:4\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1900000045\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Used: 5000\r\n' >"$d/h403"
+    [ "$(lane_rate_limit_wait "$d/e403" "$d/h403" 1900000000)" = 46 ]
+    say retry-wait-from-a-crlf-refusal $?
 
     fresh
     lane_gh_retry api forbidden/a >/dev/null 2>"$d/err"
@@ -947,13 +961,13 @@ tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
 tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
-tally_lines "$(cases_retry "$FETCH" 2>&1)" 10 retry
+tally_lines "$(cases_retry "$FETCH" 2>&1)" 12 retry
 tally_lines "$(cases_quota "$FETCH" 2>&1)" 5 quota
 
 mutant "the header block reaches the caller" cases_quota "$FETCH"   's|^    inh { if ([$]0 == "[\]r" [|][|] [$]0 == "") { inh = 0 } else { print > hdr }; next }$|    inh { print; if (length($0) < 2) inh = 0; next }|' quota-headers-never-reach-the-caller
 mutant "a call goes out without its headers" cases_quota "$FETCH"   's|command gh api -i "\${@:2}"|command gh api "${@:2}"|' quota-noted-from-the-answer
 mutant "a refusal's headers are dropped" cases_quota "$FETCH"   's|^  lane_quota_note "\$d/hdr"$|  [ "$rc" -ne 0 ] \|\| lane_quota_note "$d/hdr"|' quota-noted-from-a-refusal
-mutant "another bucket's window is taken for the REST quota" cases_quota "$FETCH"   's/(res == "" || res == "core")/1/' quota-kept-over-another-bucket-and-a-bare-answer
+mutant "another bucket's window is taken for the REST quota" cases_quota "$FETCH"   "s/^  case \"\\\$res\" in core | '?') ;; \\*) return 0 ;; esac\$/  :/" quota-kept-over-another-bucket-and-a-bare-answer
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
@@ -961,7 +975,12 @@ mutant "a secondary limit is retried at once" cases_retry "$FETCH" \
   '/secondary rate limit/,/return 0/s|printf 60|printf 0|' retry-secondary-once-after-a-minute
 mutant "a primary limit ignores the reset" cases_retry "$FETCH" \
   's|^    printf .%s. "\$((reset - now + 1))"$|    printf 60|' retry-primary-waits-for-the-reset
-mutant "a fresh window is waited out to its reset" cases_retry "$FETCH"   's|^  if \[ "\${used:-}" = 0 \]; then$|  if false; then|' retry-a-fresh-window-after-a-minute
+mutant "a window with quota left is waited out to its reset" cases_retry "$FETCH" \
+  's|^  if \[ "\${remaining:-}" = 0 \] && |  if |' retry-quota-left-after-a-minute
+mutant "the retry's wait asks rate_limit again" cases_retry "$FETCH" \
+  's|^  w="\$(lane_hdr_window "\$hdr")"$|  w="$(command gh api rate_limit --jq .x 2>/dev/null)"|' retry-primary-waits-for-the-reset
+mutant "a CR is kept on a header value" cases_retry "$FETCH" \
+  "s|^  tr -d '\\\\r' <\"\\\$1\" [|] awk|  awk|; s|^    }'\$|    }' \"\$1\"|" retry-wait-from-a-crlf-refusal
 mutant "every 403 is retried" cases_retry "$FETCH" \
   "s|grep -q 'HTTP 403' \"\\\$err\" && grep -qi 'rate limit' \"\\\$err\"|grep -q 'HTTP 403' \"\$err\"|" retry-only-a-rate-limit
 mutant "a 429 is not retried" cases_retry "$FETCH" \

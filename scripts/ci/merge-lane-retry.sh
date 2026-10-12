@@ -13,9 +13,15 @@
 # repository (docs/merge-lane.md, "The App quota is shared"). This run draws on
 # it as little as it can:
 #
-#   * `rate_limit` is free, and is read first. Under the lane's own floor the
-#     run stops there: a pass dispatched now would skip, and nothing else is
-#     worth reading.
+#   * the quota is read from the `x-ratelimit-*` headers of this run's own
+#     newest REST answer, never from `GET /rate_limit` (#1548) — that endpoint
+#     said `used=0` while the same token's calls were refused (#1543). Before
+#     every REST spend the run asks it; under the lane's own floor the run
+#     stops there: a pass dispatched now would skip, and nothing else is worth
+#     reading. Before the first REST answer the window is unknown, and an
+#     unknown quota does not hold (the lane's own rule): that first read is
+#     the probe, and costs nothing a fleet with work waiting was not going to
+#     spend anyway.
 #   * the pull-request read is ONE GraphQL query per repository, which is
 #     charged to the `graphql` bucket — not the one the lanes are short of.
 #   * the REST reads (which lane files exist, their recent runs) are made only
@@ -35,6 +41,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/merge-lane-retry-decision.sh"
+# The lane's own header capture: `lane_gh_call` makes a `gh api -i` call and
+# writes the core window its answer carried to LANE_QUOTA.
+# shellcheck source=/dev/null
+source "$HERE/merge-lane-fetch.sh"
 
 OWNER="${FLEET_OWNER:-${GITHUB_REPOSITORY_OWNER:-}}"
 MANIFEST="${FLEET_MANIFEST:-$ROOT/fleet/repos.tsv}"
@@ -71,14 +81,39 @@ for tool in gh jq; do
 done
 
 CORE_CALLS=0
+RUN_TMP="$(mktemp -d)" || { echo "merge-lane-retry: no temporary directory" >&2; exit 2; }
+trap 'rm -rf "$RUN_TMP"' EXIT
+# The core window this run's newest REST answer carried. A file, because every
+# call runs in a `$(...)` subshell, where a variable would die.
+LANE_QUOTA="$RUN_TMP/quota"
 # api <path> — a GET that returns empty rather than dying; every parser reads
 # empty as unreadable, and the rule holds on unreadable. `</dev/null` is
 # load-bearing: `gh` reads standard input, and inside the manifest loop it
-# would eat the rest of the manifest.
+# would eat the rest of the manifest. The answer's quota headers are noted.
 #
 # The call is counted at each call site, not in here: every caller runs this in
 # a command substitution, and a counter bumped in a subshell stays 0.
-api() { gh api "$1" </dev/null 2>/dev/null; }
+api() {
+  local d
+  d="$(mktemp -d "$RUN_TMP/call.XXXXXX")" || return 0
+  lane_gh_call "$d" api "$1" </dev/null || true
+  cat "$d/out" 2>/dev/null
+  rm -rf "$d"
+}
+
+# quota_holds — exits the run, held, when this run's newest REST answer says
+# the shared quota is under the floor. Asked before every REST spend.
+quota_holds() {
+  local q remaining
+  q="$(cat "$LANE_QUOTA" 2>/dev/null)"
+  remaining="$(lane_retry_quota_remaining "$q" "$(date -u +%s)")"
+  lane_retry_quota_holds "$remaining" "$QUOTA_FLOOR" || return 0
+  echo "merge-lane-retry: merge App quota remaining=$remaining, from the newest REST answer's x-ratelimit headers"
+  echo "::warning::merge-lane-retry: HELD, not idle — the merge App's shared quota is at $remaining, under the lane's floor of $QUOTA_FLOOR. A pass dispatched now would skip, so nothing more was read and nothing was sent; the next tick asks again."
+  printf '\nmerge-lane-retry: %d dispatched, %d held for a person, %d failed; %d REST call(s) on the merge App quota\n' \
+    "$DISPATCHED" "$HELD" "$FAILS" "$CORE_CALLS"
+  exit 0
+}
 
 # One query, one repository: the default branch (read, never assumed — three
 # repositories in this fleet are not on `main`) and every open pull request's
@@ -90,13 +125,6 @@ PR_QUERY='query($owner:String!,$name:String!){repository(owner:$owner,name:$name
 mode="DRY RUN"
 [ "$ARMED" = true ] && mode="ARMED"
 echo "merge-lane-retry: $mode — retry-after=${RETRY_AFTER}s max-retries=$MAX_RETRIES window=${RETRY_WINDOW}s quota-floor=$QUOTA_FLOOR actor=${ACTOR:-<any>}"
-
-remaining=$(gh api rate_limit --jq '.resources.core.remaining' </dev/null 2>/dev/null | tr -d '\r')
-echo "merge-lane-retry: merge App quota remaining=${remaining:-unreadable}"
-if lane_retry_quota_holds "$remaining" "$QUOTA_FLOOR"; then
-  echo "::warning::merge-lane-retry: HELD, not idle — the merge App's shared quota is at $remaining, under the lane's floor of $QUOTA_FLOOR. A pass dispatched now would skip, so nothing was read and nothing was sent; the next tick asks again."
-  exit 0
-fi
 
 DISPATCHED=0
 HELD=0
@@ -120,6 +148,7 @@ while IFS=$'\t' read -r repo tier _; do
   default=$(_retry_fact "$prf" default)
 
   if _retry_is_number "$ready" && [ "$ready" -gt 0 ]; then
+    quota_holds
     CORE_CALLS=$((CORE_CALLS + 1))
     wff=$(api "repos/$OWNER/$repo/actions/workflows?per_page=100" | lane_retry_workflow_facts)
     runs=""
@@ -149,6 +178,7 @@ while IFS=$'\t' read -r repo tier _; do
         printf '%-22s %s\n' "$repo" "would-$verdict ref=$default (dry run)"
         continue
       fi
+      quota_holds
       CORE_CALLS=$((CORE_CALLS + 1))
       if err=$(gh api -X POST "repos/$OWNER/$repo/actions/workflows/$wf/dispatches" -f ref="$default" </dev/null 2>&1 >/dev/null); then
         printf '%-22s %s\n' "$repo" "$verdict ref=$default"
