@@ -3711,7 +3711,7 @@ a_fetch_job_ranks_and_acts_on_nothing() {
 reads_live_once_the_walk_is_over() {
   local walk
   walk="$(code_of "$1" | sed -n '/^lane_walk() {$/,/^}$/p')"
-  before "$walk" "^  LANE_REPLAY=''$" '^  if ! base_now="\$\(gh api ' || return 1
+  before "$walk" "^  LANE_REPLAY=''$" '^  if ! base_now="\$\(lane_read_base_tip\)"' || return 1
   before "$walk" "^  LANE_REPLAY=''$" 'lane_take_action '
 }
 a_fetch_job_never_counts_or_writes() {
@@ -4015,7 +4015,7 @@ behavioural_base_read_cases() {
     rm -f "$fix/n"
     local out rc=0
     out="$(FAILS="$2" ANSWER="${5:-}" lane_read_base_tip)" || rc=$?
-    if [ "$rc" = "$3" ] && printf '%s' "$out" | grep -qE -- "$4"; then
+    if [ "$rc" = "$3" ] && [ "$(printf '%s' "$out" | grep -cE -- "$4")" -gt 0 ]; then
       printf 'PASS %s
 ' "$1"
     else
