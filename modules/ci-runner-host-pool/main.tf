@@ -258,12 +258,6 @@ locals {
   # Windows-only keys, MERGED IN rather than written with an empty value, so a
   # Linux pool renders the same key set it renders today.
   windows_host_metadata = var.host_os == "windows" ? {
-    # Guest attributes are off unless the instance asks for them, and the
-    # liveness beacon is a PUT to that namespace. Without this the host's first
-    # beacon write fails and it refuses to register — the designed outcome, for
-    # a reason nobody would find from the boot log alone.
-    "enable-guest-attributes" = "TRUE"
-
     # The publisher travels as metadata for the same reason the broker source
     # does: ONE image keeps serving every pool while the code stays versioned
     # with the module and covered by the module's own tests.
@@ -512,6 +506,14 @@ resource "google_compute_instance_template" "host" {
   }
 
   metadata = merge(local.boot_script_metadata, local.windows_host_metadata, {
+    # Guest attributes are off unless the instance asks for them, on EVERY host
+    # OS: the Windows liveness beacon and the Linux pin hold (ci-pin-hold) are
+    # both a PUT to that namespace. Without this a Windows host's first beacon
+    # write fails and it refuses to register, and a Linux host's hold publish
+    # gets a 403 so the controller's refuse-to-remove-a-held-host veto never
+    # sees a hold — neither visible from the boot log alone.
+    "enable-guest-attributes" = "TRUE"
+
     # What this host IS, said rather than inferred. The boot script asserts it
     # against the platform it is actually running on, and the controller reads
     # it to choose which liveness gate applies to the host it is about to

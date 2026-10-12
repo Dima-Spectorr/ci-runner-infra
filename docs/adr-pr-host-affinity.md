@@ -243,6 +243,10 @@ does not already have — which is the whole premise of §3.4. The controller ne
 no shell on the host to answer a question about it. And the mechanism is already
 in the module, already gated, already tested.
 
+The namespace is off unless the instance opts in, so `enable-guest-attributes = TRUE`
+is set on the template of EVERY host OS (not only Windows, where the beacon first
+needed it): without it the helper's PUT gets a 403 and the veto never sees a hold (#1577).
+
 An earlier draft claimed the read was free because the controller already
 SSHes to each host. It is not: that probe (`pgrep -fc Runner.Worker`,
 `controller-startup.sh:1579`) lives **inside** `drain_host()`, which runs *after*
