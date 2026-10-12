@@ -861,6 +861,15 @@ refuses_a_base_that_moved() {
   matches "$code" '\[ "\$base_now" != "\$base_sha" \]'
 }
 
+# A failed tip read is retried and reported as a read failure (#1449).
+retries_the_base_tip_read() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^LANE_BASE_READ_ATTEMPTS=([3-9]|[1-9][0-9])' || return 1
+  matches "$code" 'lane_read_base_tip\)' || return 1
+  matches "$code" 'tip re-read FAILED'
+}
+
 # A dropped pull request stays open and keeps its verdict, so without a
 # per-sha record the lane re-announces the same release on every pass and every
 # scheduled sweep, forever.
@@ -2591,6 +2600,7 @@ mutate "the comparison error is swallowed again" "$DRIVER" \
   's@2>"\$cmp_err"@2>/dev/null@' reports_why_the_comparison_failed
 mutate "the moved-base guard is removed" "$DRIVER" \
   's@\[ "\$base_now" != "\$base_sha" \]@false@' refuses_a_base_that_moved
+mutate "the tip re-read stops being retried" "$DRIVER"   's@^LANE_BASE_READ_ATTEMPTS=3@LANE_BASE_READ_ATTEMPTS=1@' retries_the_base_tip_read
 mutate "the release stops being recorded per sha" "$DRIVER" \
   's@merge-lane:released:@merge-lane-released@' announces_a_release_once
 
@@ -3972,6 +3982,55 @@ behavioural_premerge_cases() {
   rm -rf "$fix"
 }
 
+# #1449: a failed base re-read is a read failure, retried, and never an error
+# body reported as a moved tip. Runs the shipped function against a stub `gh`.
+behavioural_base_read_cases() {
+  local fix
+  fix="$(mktemp -d)"
+  # shellcheck disable=SC2034  # read by the evalled driver function.
+  local R="owner/repo" LANE_BASE=main
+  eval "$(sed -n "/^LANE_BASE_READ_ATTEMPTS=/p" "$DRIVER")"
+  eval "$(sed -n "/^lane_read_base_tip() {/,/^}/p" "$DRIVER")"
+  if ! declare -F lane_read_base_tip >/dev/null 2>&1; then
+    echo "FAIL lane_read_base_tip could not be lifted, so no base-read case ran"
+    rm -rf "$fix"
+    return
+  fi
+  local GOOD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  # shellcheck disable=SC2317  # reached through the evalled function.
+  sleep() { :; }
+  # shellcheck disable=SC2317
+  gh() { # fails the first $FAILS calls, then answers $GOOD (or $ANSWER)
+    local n
+    n=$(($(cat "$fix/n" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$fix/n"
+    if [ "$n" -le "${FAILS:-0}" ]; then
+      echo "HTTP 502: Bad Gateway" >&2
+      return 1
+    fi
+    printf '%s
+' "${ANSWER:-$GOOD}"
+  }
+  _br_case() { # <label> <fails> <want-rc> <want-out-regex> [answer]
+    rm -f "$fix/n"
+    local out rc=0
+    out="$(FAILS="$2" ANSWER="${5:-}" lane_read_base_tip)" || rc=$?
+    if [ "$rc" = "$3" ] && printf '%s' "$out" | grep -qE -- "$4"; then
+      printf 'PASS %s
+' "$1"
+    else
+      printf 'FAIL %s — rc=%s out=%s
+' "$1" "$rc" "$out"
+    fi
+  }
+  _br_case "a healthy read returns the sha" 0 0 "^$GOOD\$"
+  _br_case "one transient failure is retried and succeeds" 1 0 "^$GOOD\$"
+  _br_case "two transient failures are retried and succeed" 2 0 "^$GOOD\$"
+  _br_case "a persistent failure is a failure carrying the reason, not a sha" 9 1 "502"
+  _br_case "an exit-0 error body is a failure, never a tip" 0 1 "unexpected answer" '{"message":"Server Error"}'
+  rm -rf "$fix"
+}
+
 # #1529: a red base is re-run ONCE, by the run's own token, and only where a
 # failing base-health job failed on attempt 1. Runs the shipped function
 # against a stub `gh`, so what is tested is what the lane does.
@@ -4048,6 +4107,16 @@ while IFS= read -r _rr_line; do
     *) bad "behavioural base re-run: unparseable result line '$_rr_line'" ;;
   esac
 done <<<"$_rr_out"
+
+_br_out="$(behavioural_base_read_cases)"
+while IFS= read -r _br_line; do
+  case "$_br_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural base read: ${_br_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural base read: unparseable result line '$_br_line'" ;;
+  esac
+done <<<"$_br_out"
 
 _pm_out="$(behavioural_premerge_cases)"
 while IFS= read -r _pm_line; do
