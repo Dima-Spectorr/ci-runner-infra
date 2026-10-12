@@ -1078,8 +1078,11 @@ which is hosted by construction. A `lane`-tier repository that still has only
 repository in that shape is **held and reported**, because its one file runs on
 the pool label. Migrate it (the note under "Wiring a repository") to be covered.
 
-**It does not drain the quota it is recovering from.** `rate_limit` is free and
-is read first; under the lane's floor the tick stops there. The pull-request
+**It does not drain the quota it is recovering from.** Before every REST call
+the tick reads the core window from the `x-ratelimit-*` headers of its own
+newest REST answer, never `GET /rate_limit` (#1548); under the lane's floor the
+tick stops there. Before its first REST answer the window is unknown, which
+does not hold, so that first read is the probe. The pull-request
 read is one GraphQL query per repository, charged to the `graphql` bucket and
 not the REST one the lanes share. REST is spent only on a repository with a
 ready pull request: three reads and the dispatch.
@@ -1195,10 +1198,12 @@ to the refusal itself plus at most one 60s interval.
 
 **Inside a pass, a rate-limited call is made once more** when the window
 reopens soon: a secondary limit (asks for a minute), or a primary one whose
-reset is under 90s away and inside the pass budget. When `rate_limit` reports
-a FRESH window (`used` 0, reset an hour out) the refusal did not come from that
-window, so the call is made once more after a minute instead of being refused
-for an hour. Every `gh` call goes
+reset is under 90s away and inside the pass budget. The reset is the
+`x-ratelimit-reset` the REFUSAL ITSELF carried, never `GET /rate_limit` (#1548):
+only a refusal whose own headers say `remaining=0` with a reset ahead is waited
+out to that reset. One that still shows quota left, or carries no headers, came
+from a limit the window does not describe, and the call is made once more after
+a minute instead of being refused for an hour. Every `gh` call goes
 through `lane_gh_retry` in `merge-lane-fetch.sh`, but only a READ is made again.
 A write (`gh api -X ...`, `-f`, `--input`: `PUT pulls/N/merge` above all) is
 attempted once, because the wait can be up to 90s and what the lane decided on

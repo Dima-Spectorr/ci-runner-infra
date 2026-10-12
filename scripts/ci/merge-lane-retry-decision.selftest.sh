@@ -118,6 +118,23 @@ quota allows "floor 0 turns it off"                       0 0
 quota allows "an unreadable quota does not hold"         "" 500
 quota allows "a non-numeric floor does not hold"        120 lots
 
+# The remaining the hold is asked about comes from the watchdog's own newest
+# REST answer's headers (#1548), as the LANE_QUOTA line, never `rate_limit`.
+remaining_is() {
+  local want="$1" desc="$2"; shift 2
+  local got
+  got="$(lane_retry_quota_remaining "$@")"
+  if [ "$got" = "$want" ]; then ok; else bad "$desc (want '$want', got '$got')"; fi
+}
+remaining_is 120 "the newest answer's window"                 "5000 120 4880 1900000600" 1900000000
+remaining_is 120 "a limit or used the answer did not carry"   "? 120 ? 1900000600" 1900000000
+remaining_is ""  "no answer has carried the headers yet"      "" 1900000000
+remaining_is ""  "a window that has reset says nothing"       "5000 120 4880 1900000000" 1900000000
+remaining_is ""  "a malformed line"                           "5000 lots 4880 1900000600" 1900000000
+remaining_is ""  "an unreadable clock"                        "5000 120 4880 1900000600" ""
+quota holds  "a drained window holds"  "$(lane_retry_quota_remaining "5000 0 5000 1900000600" 1900000000)" 500
+quota allows "a reset window does not" "$(lane_retry_quota_remaining "5000 0 5000 1899999999" 1900000000)" 500
+
 # ---------------------------------------------------------------------------
 # The parsers.
 # ---------------------------------------------------------------------------
@@ -302,6 +319,9 @@ mutant "the quota comparison is inverted" \
 mutant "an unreadable quota holds" \
   's/_retry_is_number "\$remaining" \|\| return 1/_retry_is_number "$remaining" || return 0/' \
   "allows" 'lane_retry_quota_holds "" 500 && echo holds || echo allows'
+mutant "a window that has reset still holds" \
+  's/\[ "\$reset" -gt "\$now" \] \|\| return 0/:/' \
+  "empty" '[ -z "$(lane_retry_quota_remaining "5000 0 5000 1899999999" 1900000000)" ] && echo empty || echo set'
 
 if command -v jq >/dev/null 2>&1; then
   export PRS NOW BOT

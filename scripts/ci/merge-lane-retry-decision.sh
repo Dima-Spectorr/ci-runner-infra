@@ -79,6 +79,28 @@ lane_retry_quota_holds() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_retry_quota_remaining "<limit> <remaining> <used> <reset>" <now> — the
+# `remaining` the hold above is asked about, from the core window the
+# watchdog's newest REST answer carried in its `x-ratelimit-*` headers (the
+# LANE_QUOTA line `merge-lane-fetch.sh` writes). Never `GET /rate_limit`
+# (#1548): that endpoint said `used=0` while the same token's calls were
+# refused (#1543).
+#
+# Empty — which does not hold — when no answer has carried the headers yet, the
+# line is malformed, or the window it describes has reset since: a `remaining`
+# from a window that is gone says nothing about the one that is open.
+# ---------------------------------------------------------------------------
+lane_retry_quota_remaining() {
+  local remaining reset now="${2:-}"
+  read -r _ remaining _ reset _ <<<"${1:-}"
+  _retry_is_number "${remaining:-}" || return 0
+  _retry_is_number "${reset:-}" || return 0
+  _retry_is_number "$now" || return 0
+  [ "$reset" -gt "$now" ] || return 0
+  printf '%s' "$remaining"
+}
+
+# ---------------------------------------------------------------------------
 # lane_retry_verdict "key=value;key=value;..." — one line, always.
 #
 #   dispatch:<workflow file> ...   start a lane pass through that file

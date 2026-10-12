@@ -68,8 +68,8 @@ lane_gh_mutates() {
 # minute and a green pull request sat for 824s.
 #
 # ONE retry, and only when the window reopens soon. A secondary limit asks for
-# a minute; a primary one reopens at the `reset` the free `rate_limit` read
-# reports, which can be most of an hour away. Waiting longer than
+# a minute; a primary one reopens at the `x-ratelimit-reset` the REFUSAL
+# ITSELF carried, which can be most of an hour away. Waiting longer than
 # LANE_RETRY_MAX_WAIT, or past the pass budget, holds the lock for nothing:
 # the call fails as before, and the workflow's `recover` job dispatches one
 # more pass after the window. A refused call was not carried out, so making a
@@ -79,10 +79,19 @@ lane_gh_mutates() {
 # merge-lane.sh and `lane_gh_record` below. None of them reads stdin.
 LANE_RETRY_MAX_WAIT=90
 
-# <stderr-file> — the seconds to wait before the call is worth making again,
-# or a failure when the error is not a rate limit at all.
+# <stderr-file> <headers-file> [now] — the seconds to wait before the call is
+# worth making again, or a failure when the error is not a rate limit at all.
+#
+# DECIDED FROM THE REFUSAL'S OWN HEADERS, NEVER FROM `GET /rate_limit` (#1548).
+# That endpoint was the number that was wrong: on IntegrateIT 2026-10-11 pass
+# 38115253421 was refused at 05:35:37 and one second later `rate_limit` said
+# `remaining=5450 used=0`, reset 06:35. The refusal's header block names the
+# window that refused it. `remaining=0` with a reset ahead is that window, and
+# its reset is when the call can succeed. Anything else — some quota left, a
+# reset already past, no headers at all — is a limit the window does not
+# describe, and a minute is what GitHub asks for.
 lane_rate_limit_wait() {
-  local err="$1" now core used reset
+  local err="$1" hdr="${2:-}" now="${3:-}" w remaining reset
   if grep -q 'HTTP 429' "$err"; then
     :
   elif grep -q 'HTTP 403' "$err" && grep -qi 'rate limit' "$err"; then
@@ -94,23 +103,12 @@ lane_rate_limit_wait() {
     printf 60
     return 0
   fi
-  now="$(date -u +%s)"
-  core="$(command gh api rate_limit --jq '"\(.resources.core.used) \(.resources.core.reset)"' 2>/dev/null)" || core=''
-  read -r used reset <<<"$core"
-  if [ "${used:-}" = 0 ]; then
-    # A FRESH WINDOW DID NOT REFUSE THIS CALL. `rate_limit` reporting nothing
-    # used, resetting an hour out, is a window that opened after the refusal —
-    # or one that is not the window refusing. Measured on IntegrateIT
-    # 2026-10-11: pass 38115253421 was refused at 05:35:37 and one second later
-    # `rate_limit` said `remaining=5450 used=0`, reset 06:35. Waiting for that
-    # reset is waiting an hour for a window that is already open, so the call
-    # is made once more after the minute GitHub asks for.
-    printf 60
-  elif [[ "${reset:-}" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
+  [ -n "$now" ] || now="$(date -u +%s)"
+  w="$(lane_hdr_window "$hdr")"
+  read -r _ remaining _ reset _ <<<"$w"
+  if [ "${remaining:-}" = 0 ] && [[ "${reset:-}" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ]; then
     printf '%s' "$((reset - now + 1))"
   else
-    # The core bucket is not what refused it — a limit `rate_limit` does not
-    # report. A minute is what GitHub asks for.
     printf 60
   fi
 }
@@ -151,13 +149,13 @@ lane_gh_split() {
   ' "$1" >"$2"
 }
 
-# <headers> — writes the LAST block's core window to LANE_QUOTA. A block for
-# another bucket (`graphql`, `search`) says nothing about the REST quota the
-# lane spends, and is ignored.
-lane_quota_note() {
-  local q
-  [ -n "${LANE_QUOTA:-}" ] && [ -s "$1" ] || return 0
-  q="$(tr -d '\r' <"$1" | awk -F': *' '
+# <headers-file> — `limit remaining used reset resource` of the LAST header
+# block (the newest answer), any bucket; `?` for a field it did not carry.
+# Nothing when that block carries no numeric remaining + reset. A missing or
+# empty file is nothing too.
+lane_hdr_window() {
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  tr -d '\r' <"$1" | awk -F': *' '
     /^HTTP\// { l = ""; r = ""; u = ""; s = ""; res = ""; next }
     { k = tolower($1) }
     k == "x-ratelimit-limit" { l = $2 }
@@ -166,11 +164,22 @@ lane_quota_note() {
     k == "x-ratelimit-reset" { s = $2 }
     k == "x-ratelimit-resource" { res = $2 }
     END {
-      if (r ~ /^[0-9]+$/ && s ~ /^[0-9]+$/ && (res == "" || res == "core"))
-        print (l ~ /^[0-9]+$/ ? l : "?") " " r " " (u ~ /^[0-9]+$/ ? u : "?") " " s
-    }')"
-  [ -n "$q" ] || return 0
-  printf '%s\n' "$q" >"$LANE_QUOTA.$$.$BASHPID" && mv -f "$LANE_QUOTA.$$.$BASHPID" "$LANE_QUOTA"
+      if (r ~ /^[0-9]+$/ && s ~ /^[0-9]+$/)
+        print (l ~ /^[0-9]+$/ ? l : "?") " " r " " (u ~ /^[0-9]+$/ ? u : "?") " " s " " (res == "" ? "?" : res)
+    }'
+}
+
+# <headers> — writes the LAST block's core window to LANE_QUOTA. A block for
+# another bucket (`graphql`, `search`) says nothing about the REST quota the
+# lane spends, and is ignored.
+lane_quota_note() {
+  local w limit remaining used reset res
+  [ -n "${LANE_QUOTA:-}" ] || return 0
+  w="$(lane_hdr_window "$1")"
+  [ -n "$w" ] || return 0
+  read -r limit remaining used reset res <<<"$w"
+  case "$res" in core | '?') ;; *) return 0 ;; esac
+  printf '%s %s %s %s\n' "$limit" "$remaining" "$used" "$reset" >"$LANE_QUOTA.$$.$BASHPID" && mv -f "$LANE_QUOTA.$$.$BASHPID" "$LANE_QUOTA"
 }
 
 # <dir> <gh-args...> — one real call: output to <dir>/out, error text to
@@ -205,7 +214,7 @@ lane_gh_retry() {
     return
   fi
   lane_gh_call "$d" "$@" || rc=$?
-  if [ "$rc" -ne 0 ] && wait="$(lane_rate_limit_wait "$d/err")"; then
+  if [ "$rc" -ne 0 ] && wait="$(lane_rate_limit_wait "$d/err" "$d/hdr")"; then
     if lane_gh_mutates "$@"; then
       echo "lane: rate limited on a write; a write is never repeated on the old verdict — the pass ends and the recover job decides again from live state" >&2
     elif [ "$wait" -gt "$LANE_RETRY_MAX_WAIT" ]; then
