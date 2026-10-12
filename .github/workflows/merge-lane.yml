@@ -619,7 +619,7 @@ jobs:
           READ_TOKEN: ${{ github.token }} # read-only: the caller file and a tag; never the gh CLI, which acts as the App
           IMPLEMENTATION_REPOSITORY: ${{ inputs.implementation-repository }}
           IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
-          CALLEE_PATH: __PATH__
+          CALLEE_PATH: .github/workflows/merge-lane.yml
         run: |
           set -euo pipefail
           die() {
