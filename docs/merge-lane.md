@@ -105,6 +105,8 @@ names in `ci.yml`, so the rename fails on the pull request that does it.
 **C. A base that moved must be re-validated.** This is the entire reason a queue
 exists rather than plain auto-merge: it is what catches two sessions whose
 changes pass alone and break together.
+The tip is re-read live just before acting; a read that fails (retried three
+times, stderr captured) is logged as a read failure, never as a move (#1449).
 
 **D. Validation happens in place.** No speculative draft, no
 `merge-queue/<sha>`, no second CI run for a pull request whose base never moved

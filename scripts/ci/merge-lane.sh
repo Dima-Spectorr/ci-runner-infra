@@ -2095,6 +2095,31 @@ one_pass() {
   lane_walk
 }
 
+# The base's tip, read live. Prints the sha and returns 0, or prints the error
+# text and returns 1 when it could not be read. A transient failure is retried
+# with a short backoff before it is called one, and stderr is captured so the
+# reason reaches the log instead of vanishing (#1449).
+LANE_BASE_READ_ATTEMPTS=3
+lane_read_base_tip() {
+  local attempt out err_file rc
+  err_file="$(mktemp)"
+  for ((attempt = 1; attempt <= LANE_BASE_READ_ATTEMPTS; attempt++)); do
+    rc=0
+    out="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>"$err_file")" || rc=1
+    if [ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{40}$ ]]; then
+      rm -f "$err_file"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    # An exit-0 answer that is not a sha is a failed read too.
+    if [ "$rc" -eq 0 ]; then printf 'unexpected answer: %s' "${out:0:80}" >"$err_file"; fi
+    if [ "$attempt" -lt "$LANE_BASE_READ_ATTEMPTS" ]; then sleep "$((attempt * 2))"; fi
+  done
+  tr '\n' ' ' <"$err_file" | cut -c1-200
+  rm -f "$err_file"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # The walk: every open pull request, in list order, then the ranking and the
 # action. Called by `one_pass`, and it finishes that function's work — the
@@ -2606,8 +2631,16 @@ lane_walk() {
   # longer what `behind_by` was computed against, every verdict in this pass
   # describes a world that has gone — so none of them is acted on, and the next
   # pass reads the new one.
+  #
+  # A READ THAT FAILED IS NOT A MOVE (#1449). The answer is a tip only if it is
+  # a 40-hex sha; anything else is an error body or nothing, and is reported as
+  # that — Apigee-Portal run 36740035974 printed `{"mess` as the "new" tip.
   local base_now
-  if ! base_now="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha' 2>/dev/null)" || [ "$base_now" != "$base_sha" ]; then
+  if ! base_now="$(lane_read_base_tip)"; then
+    echo "::warning::$LANE_BASE tip re-read FAILED after $LANE_BASE_READ_ATTEMPTS attempts (${base_now:-no error text}) — a read failure, not a move; nothing acted on this pass."
+    return 1
+  fi
+  if [ "$base_now" != "$base_sha" ]; then
     echo "::warning::$LANE_BASE moved while this pass was reading (${base_sha:0:8} → ${base_now:0:8}) — nothing acted on, re-reading."
     return 1
   fi
