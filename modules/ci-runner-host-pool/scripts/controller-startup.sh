@@ -4420,17 +4420,22 @@ drain_host() {
   zone=$(gcloud compute instances list --project="$PROJECT" \
     --filter="name=$host" --format="value(zone)" 2>/dev/null | head -1)
   DRAIN_KEEP_FLAG=0
-  if [ -n "$zone" ]; then
-    local drain_flag_err
-    if ! drain_flag_err=$(timeout 60 gcloud compute instances add-metadata "$host" \
-      --zone="$zone" --project="$PROJECT" --metadata=ci-drain=1 2>&1 >/dev/null); then
-      drain_fail "$host" drain-flag-refused "could not set ci-drain=1 (${drain_flag_err:0:200}) -- a slot could register past the roster read, every agent left registered"
-      return 1
-    fi
+  # No zone is no drain flag, and no drain flag is no drain: without ci-drain a
+  # slot can mint a runner past the roster read below and take a job on a host
+  # about to be deleted. Fail closed, exactly as a refused add-metadata does.
+  if [ -z "$zone" ]; then
+    drain_fail "$host" drain-flag-no-zone "could not find the host's zone, so ci-drain=1 cannot be set -- a slot could register past the roster read, every agent left registered"
+    return 1
+  fi
+  local drain_flag_err
+  if ! drain_flag_err=$(timeout 60 gcloud compute instances add-metadata "$host" \
+    --zone="$zone" --project="$PROJECT" --metadata=ci-drain=1 2>&1 >/dev/null); then
+    drain_fail "$host" drain-flag-refused "could not set ci-drain=1 (${drain_flag_err:0:200}) -- a slot could register past the roster read, every agent left registered"
+    return 1
   fi
   drain_host_proven "$host" "$zone"
   rc=$?
-  if [ "$rc" -ne 0 ] && [ "$DRAIN_KEEP_FLAG" = 0 ] && [ -n "$zone" ]; then
+  if [ "$rc" -ne 0 ] && [ "$DRAIN_KEEP_FLAG" = 0 ]; then
     timeout 60 gcloud compute instances remove-metadata "$host" \
       --zone="$zone" --project="$PROJECT" --keys=ci-drain >>"$LOG" 2>&1 ||
       log "drain $host: could not clear ci-drain after the abort -- its slots stay unregistered until the next drain attempt clears it or deletes the host"

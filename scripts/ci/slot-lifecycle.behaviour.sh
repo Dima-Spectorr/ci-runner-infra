@@ -112,7 +112,6 @@ SLOT_ROOT="$SB/slots"
 SLOT_STATE="$SB/state"
 SLOT_TEMPLATE="$SB/template"
 PIN_DIR="$SLOT_STATE/.pin"
-SLOTS=$IDX
 
 # The tool cache the reset hook REPORTS on. Bound here for the same reason
 # SLOT_USER_PREFIX is bound further down: host-startup.sh bakes these three into
@@ -428,6 +427,44 @@ check_not "no process of the slot outlives the reset" pgrep_slot
 check "nothing rewrote the home after the wipe"   test ! -e "$HOME_DIR/.pwned"
 check "the home is the template's again"          test -f "$HOME_DIR/.bashrc"
 check "and the marker means it"                   test -f "$MARKER"
+
+# A HOLD THAT RESERVES NOTHING SPARES NOTHING (#1481, review H-1). Any job can
+# write a live hold on its own slot with reserve=0 (`ci-pin-hold --run <any-id>`).
+# The slot loop does not hold the slot back for it -- held() counts reserve=1
+# only -- so a reset that spared the slot on such a record would hand the job's
+# stragglers to the next job, where they read its JIT config and step secrets
+# through /proc. The reserve=1 run is the control: it proves this record is the
+# one the reset reads, so the reserve=0 pass is not a record nobody looked at.
+hold_record() { # <reserve>
+  printf 'run=1481\nslot=%s\nexpiry=%s\nreserve=%s\nboot=%s\n' \
+    "$IDX" "$(($(date +%s) + 600))" "$1" "$(cat /proc/sys/kernel/random/boot_id)" >"$PIN_DIR/host"
+}
+straggler() {
+  sudo -u "$U" nohup bash -c 'while :; do sleep 0.2; done' >/dev/null 2>&1 &
+  sleep 1
+}
+
+seed_work
+hold_record 0
+straggler
+check "the straggler is running before the reset" pgrep_slot
+in_workspace completed
+rc=$?
+sleep 1
+check "the reset succeeds under a hold that reserves nothing" test "$rc" = 0
+check_not "a reserve=0 hold does not spare the slot's processes" pgrep_slot
+
+seed_work
+hold_record 1
+straggler
+in_workspace completed
+sleep 1
+check "the control: a reserve=1 hold does spare them" pgrep_slot
+pkill -KILL -u "$U" 2>/dev/null || :
+sleep 1
+rm -f -- "$PIN_DIR/host"
+in_workspace completed
+check "the slot is clean again once the hold is gone" test -f "$MARKER"
 
 # The suite goes on after a failed assertion, so a writer that DID survive would
 # keep rewriting the home under every case below and the report would blame

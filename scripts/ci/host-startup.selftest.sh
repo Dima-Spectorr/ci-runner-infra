@@ -1251,6 +1251,11 @@ has_pin_hold() { # <file>
   # unexpired record from the PREVIOUS boot spared image tags for containers
   # that did not survive the guest.
   matches "$code" 'h_boot" = "\\\$\(cat /proc/sys/kernel/random/boot_id' || return 1
+  # ONLY A RESERVING HOLD SPARES THE SLOT (#1481, review H-1). Any job can write
+  # a reserve=0 hold on its own slot; sparing on that skips quiesce_slot, while
+  # the slot loop's held() still lets the next job in, so the job's stragglers
+  # meet the next job's JIT config and secrets.
+  matches "$code" 'h_reserve" = 1 \]' || return 1
 
   # A DURATION, because that is what the contract publishes (`CI_PIN_TTL: 90m`)
   # and what a workflow author writes beside a timeout-minutes they already own.
@@ -1340,7 +1345,13 @@ has_slot_sweep() { # <file>
   # The ONE stop left: a runner whose marker was withdrawn while it waited is
   # deleted through the API first -- GitHub refuses with 422 while a job is
   # assigned -- and only a runner GitHub agreed is gone is ever stopped.
-  matches "$code" "pgrep -u \"\\\$u\" -f 'Runner\\\\.Worker'" || return 1
+  # "Running a job" is a Runner.Worker in the agent UNIT's cgroup, never a name
+  # match over the process table that a stray same-named process satisfies
+  # (#1481, review L-2).
+  matches "$code" '! job_running; then' || return 1
+  matches "$code" 'cg=\$\(systemctl show -p ControlGroup --value "\$UNIT"' || return 1
+  matches "$code" '\[ "\$c" = Runner\.Worker \] && return 0' || return 1
+  ! matches "$code" "pgrep[^#]*Runner" || return 1
   matches "$code" 'if \[ "\$dirty" -ge 12 \] && delete_runner "\$id"; then' || return 1
   matches "$code" '\[ "\$withdrawn" -lt 14 \] \|\| systemctl stop "\$UNIT"' || return 1
   counts "$code" 'systemctl stop "\$UNIT"' 1 || return 1
@@ -1787,9 +1798,12 @@ slot_can_execute "$1" "$2"' _ "$1" "${2:-}" >/dev/null 2>&1
   rm -f "$root/norun/run.sh"
   probe "$root/norun" && rc=1
 
+  # NOT a half-finished copy any more: a just-in-time runner starts from
+  # `run.sh --jitconfig` and never calls config.sh (#1481), so a gate that
+  # demanded it would refuse a slot that can run every job.
   cp -a "$root/good" "$root/noconf"
   rm -f "$root/noconf/config.sh"
-  probe "$root/noconf" && rc=1
+  probe "$root/noconf" || rc=1
 
   # Nothing there at all.
   probe "$root/absent" && rc=1
@@ -2212,6 +2226,7 @@ mutate "a repeat claim moves the slot"      's@slot_to_write=\\\$R_SLOT@slot_to_
 mutate "a repeat claim may shorten a hold"  's@\[ "\\\$R_EXPIRY" -gt "\\\$expiry_to_write" \] \&\& expiry_to_write=\\\$R_EXPIRY@:@' has_pin_hold
 mutate "--ttl accepts no value again"       's@refusing: --ttl needs a value@a default will do@'                               has_pin_hold
 mutate "the prune forgets the boot"         's@\[ "\\\$h_boot" = "\\\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \]@true@' has_pin_hold
+mutate "a reserve=0 hold spares the slot"   's@\[ "\\\$h_reserve" = 1 \] && @@'                                    has_pin_hold
 mutate "teardown under a running job"     's|if systemctl is-active --quiet "ci-runner@\\\$slot.service"; then|if false; then|' has_pin_hold
 mutate "a failed docker ps reads as empty"  's@could not list the run.s containers@nothing to see@'                           has_pin_hold
 mutate "the record dies with a failed teardown" 's@teardown incomplete -- the hold stays in place@teardown incomplete@' has_pin_hold
@@ -2303,7 +2318,8 @@ mutate "the loop not installed"           's@^  install_slot_loop || die@  true 
 mutate "the loops enabled at boot"        's|^  for i in \$ready; do$|  systemctl enable ci-slot-loop@1.service\n&|' has_slot_sweep
 mutate "the loops never started"          's|systemctl start "ci-slot-loop@\$i\.service"|true|'                has_slot_sweep
 mutate "a dead loop stays dead"           's@^Restart=always$@Restart=no@'                                     has_slot_sweep
-mutate "dirty alone is enough to stop"    's@! pgrep -u "\$u"@true -u "$u"@'                                    has_slot_sweep
+mutate "dirty alone is enough to stop"    's@! job_running; then@true; then@'                                   has_slot_sweep
+mutate "a job is a name in the process table" 's@cg=\$(systemctl show -p ControlGroup --value "\$UNIT"@cg=$(pgrep -f Runner@' has_slot_sweep
 mutate "a runner stopped while assigned"  's@ \&\& delete_runner "\$id"; then@; then@'                          has_slot_sweep
 mutate "one sample is enough to stop"     's@-ge 12 \]@-ge 0 ]@'                                               has_slot_sweep
 mutate "reset under a previous loop's job" 's@^while agent_up; do sleep 5; done$@:@'                          has_slot_sweep

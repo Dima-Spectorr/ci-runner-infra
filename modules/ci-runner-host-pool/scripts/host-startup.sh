@@ -1317,14 +1317,22 @@ prune=1
 # PREVIOUS boot spared the tags -- for containers that did not survive the
 # guest. The next job then resolved locally tagged images the last run built,
 # which is exactly the cross-job leak this reset exists to close.
+#
+# ONLY A HOLD THAT RESERVES THE SLOT spares it (reserve=1), the same rule the
+# slot loop's held() applies. Any job can write a hold on its own slot with
+# reserve=0 (\`ci-pin-hold --run <any-id>\`); sparing on that would skip
+# quiesce_slot below, so the job's leftover processes, user units and
+# containers would survive into the next job -- which held() does not hold
+# back, because a hold that reserved nothing owns no stack and no slot -- and
+# read its JIT config and step secrets through /proc.
 if [ -f "\$PIN_DIR/host" ]; then
-  h_slot=""; h_expiry=""; h_boot=""
+  h_slot=""; h_expiry=""; h_boot=""; h_reserve=""
   while IFS='=' read -r hk hv; do
-    case "\$hk" in slot) h_slot="\$hv" ;; expiry) h_expiry="\$hv" ;; boot) h_boot="\$hv" ;; esac
+    case "\$hk" in slot) h_slot="\$hv" ;; expiry) h_expiry="\$hv" ;; boot) h_boot="\$hv" ;; reserve) h_reserve="\$hv" ;; esac
   done <"\$PIN_DIR/host"
   case "\$h_slot:\$h_expiry" in
     [0-9]*:[0-9]*)
-      if [ "\$h_slot" = "\$idx" ] && [ "\$h_expiry" -gt "\$(date +%s)" ] &&
+      if [ "\$h_slot" = "\$idx" ] && [ "\$h_reserve" = 1 ] && [ "\$h_expiry" -gt "\$(date +%s)" ] &&
         [ "\$h_boot" = "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
         prune=0
         say "slot \$idx is held by a live run -- keeping its containers, its processes and its local image tags until the hold expires"
@@ -2893,6 +2901,22 @@ held() {
   [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]
 }
 
+# Is the agent running a job? Asked of the agent UNIT's own cgroup, not of the
+# process table by name: a job can leave a stray process called Runner.Worker
+# behind (or start one), and a name match would read that as a job and keep a
+# runner whose clean marker was withdrawn registered. Only a Runner.Worker
+# inside ci-runner@<idx>'s cgroup is the agent's.
+job_running() {
+  local cg p c
+  cg=$(systemctl show -p ControlGroup --value "$UNIT" 2>/dev/null) || return 1
+  [ -n "$cg" ] && [ -d "/sys/fs/cgroup$cg" ] || return 1
+  for p in $(find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null); do
+    c=$(cat "/proc/$p/comm" 2>/dev/null) || continue
+    [ "$c" = Runner.Worker ] && return 0
+  done
+  return 1
+}
+
 # Prints why this slot must not register right now; false when it may.
 gate() {
   local d c
@@ -2985,7 +3009,7 @@ while :; do
       [ "$withdrawn" -lt 14 ] || systemctl stop "$UNIT" >/dev/null 2>&1 || true
       continue
     fi
-    if [ ! -f "$dir/clean" ] && ! pgrep -u "$u" -f 'Runner\.Worker' >/dev/null 2>&1; then
+    if [ ! -f "$dir/clean" ] && ! job_running; then
       dirty=$((dirty + 1))
     else
       dirty=0

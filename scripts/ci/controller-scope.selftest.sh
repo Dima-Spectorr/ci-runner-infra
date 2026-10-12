@@ -1165,8 +1165,15 @@ check "gate/unknown: a ci-host-os this controller does not know keeps the host" 
   "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq freebsd)"
 check "gate/unknown: an unreadable instance describe keeps the host" \
   "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq linux '' 0 1)"
+# No zone means ci-drain cannot be set, and drain_host refuses BEFORE the roster
+# read rather than proceeding without the flag (#1481, review L-1).
 check "gate/unknown: no zone keeps the host" \
-  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=1 fb=0 err=1" "$(gate_seq nozone)"
+  "ssh=0 ga=0 dereg=0 del=0 rc=1 clear=0 held=0 und=0 fb=0 err=1" "$(gate_seq nozone)"
+check "flag: no zone sets no flag and never reads the roster" \
+  "" "$(gate_seq nozone '' 0 0 1 0 0 0 '' flags)"
+check "flag: no zone FAILS when drain_host goes on without the flag" \
+  "mutant-caught" "$(m=$(gate_seq nozone '' 0 0 1 0 0 0 '/drain-flag-no-zone/{n;s/return 1/:/;}' flags)
+    case "$m" in *roster*) echo mutant-caught ;; *) echo "mutant-survived:$m" ;; esac)"
 
 # --- the host predates `ci-host-os` entirely: fall back, do NOT deadlock ------
 check "gate/legacy: an absent ci-host-os on a linux controller drains as linux" \
