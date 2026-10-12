@@ -3324,6 +3324,18 @@ JTIMEOUT="${CI_LOG_SHIPPER_JOURNAL_TIMEOUT:-20}"
 MSG_MAX=2000
 LOG_ID=ci-slot-lifecycle
 IDENTIFIERS=(ci-slot-reset ci-slot-sweep ci-pin-hold ci-pin-sweep)
+# The second class (#1480): systemd's own account of the units whose mass restart
+# ~5 min after boot has no other witness. A separate log, so the lifecycle log
+# the condemned-slot alert reads gains no line it did not have.
+UNIT_LOG_ID=ci-host-units
+# Which PID-1 lines are kept. UNITS_RE is matched against the line's UNIT field
+# and its message, so "Stopping ci-runner@3.service" and "user@1001.service:
+# Succeeded" both qualify; MANAGER_RE is the manager-level lines that name no
+# unit but say what happened to all of them ("Reloading requested from client
+# PID 812 ('systemctl')", "Received SIGTERM from PID 1 ...", a transaction that
+# stops a unit because another job was queued).
+UNITS_RE='google-guest-agent|user@[0-9]|user-runtime-dir@[0-9]|ci-dockerd@|ci-runner@|systemd-logind|dbus'
+MANAGER_RE='^(Reload|Reexecut|Received SIG|Shutting down|Caught |Requested transaction|A stop job|Job [^ ]+/(start|stop|restart|reload))'
 
 # Its own tag is not in the list above, so what it says about itself is never
 # shipped back through it.
@@ -3344,6 +3356,13 @@ if [ -n "$cursor" ]; then opts+=("--after-cursor=$cursor"); else opts+=(--boot);
 matches=()
 for id in "${IDENTIFIERS[@]}"; do matches+=("SYSLOG_IDENTIFIER=$id"); done
 matches+=(_UID=0)
+# `+` is journalctl's OR between match groups. Each group names a field the
+# SENDER CANNOT SET (_PID, _SYSTEMD_UNIT: journald stamps them from the socket's
+# credentials and the cgroup), so a job cannot forge a line into this class
+# either. Deliberately NOT here: any other line of a unit (the ci-runner@ and
+# ci-dockerd@ units carry job output; user@ carries the slot's user manager and
+# its rootless dockerd) -- only what PID 1 says ABOUT them, filtered below.
+matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)
 
 # --lines=+N: the OLDEST N after the cursor (systemd >= 255, which is what the
 # image's Ubuntu 24.04 ships), so journalctl stops by itself and a backlog is
@@ -3376,11 +3395,42 @@ case "$jrc" in
 esac
 [ -s "$batch" ] || exit 0
 
+advance() {
+  printf '%s' "$last" >"$cursor_file.tmp" && mv -f "$cursor_file.tmp" "$cursor_file"
+}
+
+# What is shipped, decided here and not trusted to the journalctl matches alone
+# (the stub journal in log-shipper.behaviour.sh replays everything, and a match
+# set edited later should not be the only thing between a job and the log).
+# `kind` is "slot" for the slot tools' own tags, "systemd" for a PID-1 line that
+# is about one of the watched units or about the manager itself, "unit" for a
+# line written BY systemd-logind or dbus, and nothing for the rest.
+KIND_DEFS='
+  def text: if type == "string" then .
+            elif type == "array" then map(select(type == "number" and . >= 32 and . < 127)) | implode
+            else "" end;
+  def kind:
+    (.SYSLOG_IDENTIFIER // "" | text) as $id
+    | (._PID // "" | tostring) as $pid
+    | (._SYSTEMD_UNIT // "" | text) as $su
+    | (.UNIT // "" | text) as $u
+    | (.MESSAGE // "" | text) as $m
+    | if ($ids | index($id)) != null then "slot"
+      elif $pid == "1" then (if ((($u + " " + $m) | test($re)) or ($m | test($mgr))) then "systemd" else empty end)
+      elif ($su == "systemd-logind.service" or $su == "dbus.service") then "unit"
+      else empty end;'
+
 # Line by line and tolerant: a line that is not JSON is skipped rather than
 # failing the whole batch, which would otherwise be retried forever.
-n=$(jq -Rn '[inputs | fromjson? | select(type == "object")] | length' "$batch" 2>/dev/null)
+n=$(jq -Rn --argjson ids "$(printf '%s\n' "${IDENTIFIERS[@]}" | jq -Rc '[., inputs]')" \
+  --arg re "$UNITS_RE" --arg mgr "$MANAGER_RE" "$KIND_DEFS"'
+  [inputs | fromjson? | select(type == "object") | select(kind)] | length' "$batch" 2>/dev/null)
 last=$(jq -Rr 'fromjson? | select(type == "object") | .__CURSOR // empty' "$batch" 2>/dev/null | tail -n 1)
 [ -n "$last" ] || { note "no entry in the batch carries a cursor -- ${n:-0} entries not shipped"; exit 0; }
+# A batch of lines that are all outside the allow-list (most PID-1 chatter is):
+# nothing to send, and the cursor still moves past it, or the shipper would read
+# the same unshipped lines forever.
+if [ "${n:-0}" = 0 ]; then advance; rm -f "$batch"; exit 0; fi
 
 project=$(md project/project-id)
 iid=$(md instance/id)
@@ -3391,25 +3441,32 @@ pool=$(md instance/attributes/ci-pool)
 [ -n "$project" ] && [ -n "$iid" ] && [ -n "$zone" ] ||
   { note "metadata server unreachable -- $n entries kept for the next run"; exit 0; }
 
-body=$(jq -cRn --arg lg "projects/$project/logs/$LOG_ID" --arg project "$project" \
+body=$(jq -cRn --arg lg "projects/$project/logs/$LOG_ID" --arg ulg "projects/$project/logs/$UNIT_LOG_ID" --arg project "$project" \
   --arg iid "$iid" --arg zone "$zone" --arg host "$host" --arg pool "$pool" \
-  --argjson msgmax "$MSG_MAX" '
-  def text: if type == "string" then .
-            elif type == "array" then map(select(type == "number" and . >= 32 and . < 127)) | implode
-            else "" end;
+  --argjson msgmax "$MSG_MAX" --argjson ids "$(printf '%s\n' "${IDENTIFIERS[@]}" | jq -Rc '[., inputs]')" \
+  --arg re "$UNITS_RE" --arg mgr "$MANAGER_RE" "$KIND_DEFS"'
   def clean($n): text | explode | map(if . < 32 or . == 127 then 32 else . end) | implode | .[0:$n];
   def stamp: tostring | if test("^[0-9]{7,}$") then (.[0:-6] | tonumber | todate | rtrimstr("Z")) + "." + .[-6:] + "Z" else null end;
   def sev: {"0":"EMERGENCY","1":"ALERT","2":"CRITICAL","3":"ERROR","4":"WARNING","5":"NOTICE","6":"INFO","7":"DEBUG"}[(.PRIORITY // "5") | tostring] // "DEFAULT";
+  def field($k; $n): if (.[$k] // "" | clean($n)) != "" then {($k): (.[$k] | clean($n))} else {} end;
+  # The slot tools keep the two-field payload the alert reads. A systemd line
+  # also carries the unit and the job as systemd stamped them, so a stop can be
+  # tied to the job that caused it without parsing the sentence.
+  def payload: if kind == "slot"
+    then {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax))}
+    else {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax)), source: kind}
+         + field("UNIT"; 120) + field("JOB_TYPE"; 20) + field("JOB_RESULT"; 40) + field("_SYSTEMD_UNIT"; 120)
+    end;
   { logName: $lg,
     resource: {type: "gce_instance", labels: {project_id: $project, instance_id: $iid, zone: $zone}},
     labels: {pool: $pool, host: $host},
     partialSuccess: true,
-    entries: ([inputs | fromjson? | select(type == "object")] | map({
+    entries: ([inputs | fromjson? | select(type == "object") | select(kind)] | map({
       severity: sev,
       insertId: ((._BOOT_ID // "" | clean(40)) + "-" + (.__MONOTONIC_TIMESTAMP // "" | clean(24))),
-      jsonPayload: {identifier: (.SYSLOG_IDENTIFIER // "" | clean(40)), message: (.MESSAGE // "" | clean($msgmax))}
-    } + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end))) }' \
-  "$batch" 2>/dev/null)
+      jsonPayload: payload
+    } + (if kind == "slot" then {} else {logName: $ulg} end)
+      + (if (.__REALTIME_TIMESTAMP // "" | stamp) then {timestamp: (.__REALTIME_TIMESTAMP | stamp)} else {} end))) }'   "$batch" 2>/dev/null)
 [ -n "$body" ] || { note "could not assemble the batch -- $n entries kept for the next run"; exit 0; }
 
 token=$(md instance/service-accounts/default/token | jq -r '.access_token // empty' 2>/dev/null)
@@ -3422,9 +3479,6 @@ out=$(mktemp) || out=/dev/null
 http=$(printf '%s' "$body" | curl --connect-timeout 10 --max-time 30 -s -o "$out" -w '%{http_code}' -X POST \
   -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
   -H 'Content-Type: application/json' --data-binary @- "$ENDPOINT" 2>/dev/null)
-advance() {
-  printf '%s' "$last" >"$cursor_file.tmp" && mv -f "$cursor_file.tmp" "$cursor_file"
-}
 case "$http" in
   200) advance ;;
   400)

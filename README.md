@@ -1104,6 +1104,19 @@ One more watches the slots themselves rather than the pool:
   reach it. `ci_slots_missing` still catches a condemned slot as lost
   capacity, 30 minutes later and without the reason.
 
+  The same shipper also sends a second, small class to the log `ci-host-units`
+  (#1480: google-guest-agent, `user@*`, `ci-dockerd@*` and `ci-runner@*` restart
+  together ~5 minutes after boot, and the cause was only in the host's journal).
+  It is exactly: PID 1's lines (`_PID=1`, which a job cannot forge) whose `UNIT` or
+  message names google-guest-agent, `user@N`, `user-runtime-dir@N`, `ci-dockerd@`,
+  `ci-runner@`, systemd-logind or dbus, or that are manager-level (`Reloading
+  requested from client PID …`, `Received SIG… from PID …`, `Requested transaction
+  …`, `A stop job …`, `Job …/stop|start|restart|reload …`); plus every line
+  systemd-logind and dbus write themselves. The entry carries `UNIT`, `JOB_TYPE`,
+  `JOB_RESULT` and `_SYSTEMD_UNIT` next to the message. A unit's own output is
+  never read (the runner units carry job output). Lines outside that set advance
+  the cursor and are not sent.
+
 Together those three were most of the mail this fleet produced. Measured over the
 week to 2026-08-29 across the three projects that have these policies, they
 opened 184 incidents — 368 notifications — of which the great majority were the
