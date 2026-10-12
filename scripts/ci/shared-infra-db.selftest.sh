@@ -88,8 +88,17 @@ case "$1" in
     ;;
   port)   printf '127.0.0.1:%s\n' "$(cat "$DOCKER_LAST_PORT_FILE")" ;;
   exec)   exit "${DOCKER_ISREADY_RC:-0}" ;;
+  pull)
+    for a in "$@"; do
+      case "$a" in
+        ${DOCKER_PULL_FAIL:-__none__})
+          echo "failed to copy: could not fetch content descriptor sha256:x from remote: not found" >&2
+          exit 1 ;;
+      esac
+    done
+    exit 0 ;;
   rm)     exit 0 ;;
-  logs)   echo "(stub logs)" ;;
+  logs)  echo "(stub logs)" ;;
   *)      exit 0 ;;
 esac
 STUB
@@ -119,7 +128,7 @@ run_resolve() {
   RUNNER_OS=Linux \
   GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 GITHUB_JOB=selftest \
   PG="${PG:-}" ADDR="${ADDR:-}" \
-  IMAGE="postgres@sha256:stub" \
+  IMAGE="${IMAGE_OVERRIDE:-postgres@sha256:stub}" DOCKER_PULL_FAIL="${DOCKER_PULL_FAIL:-}" \
   DB_USER="${DB_USER:-ci}" DB_PASSWORD="${DB_PASSWORD:-}" DB_NAME="${DB_NAME:-app}" \
   HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-30}" \
   PG_RETRY_SLEEP=0 PG_POLL_SLEEP=0 \
@@ -159,6 +168,30 @@ got() { sed -n "s/^$2=//p" "$1"; }
   ok "shared without addr: falls back to loopback" \
      "$([ "$(got "$OUT" url)" = 'postgres://ci@127.0.0.1:35100/app?sslmode=disable' ] && echo 1 || echo 0)"
   printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.sharednoaddr" ) || true
+
+# #1551: a mirror.gcr.io blob miss falls back to docker.io for the SAME digest;
+# a healthy mirror, or a non-mirror image, is untouched.
+( IMAGE_OVERRIDE='mirror.gcr.io/library/postgres@sha256:abc' DOCKER_PULL_FAIL='mirror.gcr.io/*' \
+    run_resolve mirrormiss
+  ok "mirror miss: starts the docker.io reference, same digest" \
+     "$(grep -q -- '^run .* -- docker.io/library/postgres@sha256:abc$' "$CALLS" && echo 1 || echo 0)"
+  ok "mirror miss: retried the mirror once before falling back" \
+     "$([ "$(grep -c '^pull --quiet -- mirror.gcr.io/library/postgres@sha256:abc$' "$CALLS")" = 2 ] && echo 1 || echo 0)"
+  ok "mirror miss: still exits 0" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.mirrormiss" ) || true
+
+( IMAGE_OVERRIDE='mirror.gcr.io/library/postgres@sha256:abc' run_resolve mirrorok
+  ok "healthy mirror: runs the mirror reference" \
+     "$(grep -q -- '^run .* -- mirror.gcr.io/library/postgres@sha256:abc$' "$CALLS" && echo 1 || echo 0)"
+  ok "healthy mirror: pulls once, no fallback" \
+     "$([ "$(grep -c '^pull ' "$CALLS")" = 1 ] && echo 1 || echo 0)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.mirrorok" ) || true
+
+( IMAGE_OVERRIDE='public.ecr.aws/docker/library/postgres@sha256:abc' DOCKER_PULL_FAIL='public.ecr.aws/*' \
+    run_resolve nonmirror
+  ok "non-mirror failure: never rewritten to docker.io" \
+     "$(grep -q 'docker.io' "$CALLS" && echo 0 || echo 1)"
+  printf '%s %s\n' "$PASS" "$FAIL" > "$TMP/r.nonmirror" ) || true
 
 # The slot that OWNS the stack must use loopback on a host that has not yet been
 # rolled onto the hairpin SNAT: `addr` DNATs back into this same namespace, so
