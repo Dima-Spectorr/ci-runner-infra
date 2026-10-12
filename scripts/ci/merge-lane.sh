@@ -741,7 +741,7 @@ check_counts() {
   # it, read from `actions/runs` only when some name is actually held (below);
   # a suite it does not know — another app's, or one the read did not return —
   # is not excluded, so an unknown lineage keeps the hold exactly as before.
-  local auth_prog wf_json='{}' wf_runs
+  local auth_prog wf_json='{}' ev_json='{}' wf_runs
   # shellcheck disable=SC2016  # A jq program: `$suites`, `$wf` and `$w` are jq variables, not shell ones.
   auth_prog='($suites | map({key: (.id | tostring), value: .}) | from_entries) as $smap
        | [ .[]
@@ -755,20 +755,30 @@ check_counts() {
        | map(.[-1])
        | map(. as $w
              | ($wf[($w.suite | tostring)]) as $w_wf
+             | ($ev[($w.suite | tostring)]) as $w_ev
              | ($suites
                 | map(select(.app == $w.app
                              and .status != "completed"
+                             and .id != $w.suite
                              and ($w_wf == null
                                   or $wf[(.id | tostring)] == null
                                   or $wf[(.id | tostring)] == $w_wf)
                              and (([.created_at, .id]
                                    > [$w.created_at, $w.suite])
                                   or (.created_at == ""
-                                      and .id > $w.suite))))) as $holders
+                                      and .id > $w.suite)
+                                  or ($w_ev != null and $w_ev != "pull_request"
+                                      and $ev[(.id | tostring)] == "pull_request"
+                                      and $w_wf != null
+                                      and $wf[(.id | tostring)] == $w_wf))))) as $holders
+             | ($suites
+                | any(.app == $w.app and .status != "completed"
+                      and .id != $w.suite)) as $any_incomplete
              | ($holders | map(select(.created_at == "")) | sort_by(.id)) as $undated
              | {($w.app): {($w.name):
                  {id: $w.suite, status: $w.status,
                   newer_incomplete: (($holders | length) > 0),
+                  any_incomplete: $any_incomplete,
                   newer_id: (if ($undated | length) > 0 then $undated[-1].id
                              elif ($holders | length) > 0
                              then ($holders | sort_by([.created_at, .id]) | .[-1].id)
@@ -779,21 +789,36 @@ check_counts() {
                              else "" end)}}})
        | reduce .[] as $e ({}; . * $e)'
   name_auth="$(printf '%s\n' "$runs" \
-    | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" "$auth_prog")"
+    | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" --argjson ev "$ev_json" "$auth_prog")"
 
   # ONLY WHEN SOMETHING IS HELD. The workflow lineage is one more paginated read,
   # and on the common sha — nothing of the app still running after the suite
   # that answered — it could not change a single verdict, so it is not paid for.
   # A failed read keeps `{}`, which is the hold exactly as it stood before this
   # existed: the unsafe direction here is trusting a green, never holding one.
-  if [ "$(printf '%s' "$name_auth" | jq '[.[][] | .newer_incomplete] | any')" = "true" ]; then
+  #
+  # IT IS PAID FOR WHEN ANY OTHER SUITE OF THE APP IS UNFINISHED, NOT ONLY A
+  # LATER ONE (#1542). The ruleset answers a required name from the
+  # `pull_request` run of the workflow, never from a `workflow_dispatch` run of
+  # it (the `is failing` arm of `lane_report_refusal` measured the same rule
+  # from the other side). So a `pull_request` suite that is still queued holds a
+  # dispatch run's green even when it was created FIRST — measured on
+  # IntegrateIT #25376: run 38113696576 (pull_request, created 05:06:02) sat
+  # queued until 06:33 while dispatch run 38114742027 (created 05:25:36) posted
+  # `ci` success at 05:50, and six merges were refused 405 "is expected" in
+  # between. Only the lineage read can tell those two suites apart, so the
+  # trigger is any unfinished sibling, and the event comes back with it.
+  if [ "$(printf '%s' "$name_auth" | jq '[.[][] | .any_incomplete] | any')" = "true" ]; then
     if wf_runs="$(gh api --paginate "repos/$R/actions/runs?head_sha=$sha&per_page=100" \
-      --jq '.workflow_runs[] | {suite: .check_suite_id, workflow: .workflow_id}' 2>/dev/null)"; then
+      --jq '.workflow_runs[] | {suite: .check_suite_id, workflow: .workflow_id, event: .event}' 2>/dev/null)"; then
       wf_json="$(printf '%s\n' "$wf_runs" \
         | jq -s '[.[] | select(type == "object" and .suite != null and .workflow != null)
                  | {key: (.suite | tostring), value: .workflow}] | from_entries')"
+      ev_json="$(printf '%s\n' "$wf_runs" \
+        | jq -s '[.[] | select(type == "object" and .suite != null and (.event | type) == "string")
+                 | {key: (.suite | tostring), value: .event}] | from_entries')"
       name_auth="$(printf '%s\n' "$runs" \
-        | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" "$auth_prog")"
+        | jq -s --argjson suites "$suites_json" --argjson wf "$wf_json" --argjson ev "$ev_json" "$auth_prog")"
     elif [ ! -e "$WORKFLOW_WARN_ONCE" ]; then
       : >"$WORKFLOW_WARN_ONCE"
       echo "lane: WARNING $sha — could not read which workflow each check_suite belongs to (actions/runs), so a green check is held while ANY later suite of its app is unfinished, not only a re-run of its own workflow. Grant the merge App 'Actions: read'." >&2
@@ -896,7 +921,17 @@ check_counts() {
     # whose winning answer was not already `success` from a check-run. A run
     # whose OWN suite already IS the authoritative one for its name keeps its
     # `success` unless the app has a later suite still running.
-    if [ "$state" = "success" ] && [ "$winner_origin" = "run" ]; then
+    #
+    # A `skipped` IS JUDGED THE SAME WAY, because it passes exactly like a
+    # `success` does (#1542). Measured on IntegrateIT, 2026-10-11: #25382,
+    # #25498, #25595 and #25600 each carried a `ci` SKIPPED by the
+    # `pull_request` run that fired while the pull request was a draft, and
+    # marking it ready started a NEW `pull_request` run of the same workflow
+    # that had not created its `ci` job yet. The lane logged "required and
+    # SKIPPED, counted as passing: ci", ranked it `merge:ready`, and the merge
+    # API refused it 405 "is expected" — 28 refusals over 5 pull requests in
+    # 48 hours, each one ending only when that new run posted `ci`.
+    if { [ "$state" = "success" ] || [ "$state" = "skipped" ]; } && [ "$winner_origin" = "run" ]; then
       winner_app="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].app // ""')"
       winner_suite="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].suite // -1')"
       auth_id="$(printf '%s' "$name_auth" | jq -r --arg a "$winner_app" --arg n "$name" '.[$a][$n].id // ""')"
@@ -995,7 +1030,7 @@ check_counts() {
         # and the OPPOSITE of the grace clock's fallback: there an unbounded
         # wait was the worse failure, here the permissive reading would trust a
         # stale green on a timestamp the lane could not read.
-        if [ "$state" = "success" ] && [ "$auth_newer" = "true" ]; then
+        if { [ "$state" = "success" ] || [ "$state" = "skipped" ]; } && [ "$auth_newer" = "true" ]; then
           local hold_age=0 hold_now
           if [ -n "$auth_newer_at" ]; then
             hold_now="$(date -u +%s)"
@@ -1016,10 +1051,14 @@ check_counts() {
             # function's stdout IS its return value. The runner parses workflow
             # commands off both streams, so the `::warning::` annotation still
             # appears.
-            echo "::warning::lane: $sha — check '$name' is green and app '$winner_app' has suite $auth_newer_id still unfinished (created $auth_newer_at, ${hold_age}s ago, past the ${NEWER_INCOMPLETE_MAX_STALENESS}s bound), so the hold on it is expired and the green is taken. If GitHub now refuses the merge with a 405 saying the context is expected, that suite is posting late rather than stuck and this repository's newer-incomplete-max-staleness-seconds is too low." >&2
+            echo "::warning::lane: $sha — check '$name' is $state and app '$winner_app' has suite $auth_newer_id still unfinished (created $auth_newer_at, ${hold_age}s ago, past the ${NEWER_INCOMPLETE_MAX_STALENESS}s bound), so the hold on it is expired and the $state is taken. If GitHub now refuses the merge with a 405 saying the context is expected, that suite is posting late rather than stuck and this repository's newer-incomplete-max-staleness-seconds is too low." >&2
           else
+            # THE CAUSE IS NAMED IN THE DECISION LOG (#1542), so a hold reads as
+            # the ruleset waiting on a suite that has not posted the name rather
+            # than as an unexplained wait — and a 405 after an EXPIRED hold is
+            # told apart from one the lane should have seen coming.
+            why="${state/success/green} held: suite $auth_newer_id of app '$winner_app' (created ${auth_newer_at:-at an unknown time}) is unfinished, of the same workflow or one the read could not place, and has not posted it (cause: ruleset-suite-unposted)"
             state="pending"
-            why="green held: suite $auth_newer_id of app '$winner_app' (created ${auth_newer_at:-at an unknown time}) is later, unfinished, and of the same workflow or one the read could not place"
           fi
         fi
       fi
