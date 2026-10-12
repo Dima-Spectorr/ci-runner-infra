@@ -426,7 +426,33 @@ jobs:
           COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_IN:-}"
           [ -n "$COMPOSE_PROJECT_NAME" ] || COMPOSE_PROJECT_NAME="pr-${PR_NUMBER}"
           export COMPOSE_PROJECT_NAME
-          PG_PORT="$pg" docker compose -f "$COMPOSE_FILE_IN" up -d --wait
+          # A digest-pinned image behind the `mirror.gcr.io` pull-through cache
+          # sometimes cannot serve one of its blobs ("could not fetch content
+          # descriptor ... not found", #1551) while a rerun passes. Pull each
+          # such image here first: retry once, then take the SAME digest from
+          # docker.io. The digest is the content address, so the fallback
+          # cannot yield different bytes. Anything not behind the mirror is
+          # left to compose. A failure of both pulls is not decided here --
+          # compose runs next and fails with its own message.
+          compose_file="$COMPOSE_FILE_IN"
+          fallback_sed=""
+          for img in $(PG_PORT="$pg" docker compose -f "$COMPOSE_FILE_IN" config --images 2>/dev/null || true); do
+            case "$img" in mirror.gcr.io/*) ;; *) continue ;; esac
+            docker pull --quiet "$img" >/dev/null 2>&1 && continue
+            sleep 3
+            docker pull --quiet "$img" >/dev/null 2>&1 && continue
+            upstream="docker.io/${img#mirror.gcr.io/}"
+            if docker pull --quiet "$upstream" >/dev/null 2>&1; then
+              echo "::warning::mirror.gcr.io could not serve ${img}; using ${upstream} (same digest)"
+              fallback_sed="${fallback_sed}s#${img}#${upstream}#;"
+            fi
+          done
+          if [ -n "$fallback_sed" ]; then
+            compose_file="$(dirname "$COMPOSE_FILE_IN")/.compose-fallback-$$.yaml"
+            sed "$fallback_sed" "$COMPOSE_FILE_IN" >"$compose_file"
+            trap 'rm -f "$compose_file"' EXIT
+          fi
+          PG_PORT="$pg" docker compose -f "$compose_file" --project-directory "$(dirname "$COMPOSE_FILE_IN")" up -d --wait
 
           # Migrate and seed ONCE, in a child shell rather than `eval`, so a
           # failing migration is a failing step and not a mangled trap.

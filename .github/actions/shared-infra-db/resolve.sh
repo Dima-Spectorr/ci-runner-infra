@@ -223,6 +223,29 @@ case "$HEALTH_TIMEOUT" in
     ;;
 esac
 
+# PULL FIRST, AND TAKE THE SAME DIGEST FROM docker.io IF THE MIRROR CANNOT
+# SERVE IT (#1551). `mirror.gcr.io` sometimes answers "could not fetch content
+# descriptor ... not found" for one blob of a digest-pinned image while a rerun
+# passes. `docker run` would fail on that inside the port-retry loop below,
+# which would read it as a port collision. Pull once up front instead: retry
+# once, then -- only for a `mirror.gcr.io/` reference -- pull the identical
+# `@sha256:` from docker.io. The digest is the content address, so the fallback
+# cannot start different bytes. If every pull fails, `docker run` below fails
+# with its own message, exactly as before.
+if ! docker pull --quiet -- "$IMAGE" >/dev/null 2>&1; then
+  sleep "${PG_RETRY_SLEEP:-3}"
+  if ! docker pull --quiet -- "$IMAGE" >/dev/null 2>&1; then
+    case "$IMAGE" in
+      mirror.gcr.io/*)
+        if docker pull --quiet -- "docker.io/${IMAGE#mirror.gcr.io/}" >/dev/null 2>&1; then
+          echo "::warning::mirror.gcr.io could not serve ${IMAGE}; using docker.io/${IMAGE#mirror.gcr.io/} (same digest)"
+          IMAGE="docker.io/${IMAGE#mirror.gcr.io/}"
+        fi
+        ;;
+    esac
+  fi
+fi
+
 # THE HOST PORT IS DRAWN HERE, NOT LEFT TO DOCKER.
 #
 # `--publish '127.0.0.1::5432'` reads as "let the kernel pick" and does not mean

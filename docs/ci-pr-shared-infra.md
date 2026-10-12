@@ -211,6 +211,15 @@ hold blocks the drain for the length of your run. A run of these means hosts are
 disappearing under live work — a recycle policy that is too aggressive, or
 preemption — and the series `ci_pinned_runs_cancelled` is where that shows up.
 
+**Image pulls behind `mirror.gcr.io` (#1551).** The anchor pulls every
+`mirror.gcr.io/...` image in the compose file before `up`: a failed pull is
+retried once, then the same `@sha256:` digest is pulled from `docker.io` and the
+compose file is run with that reference (a `::warning::` names it). The
+`shared-infra-db` fallback does the same for its `image` input. Images not
+behind the mirror are untouched; if every pull fails, compose / `docker run`
+fails with its own message as before. Consumer-side: a `docker run` of your own
+on a mirror reference needs the same retry-then-docker.io step.
+
 ## 2. Consuming the anchor
 
 ```yaml
