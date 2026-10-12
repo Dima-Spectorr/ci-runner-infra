@@ -572,9 +572,18 @@ jobs:
 >
 > **There is one sha, and you do not repeat it.** A reusable workflow's
 > `actions/checkout` clones the CALLER, so the lane does have to be told where
-> its driver lives — but only the *repository*, not the ref. The ref defaults to
-> `github.job_workflow_sha`, the commit this workflow file was called at, which
-> is by definition the sha your `uses:` line resolved to.
+> its driver lives — but only the *repository*, not the ref. The ref is read
+> from your own workflow file, at the commit that ran: the one `uses:` line
+> naming `merge-lane.yml`, resolved to a commit. If the lane cannot name exactly
+> one commit — no such line, two that disagree, an unreadable file, a tag that
+> does not resolve — the run **fails**; it never falls back to `main`.
+>
+> It used to read `github.job_workflow_sha`, which was empty in every run
+> measured, so `actions/checkout` cloned this repository's default branch and
+> every pin pinned the workflow file but none of the scripts (#1555): #1552
+> reached lanes pinned at v5.124.0 and v5.111.2 the moment it merged. **The
+> protection starts at the release that carries the fix** — a caller pinned
+> below it still runs an older `merge-lane.yml`, which still checks out `main`.
 >
 > Callers used to repeat that sha as `implementation-ref`, and that is now
 > wrong rather than merely redundant. Two shas that must agree is a rule a
@@ -1242,7 +1251,7 @@ state change no CI completion follows.
 Two things make `pull_request_target` safe here, and both must stay true:
 
 - **The lane never checks out the pull request.** Its one `actions/checkout`
-  clones `implementation-repository` at `github.job_workflow_sha` — this
+  clones `implementation-repository` at the commit the caller's `uses:` pinned — this
   repository, at the pinned release. No code from the pull request is read,
   let alone run, so the usual `pull_request_target` hazard (a privileged token
   handed to a fork's tree) has nothing to act on.

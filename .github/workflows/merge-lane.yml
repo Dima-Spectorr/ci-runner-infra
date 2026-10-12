@@ -482,9 +482,11 @@ on:
       implementation-ref:
         description: >-
           The ref of `implementation-repository` to run. LEAVE IT UNSET. Empty
-          means "the commit this workflow file was called at", read from
-          `github.job_workflow_sha`, so the driver and the workflow are the same
+          means "the commit this workflow file was called at", read from the
+          caller's own `uses:` line, so the driver and the workflow are the same
           release by construction and there is nothing left to keep in sync.
+          When that commit cannot be determined the lane FAILS — it never falls
+          back to the default branch (#1555).
 
 
           It used to default to `main`, and every caller therefore had to repeat
@@ -543,6 +545,9 @@ jobs:
     # the common single-label case takes the string through untouched.
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     timeout-minutes: 15
+    # The commit the lane ran, so `recover` checks out the same release.
+    outputs:
+      callee-sha: ${{ steps.callee.outputs.sha }}
 
     # THE LOCK, AND THE REASON IT IS NOT A QUEUE.
     #
@@ -580,22 +585,91 @@ jobs:
       # workflow needs the opposite, and has to say so.
       #
       # There is no context naming the callee's REPOSITORY, so that stays an
-      # input. There is one naming its REF: `github.job_workflow_sha` is the
-      # commit of the reusable workflow file this job is running, which is
-      # exactly the sha the caller's `uses:` line resolved to. Defaulting to it
-      # makes driver and workflow the same release by construction.
+      # input. Its REF must be the commit the caller's `uses:` line pinned, so
+      # driver and workflow are the same release by construction.
       #
-      # The old default was `main`, so every caller repeated its `uses:` sha as
-      # an input — a second, unchecked pin eight lines below the first. That is
-      # the drift the pin gate exists to prevent, and Dependabot made it worse
-      # rather than better: it rewrites a `uses:` line and cannot see an input
-      # value, so an automatic update moved the workflow and left the driver on
-      # the previous release, silently.
+      # `github.job_workflow_sha` was meant to be that commit, and it is EMPTY
+      # in every run measured (#1555): IntegrateIT pinned v5.124.0, its lane
+      # run 38220993646 printed `Uses: …merge-lane.yml@2c2e32da…`, and
+      # `actions/checkout`, handed an empty ref, cloned the DEFAULT BRANCH —
+      # v5.127.0. Every merge here therefore shipped to every consumer at once,
+      # and #1552 took two lanes down for two hours through pins that pinned
+      # nothing.
+      #
+      # So the commit is read from the one place that states it: the caller's
+      # own workflow file, at the commit it ran from (`GITHUB_WORKFLOW_REF`,
+      # `GITHUB_WORKFLOW_SHA`), read with the caller's own token. The step
+      # FAILS when it cannot name exactly one commit — an unreadable file, no
+      # `uses:` line for this workflow, two disagreeing ones, an unresolvable
+      # tag. A lane that cannot say which release it is must not run a guess,
+      # and the default branch is the worst guess there is.
+      #
+      # Inline, not a script: it runs BEFORE the implementation is checked out,
+      # so a script would have to come from somewhere — and anywhere but the
+      # pinned commit is the bug. curl, not gh: a pool image ships no gh until
+      # `ensure-gh.sh`, which is itself in the checkout.
+      # `scripts/ci/merge-lane-callee.selftest.sh` runs this block.
+      - name: Resolve the lane's own commit
+        id: callee
+        env:
+          READ_TOKEN: ${{ github.token }} # read-only: the caller file and a tag; never the gh CLI, which acts as the App
+          IMPLEMENTATION_REPOSITORY: ${{ inputs.implementation-repository }}
+          IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
+          CALLEE_PATH: .github/workflows/merge-lane.yml
+        run: |
+          set -euo pipefail
+          die() {
+            echo "::error title=merge lane::cannot pin the lane to its own commit: $*. Refusing to fall back to the default branch (#1555)."
+            exit 1
+          }
+          api=${GITHUB_API_URL:-https://api.github.com}
+          fetch() { # <accept> <url>
+            curl -sSfL --retry 3 --retry-delay 2 -H "Authorization: Bearer $READ_TOKEN" -H "Accept: $1" "$2"
+          }
+          ref=$IMPLEMENTATION_REF
+          from="input implementation-ref"
+          if [ -z "$ref" ]; then
+            caller=${GITHUB_WORKFLOW_REF:-}
+            if [ -z "$caller" ] || [ -z "${GITHUB_WORKFLOW_SHA:-}" ]; then die "GITHUB_WORKFLOW_REF or GITHUB_WORKFLOW_SHA is unset"; fi
+            path=${caller#"$GITHUB_REPOSITORY"/}
+            path=${path%%@*}
+            [ "$path" != "${caller%%@*}" ] || die "GITHUB_WORKFLOW_REF '$caller' names no file in $GITHUB_REPOSITORY"
+            body=$(fetch application/vnd.github.raw "$api/repos/$GITHUB_REPOSITORY/contents/$path?ref=$GITHUB_WORKFLOW_SHA") ||
+              die "cannot read the calling workflow $path at $GITHUB_WORKFLOW_SHA"
+            refs=$(printf '%s\n' "$body" | awk -v want="$IMPLEMENTATION_REPOSITORY/$CALLEE_PATH" \
+              -v self="$GITHUB_REPOSITORY" -v repo="$IMPLEMENTATION_REPOSITORY" \
+              -v here="$GITHUB_WORKFLOW_SHA" -v local_path="./$CALLEE_PATH" '
+              {
+                line = $0
+                sub(/^[ \t]*(-[ \t]+)?/, "", line)
+                if (line !~ /^uses:[ \t]/) next
+                sub(/^uses:[ \t]+/, "", line)
+                gsub(/["\047]/, "", line)
+                sub(/[ \t].*$/, "", line)
+                if (line == local_path && tolower(repo) == tolower(self)) { print here; next }
+                at = index(line, "@")
+                if (at && tolower(substr(line, 1, at - 1)) == tolower(want)) print substr(line, at + 1)
+              }' | sort -u)
+            n=$(printf '%s' "$refs" | grep -c . || true)
+            [ "$n" = 1 ] || die "$path at $GITHUB_WORKFLOW_SHA has $n distinct uses: refs for $IMPLEMENTATION_REPOSITORY/$CALLEE_PATH (need exactly 1): $(printf '%s' "$refs" | tr '\n' ' ')"
+            ref=$refs
+            from="$path"
+          fi
+          if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
+            sha=$ref
+          else
+            sha=$(fetch application/vnd.github.sha "$api/repos/$IMPLEMENTATION_REPOSITORY/commits/$ref") ||
+              die "cannot resolve ref '$ref' in $IMPLEMENTATION_REPOSITORY"
+          fi
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "ref '$ref' resolved to '$sha', not a commit sha"
+          echo "lane: implementation $IMPLEMENTATION_REPOSITORY@$sha, pinned by $from (ref $ref)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Check out the lane's implementation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.implementation-repository }}
-          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          ref: ${{ steps.callee.outputs.sha }}
           persist-credentials: false
 
       # THE POOL IMAGES DO NOT SHIP `gh`, AND THE LANE IS ALL `gh api`.
@@ -690,7 +764,7 @@ jobs:
   recover:
     name: Recover a failed lane pass
     needs: [lane]
-    if: ${{ always() && needs.lane.result == 'failure' && github.event_name != 'workflow_dispatch' && github.event.inputs.recovered != 'true' && github.event.workflow_run.event != 'workflow_dispatch' && !(github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) }}
+    if: ${{ always() && needs.lane.result == 'failure' && needs.lane.outputs.callee-sha != '' && github.event_name != 'workflow_dispatch' && github.event.inputs.recovered != 'true' && github.event.workflow_run.event != 'workflow_dispatch' && !(github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) }}
     # dynamic-runner-allowed(recover, #402): the same caller-scoped label as the lane job
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     # The wait is capped at 900s; the rest is the checkout, the token and one POST.
@@ -699,11 +773,15 @@ jobs:
       actions: write
       contents: read
     steps:
+      # The commit the lane job resolved (#1555). The job's `if:` requires it,
+      # so this ref is never empty and never the default branch: a lane that
+      # failed before naming its commit failed on configuration, which one more
+      # pass would not fix.
       - name: Check out the lane's implementation
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ inputs.implementation-repository }}
-          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}
+          ref: ${{ needs.lane.outputs.callee-sha }}
           persist-credentials: false
 
       # Minting is not an API call against the installation's quota, so it
