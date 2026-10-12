@@ -1,0 +1,28 @@
+query($owner: String!, $name: String!, $base: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, baseRefName: $base, first: 25, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft title headRefOid mergeable
+        author { __typename login }
+        labels(first: 100) { nodes { name } }
+        commits(last: 1) { nodes { commit {
+          oid
+          status { contexts { context state createdAt } }
+          checkSuites(first: 50) {
+            pageInfo { hasNextPage }
+            nodes {
+              databaseId status conclusion createdAt
+              app { slug databaseId }
+              workflowRun { event workflow { databaseId } }
+              checkRuns(first: 100, filterBy: {checkType: LATEST}) {
+                pageInfo { hasNextPage }
+                nodes { name status conclusion startedAt completedAt }
+              }
+            }
+          }
+        } } }
+      }
+    }
+  }
+}

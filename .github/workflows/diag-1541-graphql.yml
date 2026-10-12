@@ -1,0 +1,77 @@
+name: diag-1541 graphql under the merge App token
+
+# THROWAWAY measurement for #1541 — never merged; the PR carrying it is closed.
+# Runs the reverted #1552 snapshot query under the merge App's installation
+# token against two lane repositories, page by page, and prints status, timing,
+# request id, the full `errors` array (paths included) and node counts — never
+# the data itself.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-1541-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [IntegrateIT, ci-runner-infra]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.repo }}
+      - name: Measure
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          NAME: ${{ matrix.repo }}
+        run: |
+          set -u
+          q=$(cat .github/snap-query.graphql)
+          for round in 1 2 3; do
+            cur=null; page=0
+            while :; do
+              page=$((page+1))
+              body=$(jq -n --arg q "$q" --arg o "$OWNER" --arg n "$NAME" --argjson c "$cur" \
+                '{query:$q, variables:{owner:$o, name:$n, base:"main", endCursor:$c}}')
+              t0=$(date +%s.%N)
+              code=$(curl -sS -o resp.json -D hdr.txt -w '%{http_code}' \
+                -H "Authorization: bearer $GH_TOKEN" -H 'Content-Type: application/json' \
+                -X POST https://api.github.com/graphql -d "$body")
+              t1=$(date +%s.%N)
+              rid=$(grep -i '^x-github-request-id:' hdr.txt | tr -d '\r' | cut -d' ' -f2)
+              rem=$(grep -i '^x-ratelimit-remaining:' hdr.txt | tr -d '\r' | cut -d' ' -f2)
+              res=$(grep -i '^x-ratelimit-resource:' hdr.txt | tr -d '\r' | cut -d' ' -f2)
+              echo "round=$round page=$page http=$code secs=$(echo "$t1 - $t0" | bc) bytes=$(wc -c <resp.json) rid=$rid resource=$res remaining=$rem"
+              jq -c '{nodes: ((.data.repository.pullRequests.nodes // []) | length),
+                      nullNodes: ([(.data.repository.pullRequests.nodes // [])[] | select(. == null)] | length),
+                      repoNull: (.data.repository == null), dataNull: (.data == null),
+                      maxRuns: ([(.data.repository.pullRequests.nodes // [])[] | select(. != null)
+                                 | [.commits.nodes[0].commit.checkSuites.nodes[]?.checkRuns.nodes | length] | add // 0] | max),
+                      maxSuites: ([(.data.repository.pullRequests.nodes // [])[] | select(. != null)
+                                 | (.commits.nodes[0].commit.checkSuites.nodes | length)] | max)}' resp.json || head -c 800 resp.json
+              jq -c '.errors // empty' resp.json
+              next=$(jq -r 'if .data.repository.pullRequests.pageInfo.hasNextPage then .data.repository.pullRequests.pageInfo.endCursor else "" end' resp.json 2>/dev/null || true)
+              [ -n "$next" ] && [ "$page" -lt 10 ] || break
+              cur=$(jq -n --arg c "$next" '$c')
+            done
+          done
+          echo "--- the lane's own call shape: gh api graphql --paginate"
+          t0=$(date +%s)
+          gh api graphql --paginate -F owner="$OWNER" -F name="$NAME" -F base=main -f query="$q" \
+            --jq '.data.repository.pullRequests.nodes[] | .number' >nums.txt 2>gherr.txt
+          echo "rc=$? secs=$(( $(date +%s) - t0 )) prs=$(wc -l <nums.txt)"
+          head -c 2000 gherr.txt
