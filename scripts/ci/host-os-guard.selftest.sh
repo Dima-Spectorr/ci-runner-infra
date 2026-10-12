@@ -168,7 +168,7 @@ has_unchanged_linux_key_set() { # <main.tf>
 
   matches "$code" '^  windows_host_metadata = var\.host_os == "windows" \? \{$' || return 1
 
-  for key in 'enable-guest-attributes' 'ci-beacon-script' 'ci-image-min-version'; do
+  for key in 'ci-beacon-script' 'ci-image-min-version'; do
     # Present in the conditional …
     matches "$block" "\"$key\"" || return 1
     # … and NOWHERE else. One occurrence, and the occurrence is that one. A
@@ -176,11 +176,23 @@ has_unchanged_linux_key_set() { # <main.tf>
     # in the fleet and a key the Linux boot script has never seen.
     [ "$(count_of "$code" "^ +\"$key\" +=")" -eq 1 ] || return 1
   done
+}
 
-  # The beacon needs the namespace turned on: guest attributes are off by
-  # default, and the host's first write failing is a refusal to register for a
-  # reason no boot log names.
-  matches "$block" '"enable-guest-attributes" = "TRUE"' || return 1
+# --- invariant 4b: EVERY host OS opts into guest attributes (#1577) ----------
+
+has_guest_attributes_on_every_os() { # <main.tf>
+  local code block
+  code=$(code_of "$1")
+  block=$(awk '/^  windows_host_metadata = var\.host_os == "windows" \? \{$/,/^  \} : \{\}$/' "$1")
+
+  # Guest attributes are off unless the instance asks. The Windows beacon and
+  # the Linux pin hold both PUT to the namespace; on Linux a missing key is a
+  # 403 on every publish and the controller's pin-hold veto never sees a hold.
+  # So: written once, in the merged template map (rendered for BOTH OSes) …
+  [ "$(count_of "$code" '^ +"enable-guest-attributes" +=')" -eq 1 ] || return 1
+  matches "$code" '^    "enable-guest-attributes" = "TRUE"$' || return 1
+  # … and NOT inside the Windows-only conditional, which would drop it on Linux.
+  ! matches "$block" '"enable-guest-attributes"' || return 1
 }
 
 # --- invariant 5: the image pairing, in both directions ----------------------
@@ -352,6 +364,12 @@ else
   bad "ci-host-os is not published to both the host and the controller — the boot script then cannot assert which platform it was delivered to, and the controller has to infer an OS from an absent key rather than read one"
 fi
 
+if has_guest_attributes_on_every_os "$MAIN"; then
+  ok
+else
+  bad "enable-guest-attributes is not set for every host OS — a Linux host then gets a 403 on its pin-hold publish and the controller's pin-hold veto never sees a hold (#1577)"
+fi
+
 if has_unchanged_linux_key_set "$MAIN"; then
   ok
 else
@@ -449,9 +467,15 @@ mutate "the controller no longer told which OS its hosts run" "$MAIN" \
   has_host_os_metadata
 
 # 4. A Windows-only key escapes onto every Linux pool.
-mutate "guest attributes enabled unconditionally" "$MAIN" \
-  's|^    "ci-host-os" = var.host_os$|    "enable-guest-attributes" = "TRUE"|' \
-  has_unchanged_linux_key_set
+mutate "guest attributes left only on Windows pools (#1577)" "$MAIN" \
+  's|^    "enable-guest-attributes" = "TRUE"$||' \
+  has_guest_attributes_on_every_os
+mutate "guest attributes value no longer TRUE" "$MAIN" \
+  's|^    "enable-guest-attributes" = "TRUE"$|    "enable-guest-attributes" = "FALSE"|' \
+  has_guest_attributes_on_every_os
+mutate "guest attributes moved back inside the Windows conditional" "$MAIN" \
+  's|^    "ci-beacon-script" = file|    "enable-guest-attributes" = "TRUE"\n    "ci-beacon-script" = file|' \
+  has_guest_attributes_on_every_os
 mutate "the beacon script written on every pool" "$MAIN" \
   's|^    "ci-host-os" = var.host_os$|    "ci-beacon-script" = ""|' \
   has_unchanged_linux_key_set
