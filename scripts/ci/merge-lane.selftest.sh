@@ -1171,6 +1171,10 @@ recovers_a_failed_pass() {
   # a CI recover-workflow re-triggers the lane with: the loop guard's other arms.
   matches "$code" "^    if: .* && github\\.event\\.inputs\\.recovered != 'true' && " || return 1
   matches "$code" "^    if: .* && github\\.event\\.workflow_run\\.event != 'workflow_dispatch' && " || return 1
+  # A pass a fork's CI completion woke (the lane job lets that through, #1524)
+  # must not hold the repo-wide group for the recover wait either. Null
+  # head_repository compares unequal, so an absent field skips: fail closed.
+  matches "$code" "^    if: .* && !\(github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_repository\.full_name != github\.repository\) && " || return 1
   # An outside contributor's draft/ready toggle must not hold the repo-wide group.
   matches "$code" "^    if: .* && !\\(github\\.event_name == 'pull_request_target' && github\\.event\\.pull_request\\.head\\.repo\\.full_name != github\\.repository\\) \\}\\}\$" || return 1
   matches "$code" '^      actions: write$' || return 1
@@ -3815,6 +3819,10 @@ mutate "a pass started by a dispatched run's completion is recovered again" "$CA
   "s@ && github\.event\.workflow_run\.event != 'workflow_dispatch'@@" recovers_a_failed_pass
 mutate "a fork's draft/ready toggle can hold the merge-lane group" "$CALLEE" \
   "s@ && !(github\.event_name == 'pull_request_target' && github\.event\.pull_request\.head\.repo\.full_name != github\.repository)@@" recovers_a_failed_pass
+mutate "a fork's CI completion can hold the merge-lane group through the recover wait" "$CALLEE" \
+  "s@ && !(github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_repository\.full_name != github\.repository)@@" recovers_a_failed_pass
+mutate "the workflow_run fork guard is inverted, so only a fork's pass recovers" "$CALLEE" \
+  "s@head_repository\.full_name != github\.repository) && !(github\.event_name == 'pull_request_target'@head_repository.full_name == github.repository) \&\& !(github.event_name == 'pull_request_target'@" recovers_a_failed_pass
 mutate "the fork guard compares the wrong repository" "$CALLEE" \
   "s@head\.repo\.full_name != github\.repository@head.repo.full_name != github.event.repository.full_name@" recovers_a_failed_pass
 mutate "the dispatch is made with the App's exhausted token" "$CALLEE" \

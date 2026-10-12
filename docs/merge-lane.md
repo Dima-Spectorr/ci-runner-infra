@@ -1197,7 +1197,12 @@ contributor could toggle their own pull request between draft and ready to start
 lane runs, and each failing one would hold the repository-wide `merge-lane`
 concurrency group through a wait of up to 900s. The pass itself still runs
 and its failure is still red; only the recovery is skipped, and the watchdog
-and the next CI completion cover it.
+and the next CI completion cover it. The same holds for a `workflow_run` event
+whose completed run came from another repository
+(`github.event.workflow_run.head_repository.full_name != github.repository`,
+#1524): the lane job lets a fork's genuine CI completion through to merge, but
+its failure is not recovered. An absent head repository compares unequal, so
+it skips too.
 
 **The wait holds the caller's lock.** The caller job's `concurrency` group
 covers the whole called workflow, `recover` included, so other passes queue
