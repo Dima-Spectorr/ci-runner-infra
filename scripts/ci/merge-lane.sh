@@ -112,6 +112,9 @@ LANE_CALLS="$LANE_TMP/api-calls"
 LANE_QUOTA="$LANE_TMP/quota"
 gh() {
   if [ "${1:-}" = api ]; then
+    # Answered from this pass's GraphQL snapshot when it holds the body: no
+    # call is made, so none is counted or recorded (#1541).
+    if lane_snap_serve "$@"; then return 0; fi
     if [ -n "$LANE_RECORD" ]; then
       lane_gh_record "$@"
       return
@@ -164,10 +167,13 @@ fi
 # API answer carried (`x-ratelimit-*`, noted by `lane_gh_call`), or nothing when
 # no answer has carried one yet. Never `GET /rate_limit`: that endpoint said
 # `used=0` while the same token's real calls were being refused (#1543).
+# [graphql] — the graphql bucket's window instead, as the newest GraphQL
+# answer carried it.
 lane_quota() {
-  local q
-  [ -s "$LANE_QUOTA" ] || return 0
-  q="$(cat "$LANE_QUOTA" 2>/dev/null)" || return 0
+  local q f="$LANE_QUOTA"
+  [ "${1:-}" != graphql ] || f="$LANE_QUOTA.graphql"
+  [ -s "$f" ] || return 0
+  q="$(cat "$f" 2>/dev/null)" || return 0
   [[ "$q" =~ ^[0-9?]+\ [0-9]+\ [0-9?]+\ [0-9]+$ ]] && printf '%s' "$q"
   return 0
 }
@@ -212,6 +218,22 @@ lane_quota_allows() {
       return 1
       ;;
   esac
+  # THE GRAPHQL BUCKET HOLDS TOO, BUT ONLY ON WHAT IT SAID (#1541). The open
+  # list is read from it, so a pass started under its floor is blind from its
+  # first read. It is never probed: a run's first pass has not read it yet, and
+  # the list read that would tell is the pass itself, which costs a handful of
+  # points of the 5000. Unknown therefore lets the pass start; known and under
+  # the floor holds it, like the core window.
+  q="$(lane_quota graphql)"
+  [ -n "$q" ] || return 0
+  read -r limit remaining used reset <<<"$q"
+  verdict="$(lane_quota_verdict "$remaining" "$reset" "$QUOTA_FLOOR" "$(date -u +%s)")"
+  when="$(date -u -d "@$reset" +%H:%M:%SZ)"
+  echo "lane: graphql quota at $label: remaining=$remaining of limit=$limit used=$used resets=$when, from the lane's newest GraphQL answer ($verdict)"
+  if [ "$verdict" = hold:below-floor ]; then
+    LANE_SKIP_REASON="the merge App's shared GraphQL quota, which the open list is read from, is at $remaining of $limit, under the floor of $QUOTA_FLOOR, until $when"
+    return 1
+  fi
   return 0
 }
 
@@ -2051,11 +2073,20 @@ one_pass() {
   # And it says WHY, for the reason the base comparison says why: on a schedule,
   # a missing App permission and a transient 5xx print the same line every
   # fifteen minutes forever, and nothing distinguishes them.
+  #
+  # ONE GRAPHQL READ A PAGE (#1541). The list comes from `lane_snapshot`, which
+  # also writes every head's checks, suites, runs and statuses, and the
+  # mergeability GitHub has computed, as the REST bodies the walk reads; the
+  # `gh` wrapper answers those reads from it. A pass costs its pages plus the
+  # reads the snapshot cannot answer, not five reads an open pull request. The
+  # snapshot is this pass's only: it is replaced at the start of every pass.
   local prs_raw='' list_err walk_began
   walk_began="$(date -u +%s)"
   list_err="$(mktemp)"
-  if ! prs_raw="$(gh api --paginate "repos/$R/pulls?state=open&base=$LANE_BASE&per_page=100" \
-    --jq '.[] | (.number|tostring), .head.sha, (.draft|tostring), ((.labels // []) | map(.name) | join(",")), ((.title // "") | gsub("[\r\n]"; " ")), (.user.login // "")' 2>"$list_err")"; then
+  LANE_SNAP="$LANE_TMP/snap"
+  rm -rf "$LANE_SNAP"
+  if ! mkdir -p "$LANE_SNAP" 2>"$list_err" || ! prs_raw="$(lane_snapshot "$LANE_SNAP" 2>"$list_err")"; then
+    LANE_SNAP=''
     echo "lane: cannot list the open pull requests on $LANE_BASE — the lane is blind, not idle"
     echo "lane: the list read said: $(tr '\n' ' ' <"$list_err" | cut -c1-400)"
     rm -f "$list_err"
@@ -2063,6 +2094,7 @@ one_pass() {
     return 1
   fi
   rm -f "$list_err"
+  echo "lane: $(cat "$LANE_SNAP/summary" 2>/dev/null)"
   if [ -z "$prs_raw" ]; then
     echo "lane: no open pull requests on $LANE_BASE"
     return 1
@@ -2344,7 +2376,7 @@ lane_walk() {
       # here, not an empty string — and `true`/`false` are the only two values
       # downstream is allowed to see as an answer.
       local reread=''
-      reread="$(gh api "repos/$R/pulls/$num" --jq '.mergeable|tostring' 2>/dev/null)" || reread=''
+      reread="$(LANE_SNAP='' gh api "repos/$R/pulls/$num" --jq '.mergeable|tostring' 2>/dev/null)" || reread=''
       case "$reread" in
         true | false) mergeable="$reread" ;;
         *) mergeable=null ;;
@@ -3071,7 +3103,7 @@ lane_take_action() {
       # One call per merge, never per candidate. Anything but `ok` skips this
       # pull request for the pass (return 2) and the batch goes on.
       local fresh=() premerge
-      mapfile -t fresh < <(gh api "repos/$R/pulls/$action_num" \
+      mapfile -t fresh < <(LANE_SNAP='' gh api "repos/$R/pulls/$action_num" \
         --jq '.state, (.draft|tostring), .head.sha, ((.labels // []) | map(.name) | join(","))' 2>/dev/null)
       if [ "${#fresh[@]}" -ne 4 ]; then
         premerge="skip:fresh-read-unreadable"
