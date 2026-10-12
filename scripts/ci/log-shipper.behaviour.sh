@@ -308,8 +308,8 @@ run_suite() {
     printf '{"__CURSOR":"%s","__REALTIME_TIMESTAMP":"1790000000123456","__MONOTONIC_TIMESTAMP":"%s","_BOOT_ID":"b00t","PRIORITY":"6","_UID":"0","_PID":"1","_SYSTEMD_UNIT":"init.scope","SYSLOG_IDENTIFIER":"systemd","UNIT":"%s","MESSAGE":"%s"%s}\n' \
       "$1" "${1#c}000" "$2" "$3" "${4:-}"
   }
-  # shellcheck disable=SC2129
   sysd c20 ci-runner@3.service 'Stopping ci-runner@3.service - Runner slot 3...' ',"JOB_TYPE":"stop"' >"$SD/journal.jsonl"
+  # shellcheck disable=SC2129
   sysd c21 user@1001.service 'user@1001.service: Deactivated successfully.' >>"$SD/journal.jsonl"
   sysd c22 google-guest-agent.service 'Stopped google-guest-agent.service - Google Compute Engine Guest Agent.' ',"JOB_TYPE":"stop","JOB_RESULT":"done"' >>"$SD/journal.jsonl"
   sysd c23 ci-dockerd@3.service 'ci-dockerd@3.service: Main process exited, code=killed, status=15/TERM' >>"$SD/journal.jsonl"
