@@ -420,6 +420,14 @@ has_slot_reset() { # <file>
   # …and a slot whose previous job never completed does not get to run the next
   # one: that is the single state in which _actions cannot be trusted either
   matches "$code" 'fail_after=1' || return 1
+  # ...but the COMPLETED hook never turns a finished job red (#1544, #1484): the
+  # started shim stays an exec, the completed shim reports and exits 0, and the
+  # failed reset is recorded root-side so the sweep fences the slot at once
+  matches "$code" "reset='exec sudo -n /opt/ci/job-hooks/slot-reset\.sh started'" || return 1
+  matches "$code" "reset='sudo -n /opt/ci/job-hooks/slot-reset\.sh completed && exit 0" || return 1
+  matches "$code" 'if \[ "\\\$stage" = completed \] && \[ "\\\$rc" != 0 \] && \[ -n "\\\$\{SUDO_UID:-\}" \]; then' || return 1
+  matches "$code" ': >"\\\$SLOT_STATE/\\\$idx/unclean-after-job"' || return 1
+  matches "$code" 'rm -f -- "\\\$burns" "\\\$SLOT_STATE/\\\$idx/unclean-after-job"' || return 1
 
   # ONE RESET AT A TIME PER SLOT. The hooks alone were serial — the runner does
   # not start a job's hook while another job's is running on the same slot — so
@@ -1343,6 +1351,8 @@ has_slot_sweep() { # <file>
   # to persist turns that from a wrong action into a skipped tick.
   matches "$code" '^GRACE=60$' || return 1
   matches "$code" '\[ \\\$\(\(now - seen\)\) -ge "\\\$GRACE" \] \|\| continue' || return 1
+  # a slot whose own completed hook could not clean it skips the grace (#1544)
+  matches "$code" 'if \[ ! -f "\\\$dir/unclean-after-job" \]; then' || return 1
   # …and a slot that came back clears the clock rather than carrying a
   # measurement taken before a whole job toward its next dirty spell
   counts "$code" 'rm -f -- "\\\$since"' 3 || return 1
@@ -2096,6 +2106,8 @@ mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-re
 mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'                                            has_slot_reset
 mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
+mutate "completed hook fails the job again" "s@reset='sudo -n /opt/ci/job-hooks/slot-reset.sh completed \&\& exit 0@reset='exec sudo -n /opt/ci/job-hooks/slot-reset.sh completed@"   has_slot_reset
+mutate "failed completed not recorded"     's@: >"\\\$SLOT_STATE/\\\$idx/unclean-after-job"@: >/dev/null@'                  has_slot_reset
 mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
@@ -2249,7 +2261,7 @@ mutate "the marker alone proves idle"       's@! pgrep -u "@pgrep -u "@'        
 
 # #278. Each of these is a way the count stops meaning "in a row, right now",
 # which is the only shape the take-out-of-service rule can read.
-mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns"$@    :@'                                             has_slot_condemn
+mutate "burns become a lifetime total"      's@^    rm -f -- "\\\$burns" "\\\$SLOT_STATE/\\\$idx/unclean-after-job"$@    :@'                                           has_slot_condemn
 mutate "a burned job is not counted"        's@^  burn_add$@  :@'                                                             has_slot_condemn
 mutate "a failed reset is not counted"      's@^    burn_add$@    :@'                                                         has_slot_condemn
 mutate "the count is slot-writable"         's@burns="\\\$SLOT_STATE/\\\$idx/burns"@burns="\$home/burns"@'                    has_slot_condemn
@@ -2341,6 +2353,7 @@ mutate "state read as a yes/no again"       's@state=\\\$(systemctl is-active "c
 mutate "a slot mid-transition swept anyway" 's@    activating | deactivating | reloading) continue ;;@    esac_placeholder) : ;;@' has_slot_sweep
 mutate "one sample is enough"               's@^GRACE=60$@GRACE=0@'                                                       has_slot_sweep
 mutate "the grace never checked"            's@-ge "\\\$GRACE" \] || continue@-ge 0 ] || true@'                            has_slot_sweep
+mutate "unclean record ignored by sweep"   's@if \[ ! -f "\\\$dir/unclean-after-job" \]; then@if true; then@'           has_slot_sweep
 mutate "the agent left up during the reset" 's@systemctl stop "ci-runner@systemctl show "ci-runner@'                       has_slot_sweep
 mutate "no second look for a live job"      's@refusing to reset underneath one@resetting anyway@'                         has_slot_sweep
 mutate "a stop that failed treated as done" 's@its agent would not stop@its agent stopped@'                                has_slot_sweep

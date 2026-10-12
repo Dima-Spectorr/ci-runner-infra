@@ -585,9 +585,21 @@ install_job_hooks() {
   # in: ACTIONS_RUNNER_HOOK_JOB_STARTED and ..._COMPLETED are two variables
   # naming two paths, and neither script is passed an argument saying which one
   # it is. Two one-line files is the whole of the difference.
-  local stage renew
+  local stage renew reset
   for stage in started completed; do
     renew=': the hold is renewed on job-started only, never here'
+    # STARTED stays fatal: a slot that is not clean must not run the job that is
+    # arriving. COMPLETED does not (#1544, #1484): the job has already run and
+    # its steps are its verdict, so a reset that fails here is reported as a
+    # warning and the slot is taken out by the sweep (slot-reset.sh records
+    # the failure, withholds the marker and counts the burn) instead of the
+    # finished job being turned red.
+    reset='exec sudo -n /opt/ci/job-hooks/slot-reset.sh started'
+    if [ "$stage" = completed ]; then
+      reset='sudo -n /opt/ci/job-hooks/slot-reset.sh completed && exit 0
+echo "::warning title=CI runner slot not cleaned::this job passed or failed on its own steps; the runner slot could not be cleaned afterwards and is taken out of service until it is"
+exit 0'
+    fi
     if [ "$stage" = started ]; then
       # shellcheck disable=SC2016  # ${GITHUB_RUN_ID} must survive into the hook
       # file verbatim. Expansion is not recursive, so $renew going into the
@@ -615,7 +627,7 @@ set -uo pipefail
 # \`--run\` is what keeps a job of some OTHER run from renewing this one's hold;
 # the helper refuses when the ids differ.
 $renew
-exec sudo -n /opt/ci/job-hooks/slot-reset.sh $stage
+$reset
 EOF
     chown root:root "/opt/ci/job-hooks/job-$stage.sh" || return 1
     chmod 0755 "/opt/ci/job-hooks/job-$stage.sh" || return 1
@@ -1940,10 +1952,37 @@ fi
 # burn it may have just recorded above is already counted.
 if [ "\$stage" != started ]; then
   if [ "\$rc" = 0 ]; then
-    rm -f -- "\$burns"
+    rm -f -- "\$burns" "\$SLOT_STATE/\$idx/unclean-after-job"
   else
     burn_add
   fi
+fi
+
+# A COMPLETED HOOK THAT COULD NOT CLEAN (#1544, #1484). The job-completed shim
+# no longer passes this exit code on to the job: the job's own steps are the
+# verdict on the job, and a slot that could not be cleaned is the fleet's
+# problem, not the pull request's. Measured 2026-10-11: \`docker ps\` failing
+# against a rootless daemon that was mid-restart turned a passed \`data-model\`
+# check red, and a red check at a PR head blocks the merge lane.
+#
+# What keeps that from becoming a silent dirty slot is everything this script
+# already does on failure -- the marker is withheld, the burn is counted -- plus
+# this record, root-written for the same reason the marker is. It tells the
+# sweep that the dirt is a FAILED reset after a job that ended, not a job on its
+# way in, so the sweep does not wait out its grace: it stops the agent, resets
+# the slot with no job on it, and only then lets it take work again. And the
+# sweep is asked to run a few seconds from now rather than on its next tick,
+# because the agent goes back to listening the moment this hook returns and the
+# window in which it can win a job on a dirty slot is what this narrows. Only
+# on the slot's own completed hook: SUDO_UID is set by sudo and by nothing else,
+# and the sweep and the boot reset call this script directly.
+if [ "\$stage" = completed ] && [ "\$rc" != 0 ] && [ -n "\${SUDO_UID:-}" ]; then
+  : >"\$SLOT_STATE/\$idx/unclean-after-job" 2>/dev/null ||
+    say "slot \$idx: could not record that its completed reset failed"
+  systemd-run --quiet --no-block --collect --on-active=5 \
+    --unit="ci-slot-sweep-after-\$idx-\$(date +%s)" \
+    /usr/bin/systemctl start --no-block ci-slot-sweep.service >/dev/null 2>&1 ||
+    say "slot \$idx: could not bring the sweep forward -- its next tick takes the slot out instead"
 fi
 
 [ "\$fail_after" = 1 ] && exit 1
@@ -2853,7 +2892,14 @@ for idx in \$(seq 1 "\$SLOTS"); do
     [0-9]*) ;;
     *) seen="\$now"; printf '%s\n' "\$now" >"\$since" || say "slot \$idx: could not record when it went dirty" ;;
   esac
-  [ \$((now - seen)) -ge "\$GRACE" ] || continue
+  # No grace for a slot whose own completed hook ran and could not clean it
+  # (slot-reset.sh writes the record, root-only). There is no job arriving here
+  # to protect -- the job that dirtied it has ended -- and every second the
+  # agent stays up is a second in which it can win a job that its started hook
+  # will then fail.
+  if [ ! -f "\$dir/unclean-after-job" ]; then
+    [ \$((now - seen)) -ge "\$GRACE" ] || continue
+  fi
 
   # THE AGENT GOES DOWN FIRST, and that is what makes the reset below safe
   # rather than merely likely to be safe. With the unit stopped no job can be
