@@ -767,6 +767,10 @@ jobs:
         run: bash scripts/ci/merge-lane-decision.selftest.sh
       - name: merge-lane structural self-test
         run: bash scripts/ci/merge-lane.selftest.sh
+      # The lane resolves the commit it runs from the caller's `uses:` line in
+      # an inline step; this runs that exact block against a stub API (#1555).
+      - name: merge-lane callee-pin self-test
+        run: bash scripts/ci/merge-lane-callee.selftest.sh
       # The structural test above pins the fetch phase's WIRING on the text of
       # the driver. This one runs it: the whole driver twice against a stand-in
       # for the API, once reading serially and once reading concurrently, and

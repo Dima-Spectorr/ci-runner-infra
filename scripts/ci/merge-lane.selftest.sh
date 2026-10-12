@@ -535,7 +535,25 @@ checks_out_its_own_implementation() {
   local code
   code=$(code_of "$1")
   matches "$code" 'repository: \$\{\{ inputs.implementation-repository \}\}' || return 1
-  matches "$code" 'ref: \$\{\{ inputs.implementation-ref \|\| github.job_workflow_sha \}\}'
+  pins_its_checkout_to_the_resolved_commit "$1"
+}
+
+# THE CHECKOUT REF IS NEVER EMPTY, SO NEVER THE DEFAULT BRANCH (#1555).
+#
+# `actions/checkout` handed an empty `ref:` clones the default branch, and
+# `github.job_workflow_sha` was empty in every run measured — so every consumer
+# pin pinned the workflow file and none of the scripts. Both checkouts take the
+# commit the resolver step names, and nothing else; the resolver's own
+# behaviour is `merge-lane-callee.selftest.sh`.
+pins_its_checkout_to_the_resolved_commit() {
+  local code
+  code=$(code_of "$1")
+  ! matches "$code" 'job_workflow_sha' || return 1
+  matches "$code" '^          ref: \$\{\{ steps\.callee\.outputs\.sha \}\}$' || return 1
+  matches "$code" '^          ref: \$\{\{ needs\.lane\.outputs\.callee-sha \}\}$' || return 1
+  matches "$code" '^      callee-sha: \$\{\{ steps\.callee\.outputs\.sha \}\}$' || return 1
+  matches "$code" "needs\.lane\.outputs\.callee-sha != ''" || return 1
+  [ "$(printf '%s\n' "$code" | grep -cE '^          ref: ')" = 2 ]
 }
 
 # Every list endpoint the lane reads is paginated. Unpaginated, a required check
@@ -1331,8 +1349,8 @@ check() { # <predicate> <file> <description>
 # see an input value, so an automatic update moved the workflow and left the
 # driver on the previous release.
 #
-# The workflow now defaults the ref to `github.job_workflow_sha`, the commit it
-# was itself called at, so the second sha is not merely unnecessary — a
+# The workflow now resolves the ref from the caller's own `uses:` line (#1555),
+# the commit it was called at, so the second sha is not merely unnecessary — a
 # consumer who copies one out of an old example reintroduces the skew by hand.
 # The gate is therefore the opposite of the old one: the example pins the
 # `uses:` line and says nothing else.
@@ -2183,8 +2201,14 @@ mutate "the callee inlines a decision instead of delegating" "$CALLEE" \
   's|^        run: bash scripts/ci/merge-lane\.sh$|        run: gh pr merge --squash|' delegates_the_decision
 mutate "the checkout reverts to the caller's tree" "$CALLEE" \
   's@^          repository: .*@          fetch-depth: 0@' checks_out_its_own_implementation
-mutate "the implementation ref stops being pinnable" "$CALLEE" \
-  's@^          ref: .*inputs.implementation-ref.*@          ref: main@' checks_out_its_own_implementation
+mutate "the lane checkout falls back to the default branch" "$CALLEE" \
+  's@^          ref: ${{ steps\.callee\.outputs\.sha }}@          ref: ${{ inputs.implementation-ref || github.job_workflow_sha }}@' checks_out_its_own_implementation
+mutate "the recover checkout falls back to the default branch" "$CALLEE" \
+  's@^          ref: ${{ needs\.lane\.outputs\.callee-sha }}@          ref: ${{ inputs.implementation-ref }}@' checks_out_its_own_implementation
+mutate "recover runs without a resolved commit" "$CALLEE" \
+  "s@ && needs\.lane\.outputs\.callee-sha != ''@@" checks_out_its_own_implementation
+mutate "the lane stops publishing the commit it ran" "$CALLEE" \
+  's@^      callee-sha: .*@      callee-sha: ""@' checks_out_its_own_implementation
 mutate "the CLI install step is dropped" "$CALLEE" \
   's@^        run: bash scripts/ci/ensure-gh\.sh$@        run: true@' guarantees_the_cli_it_runs_on
 
