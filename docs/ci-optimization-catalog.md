@@ -890,13 +890,13 @@ describing nothing.
    its own `.git/hooks` and a `_tool` directory the runner puts on `PATH`. Those
    are *executed*, not read, and the list is wrong the moment a tool picks a new
    path. `install_job_hooks()` therefore **replaces** the home rather than
-   cleaning it: `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `..._COMPLETED` both run a
-   root-owned `slot-reset.sh` that empties `$HOME` and rebuilds it from a
-   root-owned template, and removes the previous job's workspace and tool cache.
-   Both ends, because the completed hook alone leaves a live credential on disk
-   while the slot idles; and a third reset as `ExecStartPre=+` on the agent unit,
-   because neither hook runs when an agent is killed mid-job or the host reboots
-   warm. It is installed on every pool, including pools with no job service
+   cleaning it: a root-owned `slot-reset.sh` empties `$HOME` and rebuilds it
+   from a root-owned template, and removes the previous job's workspace and tool
+   cache. It runs at job start (`ACTIONS_RUNNER_HOOK_JOB_STARTED`) and, since
+   every agent is run-once (#1481), at job end from the root slot loop after the
+   agent exits and before the next registration -- which also covers an agent
+   killed mid-job and a warm reboot. There is no `..._COMPLETED` hook (#1570): it
+   ran the same full reset seconds before the loop did, two per job. It is installed on every pool, including pools with no job service
    account, where an inherited credential is worst because nothing there should
    hold Google credentials at all.
 
@@ -973,7 +973,8 @@ describing nothing.
    starts over. A slot whose job never reached its completed hook is reset
    before its next registration, so recovery never costs a job. The reset takes
    a per-slot `flock`, because the loop makes root a second concurrent caller
-   of a script the runner's hooks also call.
+   of a script the runner's started hook also calls. The loop's reset is the
+   only end-of-job reset (#1570).
 
    **And a slot the timer cannot recover leaves the pool rather than eating
    it.** Retrying forever is right for a transient obstruction and wrong for a

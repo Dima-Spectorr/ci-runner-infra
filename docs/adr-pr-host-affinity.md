@@ -528,13 +528,14 @@ mechanisms, and the split is forced rather than chosen.
 
 The owner calls `ci-pin-hold --reserve-slot`, which writes a record into the
 slot's own state directory. **Unprivileged, deliberately.** A slot's sudoers
-grant is an allowlist of two literal command lines (`slot-reset.sh started`,
-`slot-reset.sh completed`), and the index is taken from `SUDO_UID` so a slot
+grant is an allowlist of one literal command line (`slot-reset.sh started`;
+the end-of-job reset is the root slot loop's since #1570), and the index is taken from `SUDO_UID` so a slot
 cannot even name another. Adding a rule that lets PR-authored code stop a
 systemd unit would undo the most carefully argued fence on the host to save
 writing a file.
 
-`slot-reset.sh` — already root, already invoked before and after every job —
+`slot-reset.sh` — already root, already invoked before every job by the started
+hook and after every job by the slot loop —
 reads that record and spares this slot's containers while performing its wipe of
 the workspace, home and credentials unchanged.
 
@@ -542,7 +543,7 @@ the workspace, home and credentials unchanged.
 teardown (§3.5) and the TTL sweep. Not by the hook and not by the controller,
 and neither omission is an oversight:
 
-* **Not the hook.** `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` executes inside
+* **Not the hook.** A job hook executes inside
   `ci-runner@<idx>.service`; a hook that stopped its own unit would have systemd
   SIGTERM the agent mid-report, so the slot would be reserved and the job lost.
 * **Not the controller.** The controller has no probe that would find a

@@ -350,23 +350,35 @@ has_slot_reset() { # <file>
   local code
   code=$(code_of "$1")
 
-  # both ends of the job, on the AGENT unit
+  # the job-started check, on the AGENT unit
   matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started\.sh$' || return 1
-  matches "$code" '^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed\.sh$' || return 1
   # …and unconditionally, not folded into the JOB_SA branch that gates BROKER_ENV:
   # a pool with no job identity is where an inherited credential is worst.
   ! matches "$code" 'if \[ -n "\$JOB_SA" \].*ACTIONS_RUNNER_HOOK' || return 1
-  # plus the third reset, which is the one the two hooks cannot cover: an agent
-  # killed mid-job never ran its completed hook, and a warm host reboots over
-  # the previous boot's leftovers. The slot loop (root) starts with a reset and
+  # The end-of-job reset is the slot loop's (root): it starts with a reset and
   # resets again after every agent exit, before it mints the next runner (#1481).
+  # That covers an agent killed mid-job and a warm host rebooting over the
+  # previous boot's leftovers.
   matches "$code" '^need_reset=1$' || return 1
   matches "$code" '^    if ! timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx" >/dev/null 2>&1; then$' || return 1
+  # ONE RESET PER JOB (#1570). Every agent is run-once, so a job-completed hook
+  # resetting inside the agent ran the same full reset the loop runs a few
+  # seconds later: two per job, measured 381 resets for 181 registrations
+  # fleet-wide in one hour on 2026-10-13. No completed hook, and the only reset
+  # a slot itself can request is the job-started one.
+  ! matches "$code" 'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' || return 1
+  ! matches "$code" 'cat >"?/opt/ci/job-hooks/job-(completed|\$stage)' || return 1
+  counts "$code" 'sudo -n /opt/ci/job-hooks/slot-reset\.sh' 1 || return 1
+  matches "$code" '^exec sudo -n /opt/ci/job-hooks/slot-reset\.sh started$' || return 1
+  # …and slot-reset.sh itself refuses a slot asking for anything else, so a
+  # widened sudoers rule still cannot bring the second reset back
+  matches "$code" 'may ask only for the job-started reset' || return 1
+  matches "$code" '^  \[ "\\\$stage" = started \] \|\|$' || return 1
 
   # the files exist, root-owned and not writable by the slots that execute them —
   # one set shared by every uid on the host, and one of them runs as root
-  matches "$code" 'chown root:root "/opt/ci/job-hooks/job-\$stage\.sh"' || return 1
-  matches "$code" 'chmod 0755 "/opt/ci/job-hooks/job-\$stage\.sh"' || return 1
+  matches "$code" 'chown root:root /opt/ci/job-hooks/job-started\.sh' || return 1
+  matches "$code" 'chmod 0755 /opt/ci/job-hooks/job-started\.sh' || return 1
   matches "$code" 'chown root:root /opt/ci/job-hooks/slot-reset\.sh' || return 1
   matches "$code" 'chmod 0755 /opt/ci/job-hooks/slot-reset\.sh' || return 1
   # installed before any agent registers, and fatal: an agent whose JOB_STARTED
@@ -411,7 +423,9 @@ has_slot_reset() { # <file>
   # WHO gets reset is never the caller's choice when the caller is a slot: sudo
   # sets SUDO_UID from the real invoking user, so slot 2 cannot name slot 3.
   matches "$code" 'if \[ -n "\\\$\{SUDO_UID:-\}" \]' || return 1
-  matches "$code" 'NOPASSWD: /opt/ci/job-hooks/slot-reset\.sh started, /opt/ci/job-hooks/slot-reset\.sh completed' || return 1
+  # …and the job-started reset is all a slot may ask root for (#1570)
+  matches "$code" "NOPASSWD: /opt/ci/job-hooks/slot-reset\\.sh started\\\\n'" || return 1
+  ! matches "$code" 'NOPASSWD: /opt/ci/job-hooks/slot-reset\.sh started,' || return 1
   # sudoers is validated before it is installed — a file there that does not
   # parse does not fail open on one rule, it stops every sudo on the host
   matches "$code" 'visudo -cqf "\$tmp"' || return 1
@@ -429,12 +443,11 @@ has_slot_reset() { # <file>
   # …and a slot whose previous job never completed does not get to run the next
   # one: that is the single state in which _actions cannot be trusted either
   matches "$code" 'fail_after=1' || return 1
-  # ...but the COMPLETED hook never turns a finished job red (#1544, #1484): the
-  # started shim stays an exec, the completed shim reports and exits 0, and the
-  # failed reset is counted as a burn, and the slot loop resets again before it
-  # registers the slot for anything else (#1481)
-  matches "$code" "reset='exec sudo -n /opt/ci/job-hooks/slot-reset\.sh started'" || return 1
-  matches "$code" "reset='sudo -n /opt/ci/job-hooks/slot-reset\.sh completed && exit 0" || return 1
+  # ...but an end-of-job reset never turns a finished job red (#1544, #1484):
+  # it runs only in the slot loop, after the agent has exited (#1570), the
+  # started shim stays an exec, and a failed reset is counted as a burn and
+  # keeps the slot unregistered (#1481)
+  matches "$code" '^exec sudo -n /opt/ci/job-hooks/slot-reset\.sh started$' || return 1
   matches "$code" '^    rm -f -- "\\\$burns"$' || return 1
 
   # ONE RESET AT A TIME PER SLOT. The hooks alone were serial — the runner does
@@ -786,10 +799,10 @@ has_slot_quiesce() { # <file>
   matches "$code" '\$1 != "dbus.service" && \\\$1 != "dbus.socket"' || return 1
   matches "$code" 'would not stop: .* -- refusing to call this slot clean' || return 1
   counts "$code" '\|\| return "\\\$units_rc"' 3 || return 1
-  #    and the agent's own tree when the caller is NOT the agent. The idle sweep
-  #    and the sweeper's teardown are root timers: without this they would kill
-  #    the listener of every slot they touched.
-  matches "$code" 'if \[ -z "\\\$\{SUDO_UID:-\}" \]; then' || return 1
+  #    and the agent's own tree. Every caller is root (#1570) -- boot, the slot
+  #    loop, the sweeper's teardown: without this they would kill the listener
+  #    of every slot they touched.
+  matches "$code" '^  if agent=\\\$\(systemctl show -p MainPID --value "ci-runner@\\\$idx\.service" 2>/dev/null\); then$' || return 1
   matches "$code" 'ci-runner@\\\$idx\.service' || return 1
   matches "$code" 'sparing everything in its unit rather than guessing' || return 1
 
@@ -1177,10 +1190,14 @@ has_pin_hold() { # <file>
   # the runs long enough for a TTL to matter — so the renewal is in the job hook
   # every job goes through, and it is never fatal.
   matches "$code" "sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run .\\\$\{GITHUB_RUN_ID:-\}." || return 1
-  # …on job-STARTED only. A renewal in the completed hook pushes the expiry a
-  # full TTL past the last job of the run, over a host nothing is using.
-  matches "$code" 'if \[ "\$stage" = started \]; then' || return 1
-  matches "$code" 'renewed on job-started only' || return 1
+  # …on job-STARTED only. A renewal at job end pushes the expiry a full TTL
+  # past the last job of the run, over a host nothing is using. There is one
+  # job hook (#1570), so the renewal is written once, into that hook.
+  counts "$code" 'sudo -n /opt/ci/job-hooks/pin-hold\.sh renew' 1 || return 1
+  # …and CALLED once: the line above counts the assignment, which is text; the
+  # call is the line that runs it, and a second call is a job-end renewal
+  counts "$code" '^\$renew$' 1 || return 1
+  ! matches "$code" 'ACTIONS_RUNNER_HOOK_JOB_COMPLETED' || return 1
   # …and it names the run, so a job of some OTHER run cannot feed this hold. It
   # was every job renewing every hold: after the owner finished or was
   # cancelled, an unrelated job on any slot pushed the expiry forward again and
@@ -2085,8 +2102,11 @@ fi
 mutate() { # <description> <sed-program> <predicate> — predicate must go false
   local desc="$1" prog="$2" pred="$3" tmp
   tmp=$(mktemp)
-  sed "$prog" "$SCRIPT" >"$tmp"
-  if cmp -s "$SCRIPT" "$tmp"; then
+  if ! sed "$prog" "$SCRIPT" >"$tmp"; then
+    # A sed program that does not parse writes an EMPTY file, every predicate
+    # fails on it, and the mutation read as detected while testing nothing.
+    bad "mutation's sed program failed: $desc"
+  elif cmp -s "$SCRIPT" "$tmp"; then
     # The sed program matched nothing, so the predicate was handed the REAL file
     # and passing proves nothing. Left undetected this reads as a live mutation
     # for as long as the anchor stays stale.
@@ -2161,7 +2181,12 @@ mutate "helper install not fatal"         's|\|\| die .could not install the reg
 mutate "template left without the config" 's@write_docker_cred_helpers >"\$SLOT_TEMPLATE/\.docker/config\.json"@true >"$SLOT_TEMPLATE/.docker/config.json"@' has_registry_credentials
 
 mutate "reset only after the job"         's@^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$@@'                   has_slot_reset
-mutate "reset only before the job"        's@^Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=.*$@@'                 has_slot_reset
+# ONE reset per job (#1570): each of these brings the old second reset back.
+mutate "the completed hook comes back"    's@^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$@&\nEnvironment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh@' has_slot_reset
+mutate "the completed hook file is written" 's@^  cat >/opt/ci/job-hooks/job-started.sh <<EOF$@  cat >/opt/ci/job-hooks/job-completed.sh <<EOF@' has_slot_reset
+mutate "a slot asks for a second reset"   's@^exec sudo -n /opt/ci/job-hooks/slot-reset.sh started$@sudo -n /opt/ci/job-hooks/slot-reset.sh completed\n&@' has_slot_reset
+mutate "a slot may ask for the end-of-job reset" 's@^  \[ "\\\$stage" = started \] ||$@  true ||@'          has_slot_reset
+mutate "sudoers grants the end-of-job reset again" 's@NOPASSWD: /opt/ci/job-hooks/slot-reset.sh started@&, /opt/ci/job-hooks/slot-reset.sh completed@' has_slot_reset
 mutate "a slot registered without a reset" 's@^need_reset=1$@need_reset=0@'                      has_slot_reset
 mutate "the loop's reset dropped"       's@if ! timeout 900 /opt/ci/job-hooks/slot-reset.sh completed "\$idx"@if false@' has_slot_reset
 mutate "hook install no longer fatal"     's@install_job_hooks || die.*@install_job_hooks || true@'                has_slot_reset
@@ -2171,11 +2196,10 @@ mutate "home cleaned, never replaced"     's@^cp -a "\\\$SLOT_TEMPLATE/\." "\\\$
 mutate "home never emptied"               's@^( cd -- "\\\$home" && empty_here.*@:@'                                  has_slot_reset
 mutate "home taken from the environment"  's@^home=\\\$(getent passwd.*@home="\$HOME"@'                           has_slot_reset
 mutate "slot names its own index"         's@if \[ -n "\\\${SUDO_UID:-}" \]@if [ -n "\${CI_SLOT:-}" ]@'           has_slot_reset
-mutate "sudoers widened to any argument"  's@ started, /opt/ci/job-hooks/slot-reset.sh completed@@'                has_slot_reset
+mutate "sudoers widened to any argument"  's@NOPASSWD: /opt/ci/job-hooks/slot-reset.sh started@NOPASSWD: /opt/ci/job-hooks/slot-reset.sh@' has_slot_reset
 mutate "sudoers installed unvalidated"    's@visudo -cqf "\$tmp"@true@'                                            has_slot_reset
 mutate "marker left forgeable by the slot" 's@install -d -o root -g root -m 0755 "\$SLOT_STATE/\$idx"@install -d -o "\$u" -g "\$u" -m 0755 "\$SLOT_STATE/\$idx"@' has_slot_reset
 mutate "dirty slot allowed to run anyway" 's@^  fail_after=1$@  fail_after=0@'                                     has_slot_reset
-mutate "completed hook fails the job again" "s@reset='sudo -n /opt/ci/job-hooks/slot-reset.sh completed \&\& exit 0@reset='exec sudo -n /opt/ci/job-hooks/slot-reset.sh completed@"   has_slot_reset
 mutate "work folder left alone"           's@work="\\\$SLOT_ROOT/\\\$idx/_work"@work="\$SLOT_ROOT/\$idx/_none"@'  has_slot_reset
 mutate "starting job loses its actions"   's@keep_actions=1@keep_actions=0@'                                     has_slot_reset
 mutate "prepared workspace unlinked"      's@install -d -o "\\\$u" -g "\\\$u" -m 0755 "\\\$e"@true@'                     has_slot_reset
@@ -2316,7 +2340,8 @@ mutate "the bare renew verb comes back"     's@pin-hold.sh renew --run \*@pin-ho
 mutate "renew accepts an empty run"         's@refusing: renew needs --run <id>@carry on then@'                                 has_pin_hold
 mutate "the host stops renewing the hold"   's@sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run@: renew --run@'           has_pin_hold
 mutate "any run may renew any hold"         's@renew_run" != "\\\$R_RUN"@renew_run" = "" @'                                    has_pin_hold
-mutate "the completed hook renews too"      's@if \[ "\$stage" = started \]; then@if true; then@'                              has_pin_hold
+mutate "the completed hook renews too"      's@^\$renew$@&\n$renew@'                                                         has_pin_hold
+mutate "a completed hook comes back"        's@^Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=.*$@&\nEnvironment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh@' has_pin_hold
 mutate "admission is not serialised"        's@take_lock "the hold" || exit 1@:@'                                             has_pin_hold
 mutate "the sweeper ignores the lock"       's@flock -w 10 9 ||@true ||@'                                              has_pin_hold
 mutate "an expired reservation is free"     's@the sweeper has not released it@go right ahead@'                               has_pin_hold
@@ -2365,7 +2390,7 @@ mutate "the whole journal is read"           's@ "\${matches\[\@\]}" >"\$batch"@
 mutate "journalctl piped into head again"    's@ "\${matches\[\@\]}" >"\$batch" 2>"\$errf"$@ "${matches[\@]}" 2>"$errf" | head -n "$MAX" >"$batch"@' has_log_shipper
 mutate "SIGPIPE left ignored in the unit"    's@^IgnoreSIGPIPE=no$@@'                                                  has_log_shipper
 mutate "the host token goes in argv"         's@-K <(printf .header = "Authorization: Bearer %s"\\n. "\$token")@-H "Authorization: Bearer $token"@' has_log_shipper
-mutate "a unit's own output is shipped"      's@^matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)$@matches+=(+ _PID=1 + _SYSTEMD_UNIT=ci-runner@3.service)@' has_log_shipper
+mutate "a unit's own output is shipped"      's|^matches+=(+ _PID=1 + _SYSTEMD_UNIT=systemd-logind.service _SYSTEMD_UNIT=dbus.service)$|matches+=(+ _PID=1 + _SYSTEMD_UNIT=ci-runner@3.service)|' has_log_shipper
 mutate "host-unit lines fall into the lifecycle log" 's@^UNIT_LOG_ID=ci-host-units$@UNIT_LOG_ID=ci-slot-lifecycle@'                   has_log_shipper
 mutate "a slot tool falls out of the ship list" 's@^IDENTIFIERS=(ci-slot-reset ci-slot-loop @IDENTIFIERS=(ci-slot-reset @' has_log_shipper
 mutate "an unrelated tag is shipped"         's@^IDENTIFIERS=(ci-slot-reset @IDENTIFIERS=(ci-controller ci-slot-reset @'   has_log_shipper

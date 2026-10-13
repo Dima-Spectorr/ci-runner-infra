@@ -719,34 +719,25 @@ install_job_hooks() {
   # OTHER slot's uid — and one of them now runs as root.
   chmod 0755 /opt/ci/job-hooks || return 1
 
-  # Two shims, because the runner tells a hook nothing about which stage it is
-  # in: ACTIONS_RUNNER_HOOK_JOB_STARTED and ..._COMPLETED are two variables
-  # naming two paths, and neither script is passed an argument saying which one
-  # it is. Two one-line files is the whole of the difference.
-  local stage renew reset
-  for stage in started completed; do
-    renew=': the hold is renewed on job-started only, never here'
-    # STARTED stays fatal: a slot that is not clean must not run the job that is
-    # arriving. COMPLETED does not (#1544, #1484): the job has already run and
-    # its steps are its verdict, so a reset that fails here is reported as a
-    # warning and the slot loop keeps the slot unregistered (slot-reset.sh records
-    # the failure, withholds the marker and counts the burn) instead of the
-    # finished job being turned red.
-    reset='exec sudo -n /opt/ci/job-hooks/slot-reset.sh started'
-    if [ "$stage" = completed ]; then
-      reset='sudo -n /opt/ci/job-hooks/slot-reset.sh completed && exit 0
-echo "::warning title=CI runner slot not cleaned::this job passed or failed on its own steps; the runner slot could not be cleaned afterwards and is taken out of service until it is"
-exit 0'
-    fi
-    if [ "$stage" = started ]; then
-      # shellcheck disable=SC2016  # ${GITHUB_RUN_ID} must survive into the hook
-      # file verbatim. Expansion is not recursive, so $renew going into the
-      # unquoted heredoc below inserts this text without re-expanding it, and
-      # the hook then reads the runner's own environment at job time. Expanding
-      # it here would bake in the empty value this boot has.
-      renew='sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run "${GITHUB_RUN_ID:-}" >/dev/null 2>&1 || true'
-    fi
-    cat >"/opt/ci/job-hooks/job-$stage.sh" <<EOF
+  # ONE hook, at job start (#1570). It is fatal: a slot that is not clean must
+  # not run the job that is arriving. There is no job-completed hook. Every
+  # agent is run-once (#1481), so the slot loop already resets the slot after
+  # the agent exits and before it mints the next runner -- as root, with no
+  # agent on the slot, which is a stronger reset than one run from inside the
+  # agent could be. A completed hook doing the same reset first was a second
+  # full reset per job, measured live at ~13-17s of every job's turnaround
+  # (2.1 resets per registration fleet-wide, 2026-10-13), and it bought nothing:
+  # a job that never reaches its completed hook is reset by the loop anyway.
+  # A reset that fails there keeps the slot unregistered and counts the burn,
+  # and the job that just finished is never turned red by it (#1544, #1484).
+  local renew
+  # shellcheck disable=SC2016  # ${GITHUB_RUN_ID} must survive into the hook
+  # file verbatim. Expansion is not recursive, so $renew going into the
+  # unquoted heredoc below inserts this text without re-expanding it, and
+  # the hook then reads the runner's own environment at job time. Expanding
+  # it here would bake in the empty value this boot has.
+  renew='sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run "${GITHUB_RUN_ID:-}" >/dev/null 2>&1 || true'
+  cat >/opt/ci/job-hooks/job-started.sh <<EOF
 #!/usr/bin/env bash
 # Installed by host-startup.sh. Runs as the slot user. See install_job_hooks().
 set -uo pipefail
@@ -760,16 +751,19 @@ set -uo pipefail
 # extend expires, and the sweeper puts the slot back; failing a job over the
 # fleet's own bookkeeping would be the worse outcome by far.
 #
-# STARTED only, and named. On \`completed\` a renewal extends the hold past the
+# At job START, and named. A renewal at job end would extend the hold past the
 # end of the last job of the run, for a full TTL, over a host nothing is using.
 # \`--run\` is what keeps a job of some OTHER run from renewing this one's hold;
 # the helper refuses when the ids differ.
 $renew
-$reset
+exec sudo -n /opt/ci/job-hooks/slot-reset.sh started
 EOF
-    chown root:root "/opt/ci/job-hooks/job-$stage.sh" || return 1
-    chmod 0755 "/opt/ci/job-hooks/job-$stage.sh" || return 1
-  done
+  chown root:root /opt/ci/job-hooks/job-started.sh || return 1
+  chmod 0755 /opt/ci/job-hooks/job-started.sh || return 1
+  # The completed hook this replaced (#1570). Nothing names it any more, but a
+  # warm host reboots over its own boot disk, and a stale root-owned reset hook
+  # beside the live one reads as a second reset that is not happening.
+  rm -f /opt/ci/job-hooks/job-completed.sh
 
   # The reset itself, and it runs as ROOT. Not a preference: a job's containers
   # write into the slot's tree through a user namespace, so the files they leave
@@ -813,9 +807,16 @@ if [ -n "\${SUDO_UID:-}" ]; then
     "\$SLOT_USER_PREFIX"[0-9]*) idx=\${u#"\$SLOT_USER_PREFIX"} ;;
     *) say "refusing: uid \$SUDO_UID (\$u) is not a slot user"; exit 1 ;;
   esac
+  # A slot asks for the job-started reset and nothing else (#1570). The
+  # end-of-job reset is the slot loop's, run as root after the agent exits, and
+  # the sudoers rule grants \`started\` alone; this says the same thing twice so
+  # that a widened rule still cannot make a slot reset itself from inside a job.
+  [ "\$stage" = started ] ||
+    { say "refusing: slot \$idx may ask only for the job-started reset, not '\$(safe "\$stage")'"; exit 1; }
 else
-  # No sudo in the picture: this is systemd's ExecStartPre, which has to supply
-  # the index because there is no invoking user to read it from.
+  # No sudo in the picture: a root caller -- systemd's ExecStartPre, the slot
+  # loop, the pin sweeper -- which has to supply the index because there is no
+  # invoking user to read it from.
   idx="\${2:-}"
 fi
 
@@ -910,8 +911,9 @@ keep_temp=0
 [ "\$stage" = started ] && keep_temp=1
 
 # A job-started that cannot find the marker is a job about to run on a slot
-# whose previous job never reached its completed hook — cancelled hard, agent
-# killed, host lost power mid-job. That is the state that leaves the most
+# that no finished reset has vouched for since its previous job — an audit
+# withdrew the marker, or the reset that should have earned it never completed.
+# That is the state that leaves the most
 # behind, and it is also the one state in which _actions cannot be trusted. So
 # the exception is dropped and the job is FAILED rather than run: one lost job
 # that says why beats a job that silently executed a previous job's action code.
@@ -1188,31 +1190,22 @@ user_manager_pids() { # <uid> -- one pid per line
 # job's worker exits and go on running as the slot user, with a writable home,
 # for as long as the host does.
 #
-# OUR OWN ANCESTRY IS SPARED, and that is the second exclusion. This hook is a
-# child of Runner.Worker, which is a child of Runner.Listener, which is the
-# slot's agent service: killing the chain we are standing on would abort the job
-# whose completed hook is running and take the agent down with it. The chain is
-# walked once from \$\$ -- it cannot change while we are inside it.
+# OUR OWN ANCESTRY IS SPARED, and that is the second exclusion: whatever started
+# this reset is not one of the slot's leftovers. The chain is walked once from
+# \$\$ -- it cannot change while we are inside it.
 #
-# THE CALLER DECIDES WHETHER THE AGENT NEEDS A THIRD EXCLUSION, and getting this
-# wrong is how a cleanup becomes an outage. Two callers reach this code:
+# THE AGENT IS THE THIRD EXCLUSION, and getting this wrong is how a cleanup
+# becomes an outage. Every caller that reaches this code is root --
+# provisioning at boot, the slot loop, the pin sweeper's teardown -- because the
+# only reset a slot may ask for is \`started\`, which never quiesces (#1570).
+# The agent is NOT on the chain above and no job of this slot is running: the
+# loop and the sweeper reset only while the agent is down, and sparing its tree
+# keeps a root reset from killing a listener all the same if one is up.
 #
-#   the job-completed hook   runs INSIDE the agent, so the agent is already on
-#                            the chain above. Everything else of this slot's is
-#                            the job's, including a step's backgrounded child --
-#                            which is still a child of the worker at this
-#                            instant and is exactly what has to go.
-#   a root caller            provisioning at boot, the slot loop, the pin
-#                            sweeper's teardown. The agent is NOT on the chain
-#                            and no job of this slot is running: the loop and the
-#                            sweeper reset only while the agent is down, and
-#                            sparing its tree keeps a root reset from killing a
-#                            listener all the same if one is up.
-#
-# So the agent's main pid is looked up and spared WITH ITS DESCENDANTS when it
-# is not already on our chain. An indeterminate answer -- systemctl itself
-# failing -- refuses rather than guesses: a stopped unit answers 0, which is an
-# answer, and anything else means we cannot tell an agent from a straggler.
+# So the agent's main pid is looked up and spared WITH ITS DESCENDANTS. An
+# indeterminate answer -- systemctl itself failing -- refuses rather than
+# guesses: a stopped unit answers 0, which is an answer, and anything else means
+# we cannot tell an agent from a straggler.
 #
 # TERM, then KILL. A survivor gets five seconds to exit on its own before the
 # signal it cannot handle, and the scan is repeated on every tick so a process
@@ -1237,27 +1230,19 @@ quiesce_slot() {
     p=\$ppid
   done
 
-  # WHICH CALLER THIS IS, read from the same variable the top of the script
-  # reads to decide whose slot this is. sudo sets it and env_reset drops the
-  # caller's own copy, so a set SUDO_UID means the agent is above us on the
-  # chain that was just walked and needs nothing further. Empty means a root
-  # caller -- boot, the idle sweep, the pin sweeper's teardown -- and there the
-  # agent has to be found and spared with its descendants.
   agent=""
   unit=""
-  if [ -z "\${SUDO_UID:-}" ]; then
-    if agent=\$(systemctl show -p MainPID --value "ci-runner@\$idx.service" 2>/dev/null); then
-      case "\$agent" in '' | 0 | *[!0-9]*) agent="" ;; esac
-    else
-      # No answer is not permission to sweep. Falling back to the unit's cgroup
-      # spares more than it should -- a straggler stays in that cgroup after it
-      # is reparented -- and that is the right way to be wrong here: the cost is
-      # a process this reset did not remove, against an idle sweep that killed
-      # the listener of every slot it touched.
-      agent=""
-      unit="ci-runner@\$idx.service"
-      say "slot \$idx: systemd would not name the agent's pid -- sparing everything in its unit rather than guessing"
-    fi
+  if agent=\$(systemctl show -p MainPID --value "ci-runner@\$idx.service" 2>/dev/null); then
+    case "\$agent" in '' | 0 | *[!0-9]*) agent="" ;; esac
+  else
+    # No answer is not permission to sweep. Falling back to the unit's cgroup
+    # spares more than it should -- a straggler stays in that cgroup after it
+    # is reparented -- and that is the right way to be wrong here: the cost is
+    # a process this reset did not remove, against an idle sweep that killed
+    # the listener of every slot it touched.
+    agent=""
+    unit="ci-runner@\$idx.service"
+    say "slot \$idx: systemd would not name the agent's pid -- sparing everything in its unit rather than guessing"
   fi
 
   # The units FIRST: a unit with Restart= would otherwise be respawned by its
@@ -1821,8 +1806,8 @@ fi
 # actions must be able to — and everything it wrote is replaced from the image's
 # verified master before the next job arrives.
 #
-# On \`completed\` and \`boot\` only. \`completed\` plus the slot loop (which resets
-# after every agent exit) covers every job that has finished or died, so by the time a
+# On \`completed\` and \`boot\` only. The slot loop's \`completed\` reset (after
+# every agent exit) covers every job that has finished or died, so by the time a
 # \`started\` reset runs the tree has already been replaced; re-extracting there
 # would double the cost per job to bound nothing.
 #
@@ -2105,17 +2090,15 @@ if [ "\$stage" != started ]; then
   fi
 fi
 
-# A COMPLETED HOOK THAT COULD NOT CLEAN (#1544, #1484). The job-completed shim
-# no longer passes this exit code on to the job: the job's own steps are the
-# verdict on the job, and a slot that could not be cleaned is the fleet's
-# problem, not the pull request's. Measured 2026-10-11: \`docker ps\` failing
-# against a rootless daemon that was mid-restart turned a passed \`data-model\`
-# check red, and a red check at a PR head blocks the merge lane.
-#
-# Nothing more is needed here (#1481): the agent took ONE job and exits after
-# this hook, and the slot loop resets the slot again before it mints the next
-# registration -- so a slot this reset could not clean is never offered work
-# until a reset does, and the burn counted above is what condemns it.
+# AN END-OF-JOB RESET THAT COULD NOT CLEAN (#1544, #1484, #1570). It never
+# reaches a job: the only end-of-job reset is the slot loop's, run after the
+# agent has exited, so the job's own steps stay the verdict on the job and a
+# slot that could not be cleaned is the fleet's problem, not the pull
+# request's. Measured 2026-10-11: \`docker ps\` failing against a rootless
+# daemon that was mid-restart turned a passed \`data-model\` check red when this
+# reset still ran inside the job, and a red check at a PR head blocks the lane.
+# The loop does not register a slot this reset could not clean, and the burn
+# counted above is what condemns it.
 
 [ "\$fail_after" = 1 ] && exit 1
 exit "\$rc"
@@ -2153,10 +2136,12 @@ install_slot_reset_sudoers() {
   tmp=$(mktemp) || return 1
   {
     echo "# Written by host-startup.sh. Lets each slot ask root to reset ITSELF"
-    echo "# between jobs. The index comes from SUDO_UID, never from an argument."
+    echo "# at job start. The index comes from SUDO_UID, never from an argument."
+    # `started` only (#1570): the end-of-job reset is the slot loop's, as root,
+    # so no slot needs to be able to ask for one.
     for i in $(seq 1 "$SLOTS"); do
       u=$(slot_user "$i")
-      printf '%s ALL=(root) NOPASSWD: /opt/ci/job-hooks/slot-reset.sh started, /opt/ci/job-hooks/slot-reset.sh completed\n' "$u"
+      printf '%s ALL=(root) NOPASSWD: /opt/ci/job-hooks/slot-reset.sh started\n' "$u"
     done
   } >"$tmp" || { rm -f "$tmp"; return 1; }
   chmod 0440 "$tmp" || { rm -f "$tmp"; return 1; }
@@ -2562,7 +2547,7 @@ install_pin_hold_sudoers() {
 # controller, and it cannot have it: the controller's only per-host shell lives
 # inside drain_host() and runs AFTER a removal verdict, so a host that is
 # healthy, current-template and busy is never probed at all — which is every
-# host a live hold is on. The job-completed hook cannot have it either, because
+# host a live hold is on. A job hook cannot have it either, because
 # it executes inside ci-runner@<idx>.service and stopping that unit would have
 # systemd SIGTERM the agent while it is still reporting the job's result.
 #
@@ -2675,8 +2660,8 @@ fi
 # --- expired ------------------------------------------------------------------
 say "run \$run's hold on slot \$slot expired \$((now - expiry))s ago"
 
-# A hold that reserved nothing owns no stack and no slot: the slot's own
-# job-completed reset already cleaned it, and it never left service. Releasing
+# A hold that reserved nothing owns no stack and no slot: the slot loop's
+# end-of-job reset already cleaned it, and it never left service. Releasing
 # is the whole of the work.
 if [ "\$reserve" != 1 ]; then
   rm -f -- "\$RECORD"
@@ -2800,7 +2785,9 @@ EOF
 # agent:
 #
 #   1. reset the slot (slot-reset.sh completed) -- every process of the slot uid
-#      is killed, the home and workspace go back to the template;
+#      is killed, the home and workspace go back to the template. This is the
+#      ONE end-of-job reset (#1570): there is no job-completed hook, so a job
+#      costs exactly one full reset between its end and the next registration;
 #   2. ask whether the slot may take work: not while the host is DRAINING
 #      (ci-drain, set by the controller before it deregisters), not while it is
 #      CORDONED (ci-cordon), and not while a live run's hold RESERVES this slot;
@@ -6341,15 +6328,18 @@ Environment=CI_HOST_LABEL=$HOST_LABEL
 Environment=CI_SHARED_INFRA_ADDR=$(primary_addr)
 Environment=CI_SHARED_INFRA_PORT_MIN=$(slot_band_min "$idx")
 Environment=CI_SHARED_INFRA_PORT_MAX=$(slot_band_max "$idx")
-# Reset this slot before every job and after every job: the home is emptied and
-# rebuilt from $SLOT_TEMPLATE, and the previous job's workspace and tool cache go
-# with it. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
+# Check this slot before every job: the started hook refuses a slot whose clean
+# marker is missing and empties the previous job's workspace. There is NO
+# completed hook (#1570): the agent is run-once, and the slot loop resets the
+# slot after the agent exits and before it mints the next runner -- the one
+# end-of-job reset, run as root with no job and no agent on the slot. A second
+# reset inside the agent bought nothing the loop's does not and cost a full
+# reset of wall clock per job. Set unconditionally, and NOT alongside BROKER_ENV: a pool with no job
 # service account is where an inherited credential is most dangerous, since
 # nothing there is supposed to have Google credentials at all. A failing hook
 # fails the job, which is the intended trade — a job that could not be given a
 # clean slot must not run in a previous job's leftovers.
 Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci/job-hooks/job-started.sh
-Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci/job-hooks/job-completed.sh
 # This is the unit job code runs under, and everything a job spawns inherits
 # this mount namespace — which is exactly why it cannot hide /proc/1: the runner
 # is in here, and it reads /proc/1/cgroup before starting any job container. See
