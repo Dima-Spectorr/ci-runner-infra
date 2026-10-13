@@ -614,9 +614,18 @@ check_counts() {
   # value — `counts="$(check_counts "$sha")"` — so a log line written to stdout
   # would be read as the counts, which is the same class of mistake the rest of
   # this comment is about.
+  # A read that fails names its cause first when it is a quota refusal or a
+  # server error (#1425), and says "blind" only when it is neither.
+  local surface_err surface_cause
+  surface_err="$(mktemp)"
   if ! runs="$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: ((.app.slug // .app.id // "unknown") | tostring), suite: (.check_suite.id // -1)}' 2>/dev/null)"; then
-    echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
+    --jq '.check_runs[] | {name: .name, state: (if .status != "completed" then "pending" else (.conclusion // "pending") end), at: (.completed_at // .started_at // ""), origin: "run", app: ((.app.slug // .app.id // "unknown") | tostring), suite: (.check_suite.id // -1)}' 2>"$surface_err")"; then
+    if surface_cause="$(lane_read_cause "$surface_err" "$LANE_QUOTA")"; then
+      echo "lane: cannot read the check-runs of $sha — $surface_cause" >&2
+    else
+      echo "lane: cannot read the check-runs of $sha — the lane is blind, not idle" >&2
+    fi
+    rm -f "$surface_err"
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
     return
@@ -651,12 +660,18 @@ check_counts() {
   # first-page-only read is the exact defect `check-runs` was already fixed
   # for.
   if ! suites="$(gh api --paginate "repos/$R/commits/$sha/check-suites?per_page=100" \
-    --jq '.check_suites[] | {id: .id, app: ((.app.slug // .app.id // "unknown") | tostring), status: .status, created_at: (.created_at // "")}' 2>/dev/null)"; then
-    echo "lane: cannot read the check-suites of $sha — the lane is blind, not idle" >&2
+    --jq '.check_suites[] | {id: .id, app: ((.app.slug // .app.id // "unknown") | tostring), status: .status, created_at: (.created_at // "")}' 2>"$surface_err")"; then
+    if surface_cause="$(lane_read_cause "$surface_err" "$LANE_QUOTA")"; then
+      echo "lane: cannot read the check-suites of $sha — $surface_cause" >&2
+    else
+      echo "lane: cannot read the check-suites of $sha — the lane is blind, not idle" >&2
+    fi
+    rm -f "$surface_err"
     LANE_FATAL=1
     echo "0 ${#REQUIRED[@]} 0 0"
     return
   fi
+  rm -f "$surface_err"
 
   # PER (APP, CHECK NAME). NOT PER APP — THAT WAS MEASURED WRONG.
   #
@@ -1947,13 +1962,20 @@ one_pass() {
   # The commit DATE comes back on the same call, and is what bounds the wait in
   # `lane_base_is_vouched`. Read here rather than there so the wait is measured
   # from when the tip was created, not from when the lane happened to look.
-  local base_read base_at
-  if ! base_read="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha + " " + .commit.committer.date' 2>/dev/null)" \
+  local base_read base_at base_err base_cause
+  base_err="$(mktemp)"
+  if ! base_read="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha + " " + .commit.committer.date' 2>"$base_err")" \
     || [ -z "$base_read" ]; then
-    echo "lane: cannot read the tip of $LANE_BASE — the lane is blind, not idle"
+    if base_cause="$(lane_read_cause "$base_err" "$LANE_QUOTA")"; then
+      echo "lane: cannot read the tip of $LANE_BASE — $base_cause"
+    else
+      echo "lane: cannot read the tip of $LANE_BASE — the lane is blind, not idle"
+    fi
+    rm -f "$base_err"
     LANE_FATAL=1
     return 1
   fi
+  rm -f "$base_err"
   read -r base_sha base_at <<<"$base_read"
 
   # Counted for the log only: a head carried forward says which pass settled it.
@@ -2087,7 +2109,14 @@ one_pass() {
   rm -rf "$LANE_SNAP"
   if ! mkdir -p "$LANE_SNAP" 2>"$list_err" || ! prs_raw="$(lane_snapshot "$LANE_SNAP" 2>"$list_err")"; then
     LANE_SNAP=''
-    echo "lane: cannot list the open pull requests on $LANE_BASE — the lane is blind, not idle"
+    # The first line names the cause when it is a quota refusal or a server
+    # error (#1425): "blind" alone sent operators after a missing permission.
+    local cause
+    if cause="$(lane_read_cause "$list_err" "${LANE_QUOTA:+$LANE_QUOTA.graphql}")"; then
+      echo "lane: cannot list the open pull requests on $LANE_BASE — $cause"
+    else
+      echo "lane: cannot list the open pull requests on $LANE_BASE — the lane is blind, not idle"
+    fi
     echo "lane: the list read said: $(tr '\n' ' ' <"$list_err" | cut -c1-400)"
     rm -f "$list_err"
     LANE_FATAL=1

@@ -168,10 +168,30 @@ if [ "$url" = graphql ] && [ -e "$file" ]; then
   line=1
   case "$cursor" in p[0-9]*) line="${cursor#p}" ;; esac
   sed -n "${line}p" "$file" >"$GH_STUB_STATE/graphql.page"
+  # `<fault> then <page>`: the fault on the first ask of this page, the page on
+  # every ask after it — a server that failed once (#1581).
+  page="$(cat "$GH_STUB_STATE/graphql.page")"
+  case "$page" in
+    *' then '*)
+      printf . >>"$GH_STUB_STATE/graphql.flaky.$line"
+      if [ "$(wc -c <"$GH_STUB_STATE/graphql.flaky.$line" | tr -d ' ')" -ge 2 ]; then
+        printf '%s\n' "${page#* then }" >"$GH_STUB_STATE/graphql.page"
+      else
+        printf '%s\n' "${page%% then *}" >"$GH_STUB_STATE/graphql.page"
+      fi
+      ;;
+  esac
   case "$(cat "$GH_STUB_STATE/graphql.page")" in
+    # `HTTP <code> [text]`: a refusal with no GraphQL body, gh's stderr naming it.
     'HTTP '*)
       printf '{"message":"Bad Gateway"}\n'
-      printf 'gh: HTTP %s\n' "$(cut -d' ' -f2 "$GH_STUB_STATE/graphql.page")" >&2
+      printf 'gh: %s\n' "$(cat "$GH_STUB_STATE/graphql.page")" >&2
+      exit 1
+      ;;
+    # GitHub's HTML error page where JSON was due.
+    HTML)
+      printf '<!DOCTYPE html>\n<html><head><title>Unicorn! - GitHub</title></head><body>Something went wrong</body></html>\n'
+      printf "gh: invalid character '<' looking for beginning of value\n" >&2
       exit 1
       ;;
   esac
@@ -421,7 +441,7 @@ cases_spawn() { # <fetch-file>
     # never the first to complete, however the scheduler behaves.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
     job() {
       local i n
       : >"$d/started.$1"
@@ -548,7 +568,7 @@ cases_shell() { # <fetch-file>
     # not the condition of anything. The job must reach the line after it.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
     failing_job() {
       false
       : >"$d/after-failure.$1"
@@ -568,7 +588,7 @@ cases_shell() { # <fetch-file>
     # the job's `trap - EXIT` changes nothing and would prove nothing. The
     # mutation re-arms the parent's trap inside the job instead, which is what
     # that line is there to make impossible.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
     quiet_job() { : >"$d/quiet.$1"; }
     (
       trap 'printf . >>"$d/trap-ran"' EXIT
@@ -1026,9 +1046,10 @@ build_snap_fixture() { # <dir>
 # <dir> <kind> — an open list GraphQL answers with something the lane must not
 # read through. The first page is always whole; the second carries the fault.
 build_snap_fault() {
-  local ok node
+  local ok node last
   node="$(snap_node 31 "$(sha_of 31)" MERGEABLE '{"__typename":"User","login":"x"}' '[]')"
   ok="$(snap_page true '"p2"' "$node")"
+  last="$(snap_page false null "$(snap_node 32 "$(sha_of 32)" MERGEABLE '{"__typename":"User","login":"y"}' '[]')")"
   case "$2" in
     # An error anywhere but a check suite's app: here, at a check run.
     other-path) printf '%s\n' "$ok" "$(snap_page false null "$node" '[{"type":"INTERNAL","path":["repository","pullRequests","nodes",0,"commits","nodes",0,"commit","checkSuites","nodes",0,"checkRuns"],"message":"x"}]')" ;;
@@ -1047,6 +1068,12 @@ build_snap_fault() {
     http) printf '%s\n' "$ok" 'HTTP 502' ;;
     # A next page with no cursor to reach it.
     no-cursor) printf '%s\n' "$(snap_page true null "$node")" ;;
+    # A server that failed the second page once, then served it (#1581).
+    502-then-ok) printf '%s\n' "$ok" "HTTP 502 Bad Gateway then $last" ;;
+    html-then-ok) printf '%s\n' "$ok" "HTML then $last" ;;
+    timeout-then-ok) printf '%s\n' "$ok" '{"data":null,"errors":[{"message":"Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug."}]} then '"$last" ;;
+    # A primary rate limit, refused as a 403: an answer, never asked again here.
+    limited) printf '%s\n' "$ok" 'HTTP 403 API rate limit exceeded for installation ID 1.' ;;
   esac >"$1/graphql"
 }
 
@@ -1059,6 +1086,9 @@ cases_snap() { # <fetch-file>
     d="$(mktemp -d "$WORK/snap.XXXXXX")"
     mkdir "$d/fix" "$d/snap"
     build_snap_fixture "$d/fix"
+    # The page retry's wait is written down, never slept (#1581).
+    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    lane_snap_retry_sleep() { echo "$1" >>"$d/slept"; }
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota" R="$REPO" LANE_BASE=main
     unset GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
     : >"$GH_STUB_LOG"
@@ -1113,7 +1143,7 @@ cases_snap() { # <fetch-file>
 
     # ANY OTHER ERROR IS THE LANE BLIND: no list, a reason on stderr, every time.
     local kind all=0
-    for kind in other-path app-elsewhere no-path no-data no-pageinfo null-node http no-cursor; do
+    for kind in other-path app-elsewhere no-path no-data no-pageinfo null-node http no-cursor limited; do
       mkdir "$d/fault-$kind" "$d/fault-$kind/snap"
       build_snap_fault "$d/fault-$kind" "$kind"
       : >"$GH_STUB_STATE/graphql.cursors"
@@ -1125,6 +1155,71 @@ cases_snap() { # <fetch-file>
     done
     [ "$all" -eq 0 ]
     say snap-any-other-error-fails-closed $?
+
+    # A PAGE GITHUB FAILED TO SERVE IS ASKED AGAIN (#1581). <kind> — runs the
+    # read on that fault fixture; leaves out/err/rc, the graphql calls and the
+    # cursors asked in $d/r-<kind>.
+    snap_run() {
+      local r="$d/r-$1"
+      mkdir -p "$r/snap"
+      build_snap_fault "$r" "$1"
+      : >"$GH_STUB_STATE/graphql.cursors"
+      : >"$GH_STUB_LOG"
+      : >"$d/slept"
+      rm -f "$GH_STUB_STATE"/graphql.flaky.*
+      local rc=0
+      GH_STUB_FIXTURES="$r" lane_snapshot "$r/snap" >"$r/out" 2>"$r/err" || rc=$?
+      printf '%s' "$rc" >"$r/rc"
+      grep -cx graphql "$GH_STUB_LOG" >"$r/calls" || true
+      tr '\n' ' ' <"$GH_STUB_STATE/graphql.cursors" >"$r/cursors"
+    }
+    local k ok_all=0
+    for k in 502-then-ok html-then-ok timeout-then-ok; do
+      snap_run "$k"
+      [ "$(<"$d/r-$k/rc")" = 0 ] && [ "$(<"$d/r-$k/calls")" = 3 ] && [ "$(<"$d/r-$k/cursors")" = '- p2 p2 ' ] \
+        && [ "$(sed -n '1p;7p' "$d/r-$k/out" | tr '\n' ' ')" = '31 32 ' ] \
+        && [ "$(tr '\n' ' ' <"$d/slept")" = '2 ' ] \
+        && grep -q '^open list read in 2 GraphQL page(s), 2 pull request(s);.* 1 page read(s) asked again after a server error$' "$d/r-$k/snap/summary" \
+        || ok_all=1
+    done
+    [ "$ok_all" -eq 0 ]
+    say snap-a-server-error-on-a-page-is-asked-again $?
+
+    # Every ask fails: bounded at LANE_SNAP_RETRIES, then blind — and says it
+    # was a server error on every attempt, which the first log line then names.
+    snap_run http
+    [ "$(<"$d/r-http/rc")" != 0 ] && [ "$(<"$d/r-http/calls")" = $((2 + LANE_SNAP_RETRIES)) ] \
+      && [ "$(tr '\n' ' ' <"$d/slept")" = '2 5 ' ] \
+      && grep -q "a server error on each of $((1 + LANE_SNAP_RETRIES)) attempts" "$d/r-http/err" \
+      && [ "$(lane_read_cause "$d/r-http/err")" = 'GitHub answered with a server error (HTTP 502) — the lane is blind for this pass, not idle; the recover job dispatches another' ]
+    say snap-a-server-error-every-time-is-bounded-and-named $?
+
+    # A quota refusal is an answer: never asked again by the page retry.
+    local quota_ok=0
+    for k in limited no-path; do
+      snap_run "$k"
+      [ "$(<"$d/r-$k/rc")" != 0 ] && [ "$(<"$d/r-$k/calls")" = 2 ] && [ ! -s "$d/slept" ] \
+        && ! grep -q 'asking again' "$d/r-$k/err" || quota_ok=1
+    done
+    [ "$quota_ok" -eq 0 ]
+    say snap-a-quota-refusal-is-not-asked-again $?
+
+    # (#1425) The first line of a failed read names a quota refusal as one, with
+    # the time the refusing window reopens, and says "blind" only for the rest.
+    printf 'gh: API rate limit exceeded for installation ID 1. (HTTP 403)\n' >"$d/e403"
+    printf 'gh: Too Many Requests (HTTP 429)\n' >"$d/e429"
+    printf 'gh: Resource not accessible by integration (HTTP 403)\n' >"$d/eperm"
+    printf 'gh: Not Found (HTTP 404)\n' >"$d/e404"
+    printf '5000 0 5000 1900000600\n' >"$d/qzero"
+    printf '5000 12 4988 1900000600\n' >"$d/qleft"
+    [ "$(lane_read_cause "$d/e403" "$d/qzero" 1900000000)" = 'rate limited by GitHub (the merge App quota is shared by every lane), retry at '"$(date -u -d @1900000600 +%H:%M:%SZ)"' — not blind; the recover job dispatches a pass after it' ] \
+      && [[ "$(lane_read_cause "$d/e429" "$d/qleft" 1900000000)" == 'rate limited by GitHub '*'retry in about a minute — not blind'* ]] \
+      && [[ "$(lane_read_cause "$d/r-no-path/err" '' 1900000000)" == 'rate limited by GitHub'* ]] \
+      && [[ "$(lane_read_cause "$d/r-limited/err" "$d/missing" 1900000000)" == 'rate limited by GitHub'* ]] \
+      && ! lane_read_cause "$d/eperm" "$d/qzero" 1900000000 >/dev/null \
+      && ! lane_read_cause "$d/e404" '' 1900000000 >/dev/null \
+      && ! lane_read_cause "$d/missing" '' 1900000000 >/dev/null
+    say read-cause-names-a-quota-refusal-not-blind $?
 
     ! lane_snap_serve api --method=PUT "repos/$REPO/pulls/21" && ! lane_snap_serve api "repos/$REPO/pulls/99" \
       && ! LANE_SNAP='' lane_snap_serve api "repos/$REPO/pulls/21" && ! lane_snap_serve api "repos/$REPO/pulls/21" --jq '.nope | error'
@@ -1181,7 +1276,7 @@ tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 tally_lines "$(cases_retry "$FETCH" 2>&1)" 12 retry
 tally_lines "$(cases_quota "$FETCH" 2>&1)" 6 quota
-tally_lines "$(cases_snap "$FETCH" 2>&1)" 11 snap
+tally_lines "$(cases_snap "$FETCH" 2>&1)" 15 snap
 
 mutant "the header block reaches the caller" cases_quota "$FETCH"   's|^    inh { if ([$]0 == "[\]r" [|][|] [$]0 == "") { inh = 0 } else { print > hdr }; next }$|    inh { print; if (length($0) < 2) inh = 0; next }|' quota-headers-never-reach-the-caller
 mutant "a call goes out without its headers" cases_quota "$FETCH"   's|command gh api -i "\${@:2}"|command gh api "${@:2}"|' quota-noted-from-the-answer
@@ -1225,6 +1320,22 @@ mutant "a failed program serves half an answer" cases_snap "$FETCH" \
   's|^  out="\$(jq -rc "\$prog" "\$file" 2>/dev/null)" \|\| return 1$|  out="$(jq -rc "$prog" "$file" 2>/dev/null)"|' snap-serves-nothing-else
 mutant "a graphql read counts as a write" cases_snap "$FETCH" \
   's|^  \[ "\${1:-}" = api \] \&\& \[ "\${2:-}" = graphql \] \&\& graphql=1$|  :|' snap-graphql-read-is-not-a-write
+mutant "a page that failed on a server error is not asked again" cases_snap "$FETCH" \
+  's|^LANE_SNAP_RETRIES=2$|LANE_SNAP_RETRIES=0|' snap-a-server-error-on-a-page-is-asked-again
+mutant "an HTML error page is not a server error" cases_snap "$FETCH" \
+  "s/grep -qiE '<!doctype html|<html' && return 0/false/" snap-a-server-error-on-a-page-is-asked-again
+mutant "a GraphQL timeout is not a server error" cases_snap "$FETCH" \
+  's|test("Something went wrong")|test("nothing matches this")|' snap-a-server-error-on-a-page-is-asked-again
+mutant "the page retry is unbounded" cases_snap "$FETCH" \
+  's|^      if \[ "\$tries" -lt "\$LANE_SNAP_RETRIES" \] \&\& lane_snap_page_transient|      if [ "$tries" -lt 9 ] \&\& lane_snap_page_transient|' snap-a-server-error-every-time-is-bounded-and-named
+mutant "an exhausted retry stops saying it was a server error" cases_snap "$FETCH" \
+  's|a server error on each of|it failed on each of|' snap-a-server-error-every-time-is-bounded-and-named
+mutant "a rate limit reads as blind again" cases_snap "$FETCH" \
+  "s/grep -q 'HTTP 429' \"\$err\" || grep -q 'RATE_LIMITED'/false \&\& grep -q x/" read-cause-names-a-quota-refusal-not-blind
+mutant "the retry time stops coming from the refusing window" cases_snap "$FETCH" \
+  's|\[ "\${remaining:-}" = 0 \] \&\& \[\[ "\${reset:-}" =~|false \&\& [[ "${reset:-}" =~|' read-cause-names-a-quota-refusal-not-blind
+mutant "a missing permission reads as a rate limit" cases_snap "$FETCH" \
+  "s/grep -q 'HTTP 403' \"\$err\" \&\& grep -qi 'rate limit' \"\$err\"/grep -q 'HTTP 403' \"\$err\"/" read-cause-names-a-quota-refusal-not-blind
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap
