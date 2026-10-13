@@ -122,6 +122,44 @@ lane_rate_limit_wait() {
 lane_retry_sleep() { command sleep "$1"; }
 
 # ---------------------------------------------------------------------------
+# A FAILED READ SAYS WHY BEFORE IT SAYS "BLIND" (#1425).
+#
+# "The lane is blind, not idle" is the line for a lane that cannot look: a
+# token without access, a base that does not exist. A quota refusal part-way
+# through a pass printed the same first line, and an operator reading it went
+# looking for a missing permission (entity-platform run 36594989687, a 403
+# rate limit). A refusal is transient and has a time it ends; a server error is
+# GitHub's, not the lane's. Each is named as itself.
+#
+# <stderr-file> [quota-file] [now] — prints the cause of a failed read when it
+# is a rate limit or a server error, and fails for anything else (the caller
+# then says "blind"). The retry time comes from the window the refusal itself
+# carried, as `lane_quota_note` wrote it — never from `GET /rate_limit` (#1548).
+lane_read_cause() {
+  local err="$1" q="${2:-}" now="${3:-}" limit remaining used reset at
+  [ -s "$err" ] || return 1
+  if grep -q 'HTTP 429' "$err" || grep -q 'RATE_LIMITED' "$err" \
+    || { grep -q 'HTTP 403' "$err" && grep -qi 'rate limit' "$err"; }; then
+    [ -n "$now" ] || now="$(date -u +%s)"
+    if [ -n "$q" ] && [ -s "$q" ] && read -r limit remaining used reset <"$q" \
+      && [ "${remaining:-}" = 0 ] && [[ "${reset:-}" =~ ^[0-9]+$ ]] && [ "$reset" -gt "$now" ] \
+      && at="$(date -u -d "@$reset" +%H:%M:%SZ 2>/dev/null)"; then
+      printf 'rate limited by GitHub (the merge App quota is shared by every lane), retry at %s — not blind; the recover job dispatches a pass after it' "$at"
+    else
+      printf 'rate limited by GitHub (the merge App quota is shared by every lane), retry in about a minute — not blind; the recover job dispatches a pass after it'
+    fi
+    return 0
+  fi
+  if grep -qE 'HTTP 5[0-9][0-9]|server error' "$err"; then
+    at="$(grep -oE 'HTTP 5[0-9][0-9]' "$err" | head -1 || true)"
+    printf 'GitHub answered with a server error (%s) — the lane is blind for this pass, not idle; the recover job dispatches another' \
+      "${at:-an error page, not JSON}"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # THE QUOTA IS READ FROM THE LANE'S OWN ANSWERS, NOT FROM `rate_limit` (#1543).
 #
 # `GET /rate_limit` was seen reporting `used=0` for the merge App's token while
@@ -598,6 +636,41 @@ lane_snap_page_ok() {
   ' "$1" >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------------------
+# A PAGE GITHUB FAILED TO SERVE IS ASKED AGAIN, IN THE PASS (#1581).
+#
+# A 502, or GitHub's "Something went wrong" page, on one page of the open list
+# ended the pass blind, and `recover` dispatched another a minute later: on
+# IntegrateIT 2026-10-12 passes 38308770674 and 38315550015 failed on `HTTP 502
+# Bad Gateway` with the quota healthy, and a green pull request waited for the
+# next pass. The same page, by the same cursor, is asked again after a short
+# wait — it is a read, so asking twice changes nothing.
+#
+# ONLY A SERVER'S FAILURE. A 4xx is an answer — a refusal, a missing
+# permission, a quota — and asking again at once changes none of them: a rate
+# limit is already waited out (or not) by `lane_gh_retry`, and the rest end the
+# pass as before. A page that IS a usable answer is never re-asked, so the
+# tolerated `.app` error, whose message is also "Something went wrong", is not
+# retried: only a page `lane_snap_page_ok` refused can reach here.
+LANE_SNAP_RETRIES=2
+lane_snap_retry_sleep() { sleep "$1"; }
+
+# <page-file> <stderr-file> — succeeds when a refused page is a server's
+# failure worth asking again: an HTTP 5xx, an HTML error page where JSON was
+# due, or a GraphQL answer with no data whose every error has no path and says
+# "Something went wrong" (GitHub's own timeout). Never on a 4xx.
+lane_snap_page_transient() {
+  local page="$1" err="$2"
+  ! grep -qE 'HTTP 4[0-9][0-9]' "$err" || return 1
+  grep -qE 'HTTP 5[0-9][0-9]' "$err" && return 0
+  head -c 512 "$page" | grep -qiE '<!doctype html|<html' && return 0
+  jq -e '
+    (.data.repository.pullRequests | type) != "object"
+    and ((.errors // []) | length) > 0
+    and ([.errors[] | (.path == null) and ((.message // "") | test("Something went wrong"))] | all)
+  ' "$page" >/dev/null 2>&1
+}
+
 # <dir> — reads the open list into <dir> and prints the six list fields a pull
 # request; writes one line to <dir>/summary saying what the read was. One
 # `gh api graphql` call a page, counted and header-noted by the `gh` wrapper
@@ -606,7 +679,7 @@ lane_snap_page_ok() {
 # stderr, on any page `lane_snap_page_ok` refuses; the caller treats that as a
 # blind lane, as it did the REST list.
 lane_snapshot() {
-  local dir="$1" cursor='' prev='' pages=0 tolerated=0 n more rc
+  local dir="$1" cursor='' prev='' pages=0 tolerated=0 n more rc tries=0 reasked=0 wait
   local page="$dir/page" err="$dir/page.err"
   : >"$dir/nodes"
   while :; do
@@ -620,12 +693,22 @@ lane_snapshot() {
     fi
     pages=$((pages + 1))
     if ! lane_snap_page_ok "$page"; then
+      # The same page, by the same cursor, once more after a short wait (#1581).
+      if [ "$tries" -lt "$LANE_SNAP_RETRIES" ] && lane_snap_page_transient "$page" "$err"; then
+        tries=$((tries + 1)) reasked=$((reasked + 1)) pages=$((pages - 1))
+        wait=$((2 + (tries - 1) * 3))
+        echo "page $((pages + 1)): $(tr '\n' ' ' <"$err" | cut -c1-120) — a server error; asking again in ${wait}s (retry $tries of $LANE_SNAP_RETRIES)" >&2
+        lane_snap_retry_sleep "$wait"
+        continue
+      fi
       local said
       said="$(jq -rc '[(.errors // [])[] | {type, path, message}] | .[:3]' "$page" 2>/dev/null)" \
         || said="$(head -c 300 "$page")"
       echo "page $pages (gh exit $rc): $(tr '\n' ' ' <"$err" | cut -c1-200) errors: ${said:0:300}" >&2
+      [ "$tries" -eq 0 ] || echo "page $pages: a server error on each of $((tries + 1)) attempts — not asked again this pass" >&2
       return 1
     fi
+    tries=0
     n="$(jq '(.errors // []) | length' "$page" | tr -d '\r')"
     tolerated=$((tolerated + n))
     jq -c '.data.repository.pullRequests.nodes[]' "$page" | tr -d '\r' >>"$dir/nodes"
@@ -638,8 +721,8 @@ lane_snapshot() {
     prev="$more" cursor="$more"
   done
   rm -f "$page" "$err"
-  printf 'open list read in %s GraphQL page(s), %s pull request(s); %s check-suite app field(s) GraphQL could not resolve, their heads'"'"' checks read from REST\n' \
-    "$pages" "$(wc -l <"$dir/nodes" | tr -d ' ')" "$tolerated" >"$dir/summary"
+  printf 'open list read in %s GraphQL page(s), %s pull request(s); %s check-suite app field(s) GraphQL could not resolve, their heads'"'"' checks read from REST; %s page read(s) asked again after a server error\n' \
+    "$pages" "$(wc -l <"$dir/nodes" | tr -d ' ')" "$tolerated" "$reasked" >"$dir/summary"
   lane_snap_write "$dir/nodes" "$R" "$dir"
 }
 
