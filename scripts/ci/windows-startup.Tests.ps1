@@ -2058,6 +2058,53 @@ Describe 'probe verdict' {
     }
 }
 
+# #1481: the controller sets ci-drain BEFORE it reads the roster it deregisters
+# from, so a slot that registers on a failed read can slip past that list on a
+# host about to be deleted. Same reading as host-startup.sh's gate().
+Describe 'drain gate' {
+    It 'lets a slot register when ci-drain is absent' {
+        Get-DrainVerdict -Value '' | Should -BeNullOrEmpty
+        Get-DrainVerdict -Value '0' | Should -BeNullOrEmpty
+    }
+
+    It 'holds a slot while the host is draining' {
+        Get-DrainVerdict -Value '1' | Should -Be 'the host is draining'
+        Get-DrainVerdict -Value "1`n" | Should -Be 'the host is draining'
+    }
+
+    It 'holds a slot when ci-drain could not be read' {
+        Get-DrainVerdict -Value '?' | Should -Be 'ci-drain could not be read'
+    }
+
+    It 'returns at once when the flag is clear' {
+        Mock -CommandName Read-DrainFlag -MockWith { '' }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Write-BootLog -MockWith { }
+        Wait-DrainClear -SlotIndex 1 -Step 'before config.cmd' -TimeoutSeconds 0
+        Should -Invoke -CommandName Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'waits out a drain the controller aborts' {
+        $script:DrainReads = 0
+        Mock -CommandName Read-DrainFlag -MockWith {
+            $script:DrainReads++
+            if ($script:DrainReads -lt 3) { '1' } else { '' }
+        }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Write-BootLog -MockWith { }
+        Wait-DrainClear -SlotIndex 2 -Step 'before config.cmd' -TimeoutSeconds 300 -PollSeconds 1
+        $script:DrainReads | Should -Be 3
+    }
+
+    It 'denies the boot when the host is still draining at the deadline' {
+        Mock -CommandName Read-DrainFlag -MockWith { '?' }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Write-BootLog -MockWith { }
+        { Wait-DrainClear -SlotIndex 3 -Step 'before its service starts' -TimeoutSeconds 0 } |
+            Should -Throw '*ci-drain could not be read*'
+    }
+}
+
 Describe 'jittered timeout' {
     # The failure mode of jitter is a bound that quietly became a constant, or
     # one that became unbounded. Both are invisible from a call site that rolls

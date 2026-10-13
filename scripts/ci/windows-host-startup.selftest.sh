@@ -3216,6 +3216,51 @@ mutate "the listener's stdout in the Application log no longer read" \
   "s|-Provider 'ActionsRunnerService'|-Provider 'Nothing'|" \
   has_agent_diagnostics
 
+# THE DRAIN FLAG IS ASKED BEFORE EVERY REGISTRATION (#1481).
+#
+# The controller writes ci-drain=1 before it reads the roster it deregisters
+# from. A slot that registers or starts past that read takes a job on a host
+# about to be deleted, and nothing on the controller can see it happen. Asked
+# twice per slot -- before config.cmd and before its service starts -- and a
+# failed read is a closed gate, never an open one.
+has_drain_gate() { # <file>
+  local code reg start svc
+  code=$(code_of "$1")
+  matches "$code" "^        Wait-DrainClear -SlotIndex \\\$slot.Index -Step 'before config.cmd'$" || return 1
+  matches "$code" "^    Wait-DrainClear -SlotIndex \\\$Slot.Index -Step 'before its service starts'$" || return 1
+  # Before, not after: the per-slot ask precedes the registration it guards,
+  # and the second ask precedes the start.
+  reg=$(line_of "$code" "-Step 'before config.cmd'$")
+  svc=$(line_of "$code" '^        Register-SlotAgent -Slot \$slot')
+  [ -n "$reg" ] && [ -n "$svc" ] && [ "$reg" -lt "$svc" ] || return 1
+  start=$(line_of "$code" "-Step 'before its service starts'$")
+  # The agent start is the LAST such line; the reset payload has an earlier one.
+  svc=$(printf '%s\n' "$code" | grep -nE -- '^        Start-Service -Name \$serviceName -ErrorAction Stop$' |
+    sed -n '$s/^\([0-9][0-9]*\):.*/\1/p')
+  [ -n "$start" ] && [ -n "$svc" ] && [ "$start" -lt "$svc" ] || return 1
+  # A read that failed is '?', and '?' closes the gate.
+  matches "$code" "^        return '\\?'$" || return 1
+  matches "$code" "^        '\\?' \\{ return 'ci-drain could not be read' \\}$" || return 1
+  matches "$code" "^        '1' \\{ return 'the host is draining' \\}$" || return 1
+  # Bounded: the wait ends in a denied boot, never a hang.
+  matches "$code" 'Deny-Boot \("slot \$\{SlotIndex\}: \$why after' || return 1
+}
+
+if has_drain_gate "$SCRIPT"; then
+  ok
+else
+  bad "a Windows slot can register or start without asking ci-drain, or reads a failed ci-drain read as not draining -- the controller sets the flag before its roster read, so that slot takes a job on a host about to be deleted (#1481)"
+fi
+
+mutate "the per-slot drain ask before config.cmd removed" \
+  "/-Step 'before config.cmd'\$/d" has_drain_gate
+mutate "the drain ask before the service starts removed" \
+  "/-Step 'before its service starts'\$/d" has_drain_gate
+mutate "a failed ci-drain read treated as not draining" \
+  "s|^        return '?'\$|        return ''|" has_drain_gate
+mutate "the drain wait no longer denying the boot at its deadline" \
+  's|Deny-Boot ("slot ${SlotIndex}: $why after|Write-BootLog ("slot ${SlotIndex}: $why after|' has_drain_gate
+
 # THE BOOT SCRIPT HAS TO FIT IN A METADATA VALUE.
 #
 # The same check host-startup.selftest.sh makes for Linux, and the reason it is
