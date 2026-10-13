@@ -1982,6 +1982,99 @@ else
   bad "the background label is not on exactly the lower slots of a host -- on every slot, push runs take the slots pull-request jobs wait for; on none, push jobs queue against a label nothing carries"
 fi
 
+# Ubuntu's unattended upgrades, off before any slot unit starts (#1480). Left
+# on, apt-daily-upgrade fired ~28 minutes after boot and its package postinst
+# restarts took every ci-runner@N and ci-dockerd@N down mid-job — and the agents
+# could not come back, their one-shot env files already consumed. Nothing about
+# it is visible at boot, so it is pinned here: the step is RUN against a stubbed
+# systemctl, on a full image, a minimal one, a second boot, and a boot that
+# lands while an upgrade is still in flight.
+apt_auto_upgrades_off_behaves() { # <file>
+  local body vars code t rc=0 want
+  body="$(extract_fn "$1" dpkg_busy)
+$(extract_fn "$1" disable_apt_auto_upgrades)"
+  vars=$(grep -E '^APT_AUTO_(TIMERS|SERVICES)=' "$1")
+  case "$body" in *'systemctl mask'*) : ;; *) return 1 ;; esac
+  # the real unit list, every unit the issue names
+  for want in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service packagekit.service; do
+    matches "$vars" "[\" ]${want}[\" ]" || return 1
+  done
+  t=$(mktemp -d)
+  if [ -z "$t" ] || [ ! -d "$t" ]; then return 1; fi
+  body=${body//\/var\/log\/ci-host.log/$t/host.log}
+
+  # run <present units> <busy polls> <wait budget> -> exit status; leaves
+  # $t/calls (every systemctl call), $t/log, $t/apt/no-auto
+  run() {
+    # a poll cap in the stub, so an unbounded wait ends the case instead of the suite
+    : >"$t/calls"; : >"$t/log"; : >"$t/polls"; printf '%s' "$2" >"$t/busy"
+    bash -c "$vars"'
+APT_NO_AUTO_CONF="$T/apt/no-auto"; DPKG_LOCK_WAIT_SECONDS=$3
+log() { printf "%s\n" "$*" >>"$T/log"; }
+sleep() { :; }
+fuser() { return 1; }
+systemctl() {
+  printf "%s\n" "$*" >>"$T/calls"
+  case "$1" in
+    show) case " $PRESENT " in *" $5 "*) if grep -qx "$5" "$T/masked" 2>/dev/null; then echo masked; else echo loaded; fi ;; *) echo not-found ;; esac ;;
+    is-active) echo . >>"$T/polls"; [ "$(wc -l <"$T/polls")" -gt 200 ] && return 1; n=$(cat "$T/busy"); [ "$n" = forever ] && return 0; [ "$n" -gt 0 ] || return 1; echo $((n - 1)) >"$T/busy"; return 0 ;;
+    mask) echo "$2" >>"$T/masked" ;;
+  esac
+  return 0
+}
+'"$body"'
+disable_apt_auto_upgrades' _ "$1" "$2" "$3"
+  }
+  export T="$t"
+  local all="apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service packagekit.service"
+  local conf=$'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";'
+
+  # 1. A stock image without packagekit: five units masked, one absent, apt's
+  #    periodic config zeroed, and the boot not refused.
+  rm -f "$t/masked"
+  PRESENT="${all% packagekit.service}" run x 0 600 || rc=1
+  [ "$(grep -c '^mask ' "$t/calls")" -eq 5 ] || rc=1
+  matches "$(cat "$t/calls")" '^mask packagekit\.service$' && rc=1
+  [ "$(cat "$t/apt/no-auto" 2>/dev/null)" = "$conf" ] || rc=1
+  matches "$(cat "$t/log")" 'apt auto-upgrades off .*masked apt-daily\.timer apt-daily-upgrade\.timer apt-daily\.service apt-daily-upgrade\.service unattended-upgrades\.service; absent packagekit\.service$' || rc=1
+  # 2. The same host booting again: idempotent, still zero, still no warning.
+  PRESENT="${all% packagekit.service}" run x 0 600 || rc=1
+  [ "$(cat "$t/apt/no-auto" 2>/dev/null)" = "$conf" ] || rc=1
+  matches "$(cat "$t/log")" 'WARNING' && rc=1
+  # 3. A minimal image with none of them: nothing to mask, and still no failure.
+  rm -f "$t/masked"
+  PRESENT="" run x 0 600 || rc=1
+  matches "$(cat "$t/calls")" '^(mask|stop) ' && rc=1
+  [ "$(cat "$t/apt/no-auto" 2>/dev/null)" = "$conf" ] || rc=1
+  # 4. An upgrade in flight at boot: the timers go first, the run is waited out,
+  #    and only then is any apt service stopped — never a dpkg killed mid-run.
+  rm -f "$t/masked"
+  PRESENT="$all" run x 3 600 || rc=1
+  code=$(grep -nE '^(mask apt-daily-upgrade\.timer|is-active|stop apt-daily\.service)' "$t/calls" | cut -d: -f2- | uniq | tr '\n' '|')
+  [ "$code" = "mask apt-daily-upgrade.timer|is-active --quiet apt-daily.service apt-daily-upgrade.service|stop apt-daily.service|" ] || rc=1
+  matches "$(cat "$t/log")" '^waited [0-9]+s for an in-flight apt/dpkg run' || rc=1
+  # 5. One that never finishes: the wait is bounded, the boot goes on, and the
+  #    units are still masked.
+  rm -f "$t/masked"
+  PRESENT="$all" run x forever 10 || rc=1
+  matches "$(cat "$t/log")" 'WARNING: an apt/dpkg run was still in flight after 10s' || rc=1
+  [ "$(grep -c '^mask ' "$t/calls")" -eq 6 ] || rc=1
+  unset T
+  rm -rf "$t"
+
+  code=$(code_of "$1")
+  # called, unconditionally, before the first slot daemon or agent can start
+  matches "$code" '^  disable_apt_auto_upgrades$' || return 1
+  [ "$(grep -n '^  disable_apt_auto_upgrades$' "$1" | cut -d: -f1)" -lt "$(grep -n '^  normalize_host_resolver' "$1" | cut -d: -f1)" ] || return 1
+  return "$rc"
+}
+
+if apt_auto_upgrades_off_behaves "$SCRIPT"; then
+  ok
+else
+  bad "Ubuntu's unattended upgrades are not reliably off before any slot starts -- apt-daily-upgrade restarts every ci-runner@N and ci-dockerd@N mid-job ~28 minutes after boot, and the agents cannot come back (#1480)"
+fi
+
 # --- mutation cases: prove the checks above can actually fail -----------------
 if has_slot_share "$SCRIPT"; then
   ok
@@ -2636,6 +2729,23 @@ mutate "the two caches may collide on one directory" \
   's@\[ "\$d" = "\$TOOL_CACHE_NAME" \]@false@' has_baked_tool_cache
 mutate "a tool cache problem takes the host down" \
   's@^  provision_tool_cache .*$@  provision_tool_cache || die "no tool cache"@' has_baked_tool_cache
+
+mutate "apt auto-upgrades never turned off" \
+  's@^  disable_apt_auto_upgrades$@  : disable_apt_auto_upgrades@' apt_auto_upgrades_off_behaves
+mutate "apt auto-upgrades turned off after the slots start" \
+  's@^  disable_apt_auto_upgrades$@  :@; s@^  install_baked_image_audit ||@  disable_apt_auto_upgrades\n  install_baked_image_audit ||@' apt_auto_upgrades_off_behaves
+mutate "the upgrade timer left out" \
+  's@^APT_AUTO_TIMERS="apt-daily.timer apt-daily-upgrade.timer"$@APT_AUTO_TIMERS="apt-daily.timer"@' apt_auto_upgrades_off_behaves
+mutate "units stopped but not masked" \
+  's@if systemctl mask "\$u"@if systemctl is-enabled "$u"@' apt_auto_upgrades_off_behaves
+mutate "a missing unit fails the step" \
+  "s@''|not-found) absent=\"\$absent \$u\"; continue ;;@''|not-found) return 1 ;;@" apt_auto_upgrades_off_behaves
+mutate "an in-flight upgrade is killed instead of waited out" \
+  's@while dpkg_busy && @while false \&\& @' apt_auto_upgrades_off_behaves
+mutate "the in-flight wait is unbounded" \
+  's@while dpkg_busy && \[ "\$waited" -lt "\$DPKG_LOCK_WAIT_SECONDS" \]; do@while dpkg_busy; do@' apt_auto_upgrades_off_behaves
+mutate "apt's periodic config not zeroed" \
+  's@APT::Periodic::Unattended-Upgrade "0";@APT::Periodic::Unattended-Upgrade "1";@' apt_auto_upgrades_off_behaves
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

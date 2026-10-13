@@ -6403,6 +6403,75 @@ harden_proc() {
   fi
 }
 
+# Ubuntu's own unattended patching, off for the life of the host (#1480). Left
+# on, apt-daily-upgrade.service fires ~28 minutes after boot, and the package
+# postinst scripts it runs restart whatever they touch: systemd re-executes,
+# every ci-runner@N goes down with logind and ssh in one wave, and a second wave
+# restarts ci-dockerd@N, which takes its agent down through BindsTo=. The agent
+# cannot come back either, because its one-shot just-in-time env file was
+# consumed when it started — so every job running on the host dies mid-step.
+#
+# Nothing is lost by turning it off: a host is ephemeral and is replaced from a
+# freshly built image, so security patches arrive by image refresh (the image
+# build scans itself and refuses a fixable critical), never by a host rewriting
+# its own packages under running jobs.
+APT_AUTO_TIMERS="apt-daily.timer apt-daily-upgrade.timer"
+APT_AUTO_SERVICES="apt-daily.service apt-daily-upgrade.service unattended-upgrades.service packagekit.service"
+APT_NO_AUTO_CONF=/etc/apt/apt.conf.d/99ci-no-auto-upgrades
+DPKG_LOCK_WAIT_SECONDS=600
+
+# A run already in flight: one of the two apt services, or anything holding a
+# dpkg lock (an unattended-upgrade, or apt started some other way).
+dpkg_busy() {
+  systemctl is-active --quiet apt-daily.service apt-daily-upgrade.service 2>/dev/null && return 0
+  command -v fuser >/dev/null 2>&1 || return 1
+  fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1
+}
+
+disable_apt_auto_upgrades() {
+  local u state off="" absent="" failed="" waited=0
+  # Timers first, so nothing new is scheduled while a run already in flight is
+  # allowed to finish.
+  for u in $APT_AUTO_TIMERS $APT_AUTO_SERVICES; do
+    if [ "$u" = "${APT_AUTO_SERVICES%% *}" ]; then
+      # An upgrade killed mid-dpkg leaves half-configured packages behind, so a
+      # run in flight is waited out — bounded, because a host that never boots
+      # is worse than one whose patch run was interrupted. No slot unit has
+      # started yet, so whatever it restarts on the way out costs nothing.
+      while dpkg_busy && [ "$waited" -lt "$DPKG_LOCK_WAIT_SECONDS" ]; do
+        sleep 5
+        waited=$((waited + 5))
+      done
+      if dpkg_busy; then
+        log "WARNING: an apt/dpkg run was still in flight after ${DPKG_LOCK_WAIT_SECONDS}s — stopping it anyway"
+      elif [ "$waited" -gt 0 ]; then
+        log "waited ${waited}s for an in-flight apt/dpkg run to finish"
+      fi
+    fi
+    # A minimal image may not carry the unit at all; that is the goal state.
+    state=$(systemctl show -p LoadState --value "$u" 2>/dev/null)
+    case "$state" in
+      ''|not-found) absent="$absent $u"; continue ;;
+    esac
+    systemctl stop "$u" >>/var/log/ci-host.log 2>&1 || true
+    systemctl disable "$u" >>/var/log/ci-host.log 2>&1 || true
+    # Masked, not merely disabled: a package or a dependency must not be able to
+    # start it again.
+    if systemctl mask "$u" >>/var/log/ci-host.log 2>&1; then
+      off="$off $u"
+    else
+      failed="$failed $u"
+    fi
+  done
+  # And at apt's own level, so an unmasked copy or a reinstalled package still
+  # finds nothing to do.
+  if ! { mkdir -p "${APT_NO_AUTO_CONF%/*}" &&
+    printf '%s\n' 'APT::Periodic::Update-Package-Lists "0";' 'APT::Periodic::Unattended-Upgrade "0";' >"$APT_NO_AUTO_CONF"; }; then
+    failed="$failed $APT_NO_AUTO_CONF"
+  fi
+  log "apt auto-upgrades off (host is patched by image refresh): masked${off:- nothing}; absent${absent:- none}${failed:+; WARNING: could not disable$failed}"
+}
+
 main() {
   mkdir -p "$SLOT_ROOT"
   id runner >/dev/null 2>&1 || die "golden image is missing the 'runner' user"
@@ -6412,6 +6481,11 @@ main() {
   # THIS script holds a GitHub App JWT while agents from a previous boot are
   # already serving jobs.
   harden_proc
+
+  # Before any slot, runner or daemon unit is started, because what this turns
+  # off restarts all of them under running jobs (#1480). Fails OPEN: it never
+  # refuses to boot, and says in one line what it could not turn off.
+  disable_apt_auto_upgrades
 
   # Before ANY slot daemon starts, because a rootless daemon copies /etc at the
   # moment it starts and keeps that copy for its lifetime — fixing the resolver
