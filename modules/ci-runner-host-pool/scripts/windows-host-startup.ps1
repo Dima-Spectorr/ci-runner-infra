@@ -1112,6 +1112,26 @@ function Test-MetadataAbsence {
     return ([int] $StatusCode -eq 404)
 }
 
+function Get-DrainVerdict {
+    <#
+      .SYNOPSIS
+        Why a slot must not register now, from the ci-drain value; '' when it may. Pure.
+      .DESCRIPTION
+        The Windows half of host-startup.sh's gate(), with the same reading:
+        '1' is draining, and '?' (the read failed) is NOT "not draining". The
+        controller sets ci-drain and THEN reads the runner list to deregister
+        it, so registering on a failed read could slip an agent past that list
+        on a host about to be deleted.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Value)
+    switch ($Value.Trim()) {
+        '1' { return 'the host is draining' }
+        '?' { return 'ci-drain could not be read' }
+    }
+    return ''
+}
+
 function Get-PortReservationArgument {
     <#
       .SYNOPSIS
@@ -3680,7 +3700,9 @@ function Get-MetadataValue {
         started booting, and deleted again once the host registers; it is the one
         attribute whose value at phase 0 says nothing about its value later. It is
         still read once, above the slot loop, for the reason at the top of this
-        file.
+        file. The drain flag is the other controller-written attribute, and it
+        has its own reader (Read-DrainFlag) because a failed read of it is a
+        reason to wait, not to deny the boot.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string] $Path)
@@ -7051,6 +7073,62 @@ function Invoke-Phase4ProfileTemplate {
 
 # --- phase 5: agent registration as a per-slot service ------------------------
 
+function Read-DrainFlag {
+    <#
+      .SYNOPSIS
+        The ci-drain attribute as '1', '' (absent) or '?' (could not be read).
+    #>
+    [CmdletBinding()]
+    param()
+    try {
+        return [string](Invoke-RestMethod -Uri "$script:MetadataRoot/instance/attributes/ci-drain" `
+                -Headers @{ 'Metadata-Flavor' = 'Google' } -TimeoutSec $script:HttpTimeoutSeconds)
+    } catch {
+        $status = $null
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+            $status = $_.Exception.Response.StatusCode
+        }
+        if (Test-MetadataAbsence -StatusCode $status) { return '' }
+        return '?'
+    }
+}
+
+function Wait-DrainClear {
+    <#
+      .SYNOPSIS
+        Block, bounded, while the controller is draining this host (#1481).
+      .DESCRIPTION
+        The controller writes ci-drain=1 BEFORE it reads the roster it
+        deregisters from, and clears it if the drain aborts. A slot asked
+        before config.cmd and again before its service starts is either in that
+        roster or never takes a job. Agents here are long-lived and only phase 5
+        registers, so this is the one place a Windows host must ask. Bounded like
+        the token wait: a host still draining at the deadline is about to be
+        deleted, and a boot that hangs is the 2h55m outage.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int] $SlotIndex,
+        [Parameter(Mandatory = $true)][string] $Step,
+        [int] $TimeoutSeconds = $script:RegistrationWaitSeconds,
+        [int] $PollSeconds = $script:RegistrationPollSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $announced = $false
+    while ($true) {
+        $why = Get-DrainVerdict -Value (Read-DrainFlag)
+        if (-not $why) { return }
+        if (-not $announced) {
+            Write-BootLog "slot ${SlotIndex}: not registering $Step -- $why; waiting up to ${TimeoutSeconds}s"
+            $announced = $true
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    Deny-Boot ("slot ${SlotIndex}: $why after ${TimeoutSeconds}s $Step -- a draining host registers " +
+        'nothing; the controller deletes it or the register-grace drain reclaims it')
+}
+
 function Wait-RegistrationToken {
     <#
       .SYNOPSIS
@@ -7486,6 +7564,10 @@ function Register-SlotAgent {
     Write-ServiceEnvironment -ServiceName $serviceName -Environment $Environment
     Clear-ServiceRecoveryAction -ServiceName $serviceName -AgentName $name
     Grant-ServiceLogonAccount -ServiceName $serviceName -Credential $Slot.Credential
+
+    # ci-drain may have gone up while config.cmd ran; a drained host never
+    # starts an agent the controller's roster read could have missed.
+    Wait-DrainClear -SlotIndex $Slot.Index -Step 'before its service starts'
 
     # A refused start used to reach the boot log as Start-Service's own sentence,
     # "Failed to start service", which is every cause at once. The innermost
@@ -7966,6 +8048,7 @@ function Invoke-Phase5Registration {
             -CompletedHookPath ([string] $HookPath.Completed) `
             -BrokerEndpoint $BrokerEndpoint -CachePath $cache `
             -HostLabel $Config.HostLabel
+        Wait-DrainClear -SlotIndex $slot.Index -Step 'before config.cmd'
         Register-SlotAgent -Slot $slot -RegistrationToken $regToken `
             -Owner $Config.Owner -Repo $Config.Repo -InstanceName $Config.InstanceName `
             -Labels $Config.Labels -RunnerGroup $Config.RunnerGroup -Environment $block
