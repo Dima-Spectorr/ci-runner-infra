@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.143.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.145.0"
   # ...
 }
 ```
@@ -282,6 +282,19 @@ It runs **before** the image is created, so a blocking finding means no image
 exists, rather than an image that exists and is documented as unusable. The
 report is downloaded to the build workspace *before* the failing check, because
 an aborted build is exactly the one whose report somebody needs.
+
+**This is the only way a Linux host is patched.** Hosts are ephemeral and are
+replaced from the latest image, so `host-startup.sh` turns Ubuntu's own
+unattended patching off at boot, before any slot unit starts: it stops, disables
+and masks `apt-daily.timer`, `apt-daily-upgrade.timer`, their services,
+`unattended-upgrades.service` and `packagekit.service` (whichever the image
+carries), and zeroes `APT::Periodic` in `/etc/apt/apt.conf.d/`. An upgrade
+already in flight at boot is waited out (bounded) rather than killed mid-dpkg.
+Left on, `apt-daily-upgrade` fired about 28 minutes after boot and its package
+restarts took every `ci-runner@N` and `ci-dockerd@N` down mid-job, with no way
+back for agents whose one-shot env file was already consumed (#1480). A security
+fix therefore reaches the fleet by rebuilding the image, never by a host
+upgrading itself under running jobs.
 
 **Windows is not covered.** `packer/ci-host-image-win.pkr.hcl` builds a very
 different filesystem, and syft's catalogers would find almost nothing to
