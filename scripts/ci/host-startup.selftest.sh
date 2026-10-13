@@ -1997,7 +1997,7 @@ $(extract_fn "$1" disable_apt_auto_upgrades)"
   case "$body" in *'systemctl mask'*) : ;; *) return 1 ;; esac
   # the real unit list, every unit the issue names
   for want in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service packagekit.service; do
-    matches "$vars" "[\" ]$want[\" ]" || return 1
+    matches "$vars" "[\" ]${want}[\" ]" || return 1
   done
   t=$(mktemp -d)
   if [ -z "$t" ] || [ ! -d "$t" ]; then return 1; fi
