@@ -4408,7 +4408,10 @@ drain_fail() { # <host> <reason> <message>
 # `ci-drain=1` is written first, and the host's slot loop reads it before every
 # registration and AGAIN after minting: a runner minted before the flag is
 # visible in the roster read that follows it, one minted after is withdrawn by
-# the host itself before it starts. Any abort takes the flag down again, so a
+# the host itself before it starts. A Windows host's agents are long-lived and
+# register only at boot: its phase 5 asks the same flag before each slot's
+# config.cmd and again before that slot's service starts (#1481). Any abort
+# takes the flag down again, so a
 # host the proof refused goes back to taking work. The one path that keeps it is
 # a delete that failed after every agent was deregistered: that host is going,
 # and re-registering it would only hand the retry a busy slot.
