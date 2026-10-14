@@ -95,7 +95,11 @@ digest verified).
    PEM — read from HEAD with `git show`, never from the working tree. A missing attestation, a failed `attestations list`, a wrong key
    (including an attestation that already existed, signed by another key) or a
    payload naming another digest fails the step, so `publish` never names an
-   unverified digest.
+   unverified digest. The list can answer before a just-written attestation
+   is visible (#1584: five signed, the last one read back as missing), so a
+   missing or non-verifying digest is read up to 5 times, 2s apart and
+   doubling (~30s worst case; each wait capped at 30s), before it counts. A list that FAILS is not
+   retried.
 
 The job needs `gcloud` with the `beta` component, `python3`, `openssl` and
 `git` (GitHub-hosted Ubuntu has all four), and the repository checked out.
@@ -201,9 +205,11 @@ that tracks the test keys, against a stub `gcloud` that signs with throwaway
 EC P-256 keys, so the verify pass does real `openssl` checks:
 
 - passes: a good signature; a re-run that finds the attestation already there;
-  a fully named attestor; a key-rotation overlap.
+  a fully named attestor; a key-rotation overlap; an attestation the list
+  shows only on the third read.
 - fails: a wrong key; an `ALREADY_EXISTS` attestation signed by the wrong key;
-  a payload naming another digest; a missing attestation; `attestations list`
+  a payload naming another digest; a missing attestation, after every read;
+  a lag outlasting the reads; `attestations list`
   exiting 1; a `sign-and-create` error; a missing input when required; a
   missing access token; an untracked PEM; a tracked PEM edited in the
   working tree (current or previous key); a PEM staged but never committed;
