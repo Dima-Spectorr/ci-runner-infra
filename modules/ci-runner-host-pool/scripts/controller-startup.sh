@@ -811,6 +811,15 @@ declare -A D_TOTAL=() D_QUEUED=() D_WAIT=() D_RUNNING=() D_EXPIRED=()
 # dropping it changes no decision — under-reporting is only possible in the one
 # state where the number is not being acted on.
 DEMAND_MAX_AGE=21600
+# ...EXCEPT a first attempt a pool OUTAGE held past it (#1466): a job queued
+# while the pool's only host was dead aged out at 6h and the recovered pool
+# never served it. Such a run is OFFERED a host for this long -- counted as
+# demand -- and spent if GitHub still has not dispatched it. See
+# stranded_run_decision. An hour is twice the worst host boot plus
+# registration this module allows (GRACE + REGISTER_GRACE = 25 min), so a real
+# job is always taken inside it; a corpse costs one warm host for one hour,
+# once per controller lifetime, and a run with no jobs costs one fetch.
+DEMAND_STRANDED_GRACE=3600
 METRIC_PREFIX=${METRIC_PREFIX:-custom.googleapis.com/ci}
 REPO_FULL="$OWNER/$REPO"
 
@@ -1549,6 +1558,52 @@ collect_demand() {
         ((.run_started_at // "") | fromdateiso8601? // "-" | tostring) ]
     | @tsv' 2>/dev/null)"
 
+  # STRANDED FIRST ATTEMPTS (#1466), from the same unfiltered page. A run
+  # queued through a pool outage longer than DEMAND_MAX_AGE is offered a host
+  # for DEMAND_STRANDED_GRACE instead of being dropped as a corpse, and spent
+  # after it -- see stranded_run_decision. The ledger is per repository and
+  # holds only runs still on this page, so it stays bounded by the page; a
+  # replaced controller loses it, which costs each corpse one more offer.
+  # Rewritten only when the page parsed: an empty read must not forget which
+  # corpses are already spent.
+  local st_ledger st_ids="" st_led="" st_id st_attempt st_created st_seen st_state st_verdict
+  local -A st_seen_of=() st_state_of=()
+  st_ledger="$STATE_DIR/stranded-runs"
+  if [ -r "$st_ledger" ]; then
+    while read -r st_id st_seen st_state; do
+      case "$st_id" in "" | *[!0-9]*) continue ;; esac
+      st_seen_of["$st_id"]="$st_seen"
+      st_state_of["$st_id"]="${st_state:-offer}"
+    done <"$st_ledger"
+  fi
+  while IFS=$'\t' read -r st_id st_attempt st_created; do
+    case "$st_id" in "" | *[!0-9]*) continue ;; esac
+    st_seen="${st_seen_of[$st_id]:--}"
+    st_verdict=$(stranded_run_decision "$st_attempt" "$st_created" "$st_seen" "$sweep_start" "$DEMAND_MAX_AGE" "$DEMAND_STRANDED_GRACE")
+    case "$st_verdict" in
+      fetch:*)
+        st_ids="${st_ids}${st_id}
+"
+        [ "$st_seen" = "-" ] || st_led="${st_led}${st_id} ${st_seen} offer
+"
+        ;;
+      skip:spent*)
+        [ "${st_state_of[$st_id]:-}" = "spent" ] ||
+          log "stranded run $st_id: ${st_verdict#skip:} -- a corpse, no longer demand"
+        st_led="${st_led}${st_id} ${st_seen} spent
+"
+        ;;
+    esac
+  done <<<"$(printf '%s' "$runs_rr" | jq -r '
+    .workflow_runs[]?
+    | select((.run_attempt // 1) <= 1)
+    | [ (.id | tostring), ((.run_attempt // 1) | tostring),
+        ((.created_at // "") | fromdateiso8601? // "-" | tostring) ]
+    | @tsv' 2>/dev/null)"
+  if printf '%s' "$runs_rr" | jq -e '.workflow_runs | type == "array"' >/dev/null 2>&1; then
+    printf '%s' "$st_led" >"$st_ledger.tmp" 2>/dev/null && mv -f "$st_ledger.tmp" "$st_ledger" 2>/dev/null
+  fi
+
   # QUEUED RUNS FIRST, and no `sort -u` across the two lists: the order decides
   # what survives the budget below, and queued jobs are the ones the pool has to
   # scale out FOR. `awk '!seen[$0]++'` keeps that order while still visiting a
@@ -1568,6 +1623,8 @@ collect_demand() {
     printf '%s' "$runs" | jq -r '.workflow_runs[]?.id' 2>/dev/null
     printf '%s' "$rr_ids"
     printf '%s' "$runs_ip" | jq -r '.workflow_runs[]?.id' 2>/dev/null
+    # LAST, so a stranded run can never push live work past the budget.
+    printf '%s' "$st_ids"
   } | awk 'NF && !seen[$0]++')
   [ -n "$ids" ] || return 0
 
@@ -1658,11 +1715,33 @@ collect_demand() {
     # given a label the CI pools do not carry AND deliberately omit the generic
     # labels the CI pools do — the sets are disjoint by construction, and this
     # is the code that would double-scale if they ever stopped being.
+    # A STRANDED RUN ON OFFER is exempt from the shelf life below (#1466). Its
+    # clock starts on the first payload; a run with no jobs at all is the
+    # measured corpse shape (total_count 0) and is spent at once. Appended to
+    # the ledger: a later line for the same run wins when it is read back.
+    local st_offer=false st_total
+    case $'\n'"$st_ids" in
+      *$'\n'"$id"$'\n'*)
+        st_offer=true
+        st_total=$(printf '%s' "$jobs" | jq -r '.total_count // "-"' 2>/dev/null)
+        if [ "$st_total" = "0" ]; then
+          st_offer=false
+          log "stranded run $id has no jobs -- a corpse, spent"
+          printf '%s 0 spent\n' "$id" >>"$st_ledger" 2>/dev/null
+        elif [ -z "${st_seen_of[$id]+set}" ]; then
+          log "stranded run $id queued past DEMAND_MAX_AGE -- offered a host for ${DEMAND_STRANDED_GRACE}s"
+          printf '%s %s offer\n' "$id" "$sweep_start" >>"$st_ledger" 2>/dev/null
+        fi
+        ;;
+    esac
+
     local counted
     counted=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MATCH_MAP" \
-      --argjson now "$sweep_start" --argjson maxage "$DEMAND_MAX_AGE" '
+      --argjson now "$sweep_start" --argjson maxage "$DEMAND_MAX_AGE" \
+      --argjson offer "$st_offer" '
       # A QUEUED JOB HAS A SHELF LIFE, and past it this pool stops answering for
-      # it. See DEMAND_MAX_AGE. An unparseable timestamp reads as "just now" and
+      # it. See DEMAND_MAX_AGE -- unless its run is a stranded one on offer
+      # ($offer), which is the point of offering it. An unparseable timestamp reads as "just now" and
       # is therefore never aged out -- the fail-safe direction, since the cost of
       # keeping a corpse is a warm host and the cost of dropping a live job is a
       # pool that will not scale out for real work.
@@ -1670,7 +1749,8 @@ collect_demand() {
       # every comparison below is between folded sets. $pools arrives folded.
       def jlabels: ((.labels // []) | map(ascii_downcase));
       def expired:
-        .status == "queued"
+        ($offer | not)
+        and .status == "queued"
         and (((((.started_at // .created_at) // "") | fromdateiso8601?) // $now)
               < ($now - $maxage));
       [ .jobs[]?

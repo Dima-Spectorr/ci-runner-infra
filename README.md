@@ -993,6 +993,19 @@ of which 0 were real, IntegrateIT 31 of which 5 were real. The in-progress list
 is deliberately not filtered this way — a long build can be older than the
 window and still hold live work.
 
+The window alone would also drop real work a pool outage held past it (#1466:
+a Windows job queued while the pool's only host was dead was 6h21m old when the
+pool came back, and the recovered pool sat at zero until a human re-ran it). So
+a first attempt from the unfiltered queued page that is older than the window is
+**offered** a host: for `DEMAND_STRANDED_GRACE` (1h) its queued jobs count as
+demand, and the pool scales out for them. A real job is taken inside that hour;
+one still queued after it was given a host and not dispatched, so it is spent —
+logged as a corpse and never fetched again. A run with no jobs at all (the
+measured corpse shape) is spent on its first fetch. Stranded runs are fetched
+last, after in-progress work, so they never push live work past the budget. The
+ledger (`stranded-runs` in the repository's state directory) is not durable: a
+replaced controller offers each corpse one more hour.
+
 `ci_poller_heartbeat` is published on every tick including a failed one:
 "no data" there means the controller is down, which no other series can
 distinguish from "the pool is idle".

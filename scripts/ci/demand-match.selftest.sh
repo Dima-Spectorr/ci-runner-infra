@@ -120,7 +120,8 @@ expect 0 "missing jobs key does not crash the tick" '{}'
 STAMPS='
   def jlabels: ((.labels // []) | map(ascii_downcase));
   def expired:
-    .status == "queued"
+    ($offer | not)
+    and .status == "queued"
     and (((((.started_at // .created_at) // "") | fromdateiso8601?) // $now)
           < ($now - $maxage));
   [ .jobs[]?
@@ -156,9 +157,9 @@ POOLS_MAP=$(jq -n --argjson l "$POOL_LABELS" '{telnet: $l}')
 
 # fields <want-pipe-joined> <description> <jobs-json>
 fields() {
-  local want="$1" desc="$2" jobs="$3" got
+  local want="$1" desc="$2" jobs="$3" offer="${4:-false}" got
   got=$(printf '%s' "$jobs" | jq -r --argjson pools "$POOLS_MAP" \
-    --argjson now "$NOW" --argjson maxage "$MAXAGE" "$STAMPS" \
+    --argjson now "$NOW" --argjson maxage "$MAXAGE" --argjson offer "$offer" "$STAMPS" \
     | tr -d '\r' | tr '\t' '|' | paste -sd';' -)
   if [ "$got" = "$want" ]; then
     PASS=$((PASS + 1))
@@ -219,7 +220,7 @@ MULTI=$(jq -n '{
 multi() {
   local want="$1" desc="$2" jobs="$3" got
   got=$(printf '%s' "$jobs" | jq -r --argjson pools "$MULTI" \
-    --argjson now "$NOW" --argjson maxage "$MAXAGE" "$STAMPS" \
+    --argjson now "$NOW" --argjson maxage "$MAXAGE" --argjson offer false "$STAMPS" \
     | tr -d '\r' | cut -f1,2 | tr '\t' '|' | paste -sd';' -)
   if [ "$got" = "$want" ]; then
     PASS=$((PASS + 1))
@@ -481,9 +482,17 @@ fields "telnet|1|0|-|$STALE|0" \
 fields "telnet|1|1|not-a-date|-|0" \
   "an unparseable timestamp is kept, not aged out" \
   '{"jobs":[{"status":"queued","labels":["self-hosted"],"created_at":"not-a-date"}]}'
+# ...UNLESS the run is a stranded one on offer (#1466): a job a pool outage held
+# past the shelf life is demand while the controller offers it a host, so the
+# recovered pool scales out for it instead of sitting at zero.
+fields "telnet|1|1|$STALE|-|0" \
+  "a stale job in a run on offer is demand, not expired" \
+  '{"jobs":[{"status":"queued","labels":["self-hosted"],"created_at":"'"$STALE"'"}]}' true
 # shellcheck disable=SC2016  # matching shell source text literally, on purpose.
 for needle in \
   'DEMAND_MAX_AGE=21600' \
+  'DEMAND_STRANDED_GRACE=3600' \
+  '($offer | not)' \
   'queue_series "ci_demand_expired" "$DEMAND_EXPIRED"'
 do
   if grep -qF "$needle" "$CONTROLLER"; then
