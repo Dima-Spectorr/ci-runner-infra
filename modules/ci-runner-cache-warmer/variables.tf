@@ -396,21 +396,23 @@ variable "alert_notification_channels" {
   description = <<-EOT
     Notification channels the warmer's own alert policy notifies, as full
     resource names (`projects/<project>/notificationChannels/<id>`), in this
-    module's project. Required and non-empty: a failing warm raises nothing
-    else, and an alert nobody receives is the incident this policy exists to
-    end.
+    module's project. Optional: `[]` (the default) creates no alert policy and
+    no log-based outcome metric — a failing warm then raises nothing, only a
+    cold pool. Name at least one channel to have the alarm.
   EOT
   type        = list(string)
+  default     = []
 
   validation {
-    condition     = length(var.alert_notification_channels) > 0 && alltrue([for c in var.alert_notification_channels : can(regex("^projects/[^/]+/notificationChannels/[^/]+$", c))])
-    error_message = "alert_notification_channels must name at least one channel, each as projects/<project>/notificationChannels/<id>. A warmer alert with no recipient is silent."
+    condition     = alltrue([for c in var.alert_notification_channels : can(regex("^projects/[^/]+/notificationChannels/[^/]+$", c))])
+    error_message = "Each alert_notification_channels entry must be projects/<project>/notificationChannels/<id>. Leave the list empty for no alert."
   }
 }
 
 variable "alert_stale_after_hours" {
   description = <<-EOT
-    The alert fires when no warm has succeeded for this many hours. 36 by
+    The alert fires when no warm has succeeded for this many hours (only
+    when `alert_notification_channels` is non-empty). 36 by
     default: one missed nightly run plus margin. This condition — absence of
     success — is the guarantee; it catches a build refused at fire time, a
     schedule that stopped firing and a timeout alike, none of which needs to
