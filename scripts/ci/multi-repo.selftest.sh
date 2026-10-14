@@ -392,7 +392,15 @@ if [ "${1:-}" != "--plan" ]; then
   touch -d '2 hours ago' "$T/wd/heartbeat"
   check "watchdog: and restarts the single-repository unit under its old name" "systemctl restart ci-controller.service" "$(watchdog | grep '^systemctl')"
 
-  # --- 8. health: unhealthy if ANY repository is wedged, and it says which ----
+  # --- 8. health: one wedged repository is named, not rebuilt (#1497) -------
+  #
+  # The machine is unhealthy when EVERY heartbeat is past the threshold, or ANY
+  # is past the long bound. One repository stale between the two is named in
+  # the answer while the machine answers 200: its own watchdog restarts it, and
+  # the rebuild — which stops every other repository for ~11 minutes — waits.
+  # Thresholds below: 900s (3 watchdog thresholds) and 3600s (12).
+  check "installer: the responder gets three watchdog thresholds, and twelve as the long bound" "yes" \
+    "$(has "$inst" 'livez_script "$livez_hbs" "$((wd_threshold * 3))" "$HEALTH_PORT" "$((wd_threshold * 12))"')"
   eval "$(fn livez_script)"
   PY=$(command -v python3 || command -v python || true)
   if [ -z "$PY" ]; then
@@ -400,20 +408,65 @@ if [ "${1:-}" != "--plan" ]; then
     fail=$((fail + 1))
   else
     mkdir -p "$T/hz/alpha" "$T/hz/beta" "$T/hz/gamma" "$T/py-multi" "$T/py-legacy"
-    touch "$T/hz/alpha/heartbeat" "$T/hz/beta/heartbeat" "$T/hz/gamma/heartbeat" "$T/hz/heartbeat"
-    livez_script "(\"alpha\", \"$TN/hz/alpha/heartbeat\"), (\"beta\", \"$TN/hz/beta/heartbeat\"), (\"gamma\", \"$TN/hz/gamma/heartbeat\"), " 900 0 >"$T/py-multi/livez.py"
-    livez_script "(\"\", \"$TN/hz/heartbeat\")" 900 0 >"$T/py-legacy/livez.py"
+    fresh() { touch "$T/hz/alpha/heartbeat" "$T/hz/beta/heartbeat" "$T/hz/gamma/heartbeat" "$T/hz/heartbeat"; }
+    fresh
+    livez_script "(\"alpha\", \"$TN/hz/alpha/heartbeat\"), (\"beta\", \"$TN/hz/beta/heartbeat\"), (\"gamma\", \"$TN/hz/gamma/heartbeat\"), " 900 0 3600 >"$T/py-multi/livez.py"
+    livez_script "(\"\", \"$TN/hz/heartbeat\")" 900 0 3600 >"$T/py-legacy/livez.py"
     verdict() { # <dir> -> "<ok> <names> <body after the age>"
       "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import livez; ok, body, named = livez.verdict(); print(int(ok), ",".join(named) or "-", body.split(" ", 1)[1])' "$TN/$1" 2>&1 | tr -d '\r'
     }
-    check "health: every repository fresh is healthy" "1 - threshold=900" "$(verdict py-multi)"
-    touch -d '2 hours ago' "$T/hz/beta/heartbeat"
-    check "health: ONE wedged repository makes the machine unhealthy, and is named" "0 beta threshold=900 wedged=beta" "$(verdict py-multi)"
-    rm -f "$T/hz/gamma/heartbeat"
-    check "health: a repository with no heartbeat at all is wedged too" "0 beta,gamma threshold=900 wedged=beta,gamma" "$(verdict py-multi)"
-    check "health(legacy): fresh is healthy, and the answer is the one it always gave" "1 - threshold=900" "$(verdict py-legacy)"
-    touch -d '2 hours ago' "$T/hz/heartbeat"
-    check "health(legacy): stale is unhealthy with no repository named" "0 - threshold=900" "$(verdict py-legacy)"
+    # Every case below, run against the shipped responder and then against each
+    # mutant of it. A case is "<name>|<expected>|<setup>" for the py-multi
+    # responder unless the setup starts with "legacy:".
+    cases=(
+      "health: every repository fresh is healthy|1 - threshold=900|:"
+      "health: ONE repository stale is named, and the machine stays healthy|1 beta threshold=900 wedged=beta|touch -d '20 minutes ago' \"\$T/hz/beta/heartbeat\""
+      "health: ONE repository stale past the long bound makes the machine unhealthy|0 beta threshold=900 wedged=beta|touch -d '2 hours ago' \"\$T/hz/beta/heartbeat\""
+      "health: EVERY repository stale makes the machine unhealthy, and names them all|0 alpha,beta,gamma threshold=900 wedged=alpha,beta,gamma|touch -d '20 minutes ago' \"\$T/hz/alpha/heartbeat\" \"\$T/hz/beta/heartbeat\" \"\$T/hz/gamma/heartbeat\""
+      "health: a repository with no heartbeat at all is past the long bound|0 gamma threshold=900 wedged=gamma|rm -f \"\$T/hz/gamma/heartbeat\""
+      "health(legacy): fresh is healthy, and the answer is the one it always gave|1 - threshold=900|legacy:"
+      "health(legacy): stale is unhealthy with no repository named|0 - threshold=900|legacy:touch -d '20 minutes ago' \"\$T/hz/heartbeat\""
+    )
+    run_case() { # <case> -> the verdict the current responders give
+      local setup="${1##*|}" dir=py-multi
+      case "$setup" in legacy:*) dir=py-legacy; setup="${setup#legacy:}" ;; esac
+      fresh
+      eval "${setup:-:}"
+      verdict "$dir"
+    }
+    for c in "${cases[@]}"; do
+      exp="${c#*|}"; exp="${exp%|*}"
+      check "${c%%|*}" "$exp" "$(run_case "$c")"
+    done
+
+    # Mutants: each rewrites the rendered responders, and the case it names must
+    # now give a different answer. One that survives is a branch no case tests.
+    cp "$T/py-multi/livez.py" "$T/livez-multi.orig"
+    cp "$T/py-legacy/livez.py" "$T/livez-legacy.orig"
+    mutant() { # <desc> <sed-expr> <case index>
+      sed -e "$2" "$T/livez-multi.orig" >"$T/py-multi/livez.py"
+      sed -e "$2" "$T/livez-legacy.orig" >"$T/py-legacy/livez.py"
+      rm -rf "$T/py-multi/__pycache__" "$T/py-legacy/__pycache__"
+      if cmp -s "$T/py-multi/livez.py" "$T/livez-multi.orig"; then
+        echo "FAIL mutant did not apply: $1"; fail=$((fail + 1)); return
+      fi
+      local c="${cases[$3]}" exp got
+      exp="${c#*|}"; exp="${exp%|*}"
+      got=$(run_case "$c")
+      if [ "$got" = "$exp" ]; then
+        echo "FAIL mutant survived: $1 (${c%%|*})"; fail=$((fail + 1))
+      else
+        echo "ok   mutant killed: $1"; pass=$((pass + 1))
+      fi
+    }
+    mutant "any stale repository rebuilds the machine again (the #1497 shape)" \
+      's/        if age >= LONG:/        if age >= THRESHOLD:/' 1
+    mutant "the long bound never rebuilds" 's/    return not (every or ancient), /    return not every, /' 2
+    mutant "every repository stale is not enough" 's/    every = len(stale) == len(HBS)/    every = False/' 3
+    mutant "a missing heartbeat is only stale, not ancient" 's/            age = LONG + 1/            age = THRESHOLD + 1/' 4
+    mutant "the single-repository controller never goes unhealthy" 's/    every = len(stale) == len(HBS)/    every = False/' 6
+    cp "$T/livez-multi.orig" "$T/py-multi/livez.py"
+    cp "$T/livez-legacy.orig" "$T/py-legacy/livez.py"
   fi
 
   # --- 9. the Terraform text a plan cannot be run for here -------------------

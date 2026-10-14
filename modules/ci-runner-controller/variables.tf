@@ -355,6 +355,9 @@ variable "controller_health_port" {
     `controller_autohealing` is set. It answers 200 on /livez only while the
     tick heartbeat is fresh, so the probe distinguishes a stalled controller
     from a live one rather than merely confirming something is listening.
+    Serving a `repos` table, one stale repository is named in the answer but
+    does not fail it: only every repository stale, or one stale for twelve
+    watchdog thresholds, does — its own watchdog restarts it first.
 
     With autohealing off nothing listens on it at all: the port is passed to
     the VM as an empty string and the responder is never started.
