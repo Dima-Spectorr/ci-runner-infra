@@ -279,7 +279,43 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
   local reg="$1" age="$2" pre="${3:-}" status="${4:-RUNNING}" busy="${5:-0}"
   local arc="${6:-0}" drc="${7:-0}" mut="${8:-}"
   local cago="${9:-0}" ikey="${10:-absent}" derc="${11:-0}" dmut="${12:-}"
-  local dir out step facts m
+  # [started-ago] — when the CURRENT boot began (#1469). Defaults to the creation
+  # time, an instance that has never been restarted. `-` is an instance with no
+  # lastStartTimestamp at all: it has not started.
+  local sago="${13:-$cago}"
+  local dir out step wrt facts m now cep sep cts sts boot keys
+  # Fixed ONCE, so the stub's timestamp and the boot named in its key list are
+  # the same second however long the run takes.
+  now=$(date -u +%s)
+  cep=$((now - cago))
+  cts=$(date -u -d "@$cep" +%Y-%m-%dT%H:%M:%S.000-00:00)
+  if [ "$sago" = - ]; then
+    sts="" boot="4733205416644719969-"
+  else
+    sep=$((now - sago))
+    sts=$(date -u -d "@$sep" +%Y-%m-%dT%H:%M:%S.000-00:00)
+    boot="4733205416644719969-$sep"
+  fi
+  # The instance's WHOLE key set, one per line — which is what the real
+  # projection returns, there being no --filter to narrow it. The absent case
+  # still prints a key, and one whose name CONTAINS the real one, so a substring
+  # match would read it as present.
+  #
+  # `issued` is the state that outlives everything else: the token was handed
+  # out once, to THIS boot, and correctly deleted; the marker the write put there
+  # in the same call is all that remains. It is listed BEFORE the token key in
+  # the `present` case, because the loop must see every line rather than stop at
+  # the first match. `issued-old` is a marker for an EARLIER boot of the same
+  # instance — the recreate in place — and `legacy` is the bare, boot-less marker
+  # every host issued before #1469 carries.
+  case "$ikey" in
+    present) keys="instance-template ci-registration-token-issued-$boot ci-registration-token created-by" ;;
+    absent) keys="instance-template ci-registration-token-old created-by" ;;
+    issued) keys="instance-template ci-registration-token-issued-$boot created-by" ;;
+    issued-old) keys="instance-template ci-registration-token-issued-4733205416644719969-$((cep - 1)) created-by" ;;
+    legacy) keys="instance-template ci-registration-token-issued created-by" ;;
+    none) keys="" ;;
+  esac
   dir=$(mktemp -d)
   : >"$dir/calls"
   for m in ${pre//,/ }; do
@@ -293,6 +329,10 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
 
   step=$(fn registration_token_step)
   [ -n "$mut" ] && step=$(printf '%s\n' "$step" | sed "$mut")
+  # The step mutation reaches the write too: the no-boot refusal lives in both,
+  # and a mutation has to be able to remove the pair.
+  wrt=$(fn write_registration_token)
+  [ -n "$mut" ] && wrt=$(printf '%s\n' "$wrt" | sed "$mut")
   facts=$(fn instance_durable_facts)
   [ -n "$dmut" ] && facts=$(printf '%s\n' "$facts" | sed "$dmut")
 
@@ -343,26 +383,13 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
           # has to survive it.
           *creationTimestamp*)
             [ $derc -eq 0 ] || return $derc
-            date -u -d \"@\$((\$(date -u +%s) - $cago))\" +%Y-%m-%dT%H:%M:%S.000-00:00
+            # What value(id,creationTimestamp,lastStartTimestamp) prints:
+            # tab-separated, the last field empty on an unstarted instance.
+            printf '%s\t%s\t%s\n' 4733205416644719969 '$cts' '$sts'
             return 0 ;;
           *metadata.items.key*)
             [ $derc -eq 0 ] || return $derc
-            # The WHOLE key set, one per line — which is what the real
-            # projection returns, there being no --filter to narrow it. The
-            # absent case still prints a key, and one whose name CONTAINS the
-            # real one, so a substring match would read it as present.
-            #
-            # \`issued\` is the state that outlives everything else: the token was
-            # handed out once and correctly deleted, and the marker the write put
-            # there in the same call is all that remains. It is deliberately
-            # listed BEFORE the token key in the \`present\` case, because the loop
-            # must see every line rather than stop at the first match.
-            case '$ikey' in
-              present) printf '%s\n' instance-template ci-registration-token-issued ci-registration-token created-by ;;
-              absent) printf '%s\n' instance-template ci-registration-token-old created-by ;;
-              issued) printf '%s\n' instance-template ci-registration-token-issued created-by ;;
-              none) : ;;
-            esac
+            for k in $keys; do printf '%s\n' \"\$k\"; done
             return 0 ;;
           *) return $drc ;;
         esac
@@ -371,7 +398,7 @@ reg_seq() { # <reg> <age> <pre> <status> [busy] [add-rc] [del-rc] [mutation-sed]
       # functions below. Left out, every assertion in this section reports the
       # helper's absence as the tested function's failure.
       $(fn zone_of_uri)
-      $(fn write_registration_token)
+      $wrt
       $(fn delete_registration_token)
       $facts
       $step
@@ -663,6 +690,61 @@ check "regtoken: the H-4 case FAILS when the issued gate is reverted" \
 # this line in that event. It is defence in depth against a future caller, not a
 # behaviour this harness can reach — a check for it would assert nothing.
 
+# ── #1469: a host recreated under its own name is a NEW BOOT ─────────────────
+#
+# A regional MIG recreate is an in-place update: the instance id and the
+# creationTimestamp are unchanged, only lastStartTimestamp moves. Asked per
+# instance, every durable fact refused that host for good — "created 4000s ago"
+# and "already issued one" were both about the dead boot. Asked per boot, the new
+# one is a host that has never been handed a token, which is what it is.
+check "regtoken: #1469 — a host recreated in place is minted a token for its new boot" \
+  "1|0|minted|keylive|fails=0" "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 issued-old 0 '' 30)"
+check "regtoken: #1469 — the durable age runs from the boot, not from creation" \
+  "1|0|minted|keylive|fails=0" "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 absent 0 '' 30)"
+
+# …and the refusals the per-boot facts must KEEP. THIS boot's own marker still
+# refuses a second token (H-4 after a recreate), a boot older than the grace is
+# still not booting (H-3 with an earlier boot's marker beside it), and the bare
+# marker every host issued before #1469 carries cannot say which boot it was for,
+# so it is read as this one.
+check "regtoken: #1469 — this boot's own issued marker still refuses a second token" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 issued 0 '' 30)"
+check "regtoken: #1469 — an old boot is still refused whatever an earlier boot was issued" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 0 '' RUNNING 0 0 0 '' 4000 issued-old 0 '' 4000)"
+check "regtoken: #1469 — the legacy boot-less issued marker still refuses" \
+  "0|0|minted|no-keylive|fails=0" "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 legacy 0 '' 30)"
+
+# An instance with no lastStartTimestamp has no boot to record a token against.
+# Nothing is minted, and it is NOT charged to the cap — nothing failed — nor
+# marked minted — nothing was decided. The next tick, started, mints.
+check "regtoken: #1469 — an instance that has not started yet is minted nothing, uncharged" \
+  "0|0|no-minted|no-keylive|fails=0" "$(reg_seq absent 0 '' PROVISIONING 0 0 0 '' 30 absent 0 '' -)"
+
+# Mutations, one per new branch; each must change the answer of the case above it.
+# shellcheck disable=SC2016
+check "regtoken: #1469 — FAILS when the durable age goes back to creation alone" \
+  "0|0|minted|no-keylive|fails=0" \
+  "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 absent 0 's/\[ "\$epoch" -gt "\$born" \] && born=\$epoch/:/' 30)"
+# shellcheck disable=SC2016
+check "regtoken: #1469 — FAILS when any boot's issued marker refuses this one" \
+  "0|0|minted|no-keylive|fails=0" \
+  "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 issued-old 0 's/\[ "\$k" = "\${REG_TOKEN_KEY}-issued-\$t" \]/[[ "$k" == "${REG_TOKEN_KEY}-issued-"* ]]/' 30)"
+# shellcheck disable=SC2016
+check "regtoken: #1469 — FAILS when the legacy marker stops refusing" \
+  "1|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 30 '' RUNNING 0 0 0 '' 4000 legacy 0 's/      "${REG_TOKEN_KEY}-issued") DUR_ISSUED="present" ;;/      "${REG_TOKEN_KEY}-issued-never") ;;/' 30)"
+# The no-boot refusal has two layers. With the step's check gone the write
+# refuses on its own — no add-metadata, a charged attempt — and with both gone a
+# token is written under a marker naming no boot, which no later read matches.
+# shellcheck disable=SC2016
+check "regtoken: #1469 — without the step's no-boot check the write still refuses" \
+  "0|0|no-minted|no-keylive|fails=1" \
+  "$(reg_seq absent 0 '' PROVISIONING 0 0 0 's/if \[ -z "\$DUR_BOOT" \]; then/if false; then/' 30 absent 0 '' -)"
+# shellcheck disable=SC2016
+check "regtoken: #1469 — FAILS when both no-boot checks are removed" \
+  "1|0|minted|keylive|fails=0" \
+  "$(reg_seq absent 0 '' PROVISIONING 0 0 0 's/if \[ -z "\$DUR_BOOT" \]; then/if false; then/; s/if \[ -z "\$boot" \]; then/if false; then/' 30 absent 0 '' -)"
+
 # A creationTimestamp in the FUTURE — a controller whose clock is behind the
 # API's. The instance's real age is unknowable from here, so the durable age
 # reads as the refusing sentinel and nothing is minted; a key already on the
@@ -685,8 +767,8 @@ check "regtoken: the skew clamp FAILS when a negative age clamps to 0" \
 # one that matters most and was the one missing: `absent` left over from another
 # host's successful read is a licence to mint.
 r=$(sed -n '/^instance_durable_facts()/,/^  zone=/p' "$CTRL" |
-  grep -c -E '^  DUR_(AGE|KEY|ISSUED)=')
-check "regtoken: every durable fact is reset before the first early return" 3 "$r"
+  grep -c -E '^  DUR_(AGE|KEY|ISSUED|BOOT)=')
+check "regtoken: every durable fact is reset before the first early return" 4 "$r"
 
 # ── F4: the bug the stub above could not see ─────────────────────────────────
 #
@@ -771,7 +853,7 @@ r=$(grep -c -- '--metadata=' "$CTRL")
 # The third is ci-drain=1 (#1481), a literal flag, not a credential.
 check "regtoken: still only the three known --metadata arguments" 3 "$r"
 # shellcheck disable=SC2016
-grep -q -- '--metadata="${REG_TOKEN_KEY}-issued=1"' "$CTRL" && r=yes || r=no
+grep -q -- '--metadata="${REG_TOKEN_KEY}-issued-${boot}=1"' "$CTRL" && r=yes || r=no
 check "regtoken: and it carries only the issued marker, never the token" yes "$r"
 
 # The delete names the token key and only the token key. Removing the issued
@@ -1314,6 +1396,52 @@ check "slots: a host that registered nothing reads as zero, not as unknown" \
 check "slots: a blind tick reports -1, which the sum skips entirely" \
   "-1|0|unknown" "$(hf '' 4 ci-lin-a1b2)"
 
+# ── #1469: the registrations the mint decision counts ───────────────────────
+#
+# A host recreated under its own name inherits the dead boot's registrations:
+# GitHub still lists them, offline. HOST_REG reads them as `present` (drain and
+# recycle still have them to deregister); HOST_REG_LIVE, which is all the mint
+# step sees, counts only an agent a job can reach — online, or busy.
+hfl() { # <runners-json> <slots> <host> [mutation-sed] -> HOST_REG|HOST_REG_LIVE
+  (
+    set -uo pipefail
+    code=$(fn host_facts)
+    [ -n "${4:-}" ] && code=$(printf '%s\n' "$code" | sed "$4")
+    eval "$code"
+    # shellcheck disable=SC2034
+    RUNNERS_JSON="$1"
+    # shellcheck disable=SC2034
+    SLOTS="$2"
+    HOST_REG="" HOST_REG_LIVE=""
+    host_facts "$3"
+    printf '%s|%s' "$HOST_REG" "$HOST_REG_LIVE"
+  ) 2>&1
+}
+STALE='{"runners":[
+  {"name":"ci-win-a1b2-s1","status":"offline","busy":false},
+  {"name":"ci-win-a1b2-s2","status":"offline","busy":false}
+]}'
+check "slots: #1469 — a recreated host's offline registrations are not live" \
+  "present|absent" "$(hfl "$STALE" 2 ci-win-a1b2)"
+check "slots: #1469 — an online agent is live" "present|partial" \
+  "$(hfl '{"runners":[{"name":"ci-win-a1b2-s1","status":"online","busy":false},
+    {"name":"ci-win-a1b2-s2","status":"offline","busy":false}]}' 2 ci-win-a1b2)"
+# Busy wins over the connection: a busy agent is executing a job, and the key's
+# expiry must see it whatever the connection says.
+check "slots: #1469 — a busy agent is live even while offline" "present|partial" \
+  "$(hfl '{"runners":[{"name":"ci-win-a1b2-s1","status":"offline","busy":true},
+    {"name":"ci-win-a1b2-s2","status":"offline","busy":false}]}' 2 ci-win-a1b2)"
+check "slots: #1469 — a list without status counts every registration, the old answer" \
+  "present|present" "$(hfl "$FULL" 4 ci-lin-a1b2)"
+check "slots: #1469 — a blind tick is unknown on both" "unknown|unknown" "$(hfl '' 2 ci-win-a1b2)"
+# shellcheck disable=SC2016
+check "slots: #1469 — FAILS when the live count counts offline registrations" \
+  "present|present" \
+  "$(hfl "$STALE" 2 ci-win-a1b2 's/select(.busy == true or .status == "online" or (has("status") | not))/select(true)/')"
+# shellcheck disable=SC2016
+grep -q 'registration_token_step "\$host" "\$host_uri" "\$HOST_REG_LIVE"' "$CTRL" && r=yes || r=no
+check "slots: #1469 — the mint step is handed the live count, not every registration" yes "$r"
+
 # And the sum itself: the three guards that keep ordinary scale-out from moving
 # the series. A host still inside its registration grace has not registered YET,
 # a host that is not RUNNING is arriving or leaving, and a blind tick knows
@@ -1715,7 +1843,9 @@ boot_seq() {
   rm -rf "$dir"
 }
 
-_KEPT='pinhold,cordon,regtoken,regkey,regfail,absent,'
+# Since #1469 the credential markers and the cordon go with the boot too: each is
+# asked again of the instance (the per-boot durable facts, the ci-cordon flag).
+_KEPT='pinhold,absent,'
 _ALL='beaconerr,pinerr,pinveto,pinhold,cordon,regtoken,regkey,regfail,absent,'
 _NEW_BOOT="4733205416644719969/$_NEW_START"
 _UNTOUCHED="age=old idle=old partial=old verdict=drain:never-registered miss=222"
@@ -1806,6 +1936,16 @@ check "restart mutation: resetting on first sight is seen" caught "$r"
 case "$(boot_seq "$_OLD_BOOT" "h1,4733205416644719969,$_CREATED,," 's@^    case "\$started" in .*$@@')" in
   "age=old idle=young"*) r=caught ;; *) r=missed ;; esac
 check "restart mutation: dropping the start-time check resets on an unreadable one" caught "$r"
+# #1469: each credential marker the reset drops is the one that kept a recreated
+# host from ever being handed a token. Left behind, it shows up in `kept`.
+for _m in regtoken regfail regkey cordon; do
+  # shellcheck disable=SC2016
+  case "$(_inc "s@ \"\\\$STATE_DIR/$_m-\\\$name\"@@")" in
+    *" kept="*"$_m,"*) r=caught ;;
+    *) r=missed ;;
+  esac
+  check "restart mutation: $_m- left behind is inherited by the new boot" caught "$r"
+done
 
 # The age writes NOTHING. The seen- file it replaced was the state a restart
 # lost; an age that needs a file has the same flaw.
