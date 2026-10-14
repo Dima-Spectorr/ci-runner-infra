@@ -616,9 +616,14 @@ fi
 #       logs nothing), and keeps `or vector(0)`, without which "no DONE at all"
 #       is an empty comparison and therefore silence;
 #       the failure condition counts anything that is not DONE;
-#       the policy notifies the declared channels, and the channels are required;
+#       the policy notifies the declared channels;
 #       it has ONE condition with both branches joined by `or` — the API refuses
 #       (400) a second prometheus_query_language condition on a policy.
+#     OPT-IN since v5.149.0 (measured 2026-10-14: the policy's e-mails flooded the
+#     owner, who deleted it by hand, and a required input would have recreated it
+#     on the next apply). So the channels default to `[]`, an empty list creates
+#     NEITHER the policy nor its metric, a named channel still has to be a full
+#     resource name, and the `moved` blocks keep an existing alarm in place.
 owns_its_alarm() { # <alert.tf>
   local code
   code=$(code_of "$1")
@@ -633,22 +638,41 @@ owns_its_alarm() { # <alert.tf>
   [ "$(grep -c '^  conditions {$' <<<"$code")" -eq 1 ] || return 1
 }
 
-requires_alert_channels() { # <variables.tf>
+alert_channels_optional() { # <variables.tf>
   local blk
   blk=$(block_of "$1" alert_notification_channels)
   [ -n "$blk" ] || return 1
-  ! matches "$blk" '^[[:space:]]*default[[:space:]]*=' || return 1
-  matches "$blk" 'length\(var\.alert_notification_channels\) > 0 && alltrue' || return 1
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*\[\][[:space:]]*$' || return 1
+  matches "$blk" 'condition[[:space:]]*=[[:space:]]*alltrue\(\[for c in var\.alert_notification_channels : can\(regex\("\^projects/\[\^/\]\+/notificationChannels/\[\^/\]\+\$", c\)\)\]\)' || return 1
   blk=$(block_of "$1" alert_stale_after_hours)
   matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*36[[:space:]]*$'
+}
+
+# The line right after each resource's opening brace must be its count.
+counted_by_alert_enabled() { # <code> <resource header>
+  awk -v h="$2" '$0 == h { getline; found = 1; exit !($0 ~ /^  count +=  ?local\.alert_enabled \? 1 : 0$/) } END { if (!found) exit 1 }' <<<"$1"
+}
+
+no_channels_no_alarm() { # <alert.tf>
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^  alert_enabled = length\(var\.alert_notification_channels\) > 0$' || return 1
+  counted_by_alert_enabled "$code" 'resource "google_logging_metric" "warm_outcome" {' || return 1
+  counted_by_alert_enabled "$code" 'resource "google_monitoring_alert_policy" "warm" {' || return 1
+  matches "$code" '^  to   = google_logging_metric\.warm_outcome\[0\]$' || return 1
+  matches "$code" '^  to   = google_monitoring_alert_policy\.warm\[0\]$'
 }
 
 if owns_its_alarm "$ALERT"; then ok; else
   bad "the warmer's own alert policy lost a property that makes it fire — a failing or never-run warm is a cold pool and nothing else turns red"
 fi
 
-if requires_alert_channels "$VARS"; then ok; else
-  bad "alert_notification_channels is no longer required and non-empty (or the stale default moved) — an alert nobody receives repeats the incident"
+if alert_channels_optional "$VARS"; then ok; else
+  bad "alert_notification_channels is no longer optional with a [] default, lost its resource-name check, or the stale default moved — every apply would recreate an alarm the owner deleted"
+fi
+
+if no_channels_no_alarm "$ALERT"; then ok; else
+  bad "an empty alert_notification_channels no longer means NO policy and NO metric, or the moved blocks are gone — the deleted alarm comes back on the next apply, or a kept one is replaced"
 fi
 
 # 20. THE BUILD READS THE POOL BEFORE IT BUILDS. Measured on build 6e721cc4: 0
@@ -1165,13 +1189,41 @@ mutate "a second condition the API refuses" "$ALERT" \
   's|^  conditions {$|  conditions {\n  }\n  conditions {|' \
   owns_its_alarm
 
-mutate "the alert channels given an empty default" "$VARS" \
-  's|^  type        = list(string)$|&\n  default     = []|' \
-  requires_alert_channels
+mutate "the alert channels made required again" "$VARS" \
+  's|^  default     = \[\]$||' \
+  alert_channels_optional
 
-mutate "the empty channel list accepted" "$VARS" \
-  's|length(var\.alert_notification_channels) > 0 \&\& alltrue|alltrue|' \
-  requires_alert_channels
+mutate "the alert channels given a non-empty default" "$VARS" \
+  's|^  default     = \[\]$|  default     = ["projects/p/notificationChannels/1"]|' \
+  alert_channels_optional
+
+mutate "a malformed channel accepted" "$VARS" \
+  's|condition     = alltrue(\[for c in var\.alert_notification_channels : can(regex(.*$|condition     = true|' \
+  alert_channels_optional
+
+mutate "the alarm created with no channel at all" "$ALERT" \
+  's|^  alert_enabled = length(var\.alert_notification_channels) > 0$|  alert_enabled = true|' \
+  no_channels_no_alarm
+
+mutate "the policy created regardless of the channels" "$ALERT" \
+  '/^resource "google_monitoring_alert_policy" "warm" {$/{n;/^  count/d;}' \
+  no_channels_no_alarm
+
+mutate "the metric kept with no policy to feed" "$ALERT" \
+  '/^resource "google_logging_metric" "warm_outcome" {$/{n;/^  count/d;}' \
+  no_channels_no_alarm
+
+mutate "the policy counted by something else" "$ALERT" \
+  '/^resource "google_monitoring_alert_policy" "warm" {$/{n;s|local\.alert_enabled ? 1 : 0|1|;}' \
+  no_channels_no_alarm
+
+mutate "the policy's moved block dropped" "$ALERT" \
+  's|^  to   = google_monitoring_alert_policy\.warm\[0\]$||' \
+  no_channels_no_alarm
+
+mutate "the metric's moved block dropped" "$ALERT" \
+  's|^  to   = google_logging_metric\.warm_outcome\[0\]$||' \
+  no_channels_no_alarm
 
 mutate "the read-only server bound to every interface" "$MAIN" \
   's@CI_TURBO_HOST=127\.0\.0\.1@CI_TURBO_HOST=0.0.0.0@' \

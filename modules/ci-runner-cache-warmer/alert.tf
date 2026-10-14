@@ -30,8 +30,21 @@
 #           all of them.
 # A metric-ABSENCE condition was not used for `stale`: its window is capped
 # well below a nightly cadence. A PromQL range is not.
+#
+# OPT-IN SINCE v5.149.0. `alert_notification_channels` defaults to `[]`, and an
+# empty list creates NEITHER the policy NOR its metric: the metric feeds this
+# policy and nothing else, so one without the other is a resource nobody reads.
+# Measured 2026-10-14: the repository owner was flooded with this policy's
+# e-mails and deleted it by hand in the console; a required input meant the next
+# apply would have recreated it. A root that wants the alarm names a channel.
+# The count index is a `moved` below, so a root that keeps its channels sees no
+# change; one that drops them plans a delete of both (a refresh drops a policy
+# already deleted by hand, so only the metric is left to delete).
 
 locals {
+  # The one switch: no recipient, no alarm and no metric behind it.
+  alert_enabled = length(var.alert_notification_channels) > 0
+
   # Log-based metric ids allow `-`; their PromQL names do not, and Cloud
   # Monitoring maps every other character to `_`.
   outcome_metric_name = "${local.trigger_name}-outcome"
@@ -39,7 +52,18 @@ locals {
   outcome_selector    = "monitored_resource=\"build\""
 }
 
+moved {
+  from = google_logging_metric.warm_outcome
+  to   = google_logging_metric.warm_outcome[0]
+}
+
+moved {
+  from = google_monitoring_alert_policy.warm
+  to   = google_monitoring_alert_policy.warm[0]
+}
+
 resource "google_logging_metric" "warm_outcome" {
+  count       = local.alert_enabled ? 1 : 0
   project     = var.project_id
   name        = local.outcome_metric_name
   description = "Final outcome of each ${local.trigger_name} build (DONE, ERROR, or whatever else Cloud Build writes as the MAIN step's last line). Feeds the warmer's own alert policy."
@@ -71,6 +95,7 @@ resource "google_logging_metric" "warm_outcome" {
 }
 
 resource "google_monitoring_alert_policy" "warm" {
+  count        = local.alert_enabled ? 1 : 0
   project      = var.project_id
   display_name = "CI cache warmer / ${local.trigger_name} failing or stale"
   # Required by the API; with one condition it has nothing to combine.
@@ -120,7 +145,7 @@ resource "google_monitoring_alert_policy" "warm" {
 
           gcloud builds list --project=${var.project_id} --region=${var.region} --filter='buildTriggerId="${google_cloudbuild_trigger.warm.trigger_id}"' --limit=5
 
-      Or in Logs Explorer: `${google_logging_metric.warm_outcome.filter}`
+      Or in Logs Explorer: `${google_logging_metric.warm_outcome[0].filter}`
 
       No build at all within the window means the scheduler did not fire or the build was refused
       before it ran (a refused build writes no log). A credential-scan refusal names the file and,

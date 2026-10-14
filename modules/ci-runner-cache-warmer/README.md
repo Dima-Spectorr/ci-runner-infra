@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.148.3"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.149.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -28,7 +28,8 @@ module "ci_cache_warmer" {
   github_owner = "my-org"
   github_repo  = "myrepo"
 
-  # Required, non-empty: who is told when a warm fails or goes stale.
+  # Optional: who is told when a warm fails or goes stale. Omit (or `[]`)
+  # for no alert policy at all.
   alert_notification_channels = [var.ci_alert_channel]
 
   # 2nd-generation projects only; omit on a project using gen1 triggers.
@@ -36,7 +37,7 @@ module "ci_cache_warmer" {
 }
 ```
 
-Those six values, a bucket and an alert recipient are the whole configuration, and every one of
+Those six values, a bucket and an optional alert recipient are the whole configuration, and every one of
 them is a fact the root already knows. **Nothing here describes the repository's
 build**, and that is deliberate: the warm reads the repository.
 
@@ -298,8 +299,9 @@ The structure can be right and the build can still fail every night: measured
 2026-10-10, one consumer's warm ended in `ERROR` on at least eight consecutive
 nights and nobody was told. The fleet's stale-cache policy lives in the POOL's
 project and is installed by that project's apply trigger, which had never run
-there. So the module now creates its own alarm, in its own project, in the same
-apply as the trigger (`alert.tf`):
+there. So the module can create its own alarm, in its own project, in the same
+apply as the trigger (`alert.tf`), when `alert_notification_channels` names at
+least one channel:
 
 - a log-based metric `<trigger name>-outcome`, counting each build's final MAIN
   log line (`DONE` on success, `ERROR` on failure) by `outcome`;
@@ -316,11 +318,17 @@ when the build did log. Directly after the first apply the stale condition fires
 until the first warm succeeds, so fire the trigger once by hand (`trigger_id`
 output). With `disabled = true` the policy is created disabled.
 
-`alert_notification_channels` is required and must name at least one channel
-(`projects/<project>/notificationChannels/<id>`) in this module's project: an
-alert nobody receives is the incident it replaces.
+`alert_notification_channels` is **optional since v5.149.0** and defaults to
+`[]`. An empty list creates neither the policy nor the metric (the metric feeds
+the policy and nothing else); a failing warm then shows only as a cold pool. Each
+channel named must be `projects/<project>/notificationChannels/<id>` in this
+module's project. Why opt-in: on 2026-10-14 the policy's e-mails flooded the
+owner, who deleted it by hand, and a required input meant the next apply would
+recreate it. A root that drops its channels plans a delete of both resources (a
+policy already deleted by hand is dropped by the refresh); a root that keeps them
+sees no change, because `alert.tf` carries `moved` blocks to the `[0]` index.
 
-**The applying identity needs two more permissions** than before, in this
+**With channels named, the applying identity needs two more permissions** than before, in this
 module's project: `logging.logMetrics.create/get/update/delete` (a custom role
 holding only these — not `roles/logging.configWriter`, which also lets its
 holder create sinks and exclusions, i.e. export or drop the build logs) and `monitoring.alertPolicies.create/update/delete`
