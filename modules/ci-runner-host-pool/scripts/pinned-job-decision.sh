@@ -680,3 +680,53 @@ rerun_run_decision() {
     echo "skip:attempt $attempt started before the window too"
   fi
 }
+
+# stranded_run_decision <run_attempt> <created_epoch> <first_offered_epoch|-> <now> <max_age> <grace>
+#
+# Whether a FIRST attempt queued since before the DEMAND_MAX_AGE window is
+# fetched and counted anyway, because it may be real work a pool outage
+# stranded rather than a corpse (#1466). Measured: a Windows job queued while
+# the pool's only host was dead was 6h21m old when the pool came back, and the
+# window had already made it invisible -- the MIG sat at zero, stable, until a
+# human cancelled and re-ran it.
+#
+# Age alone cannot tell the two apart, so the rule asks a fact instead: OFFER
+# the run a host. While it is offered, its queued jobs count as demand, the pool
+# scales out for them, and a real job is taken by the first matching slot. One
+# still queued after `grace` of that is not waiting for capacity -- GitHub was
+# given a host and did not dispatch it -- so it is spent and never fetched
+# again. A run with no jobs at all is spent at once by the caller.
+#
+# Echoes `fetch:<reason>` or `skip:<reason>`. Always exits 0.
+#
+#   * A re-run is rerun_run_decision's, and a run created inside the window is
+#     already on the windowed list.
+#   * Not yet offered (`-`): fetched. The caller starts the clock only once a
+#     payload arrived, so a run the budget skipped loses none of its grace.
+#   * Offered less than `grace` ago: fetched. Past it: `skip:spent`.
+#   * Anything unreadable is skipped: the page can hold dozens of corpses, and
+#     without a clock or a created stamp nothing here can bound their cost.
+stranded_run_decision() {
+  local attempt="${1:-}" created="${2:-}" offered="${3:-}" now="${4:-}" max_age="${5:-}" grace="${6:-}"
+
+  case "$now" in "" | *[!0-9]*) echo "skip:unreadable clock"; return 0 ;; esac
+  case "$max_age" in "" | *[!0-9]*) echo "skip:unreadable window"; return 0 ;; esac
+  case "$grace" in "" | *[!0-9]*) echo "skip:unreadable grace"; return 0 ;; esac
+  case "$attempt" in "" | *[!0-9]*) echo "skip:unreadable run_attempt [$attempt]"; return 0 ;; esac
+  [ "$attempt" -le 1 ] || { echo "skip:a re-run, rerun_run_decision owns it"; return 0; }
+  case "$created" in "" | *[!0-9]*) echo "skip:unreadable created"; return 0 ;; esac
+  if [ "$created" -ge "$((now - max_age))" ]; then
+    echo "skip:created inside the window, already listed"
+    return 0
+  fi
+
+  case "$offered" in
+    "" | -) echo "fetch:queued $((now - created))s, not yet offered a host"; return 0 ;;
+    *[!0-9]*) echo "skip:unreadable offer stamp [$offered]"; return 0 ;;
+  esac
+  if [ "$((now - offered))" -lt "$grace" ]; then
+    echo "fetch:offered a host $((now - offered))s of ${grace}s"
+  else
+    echo "skip:spent, offered a host for ${grace}s and still queued"
+  fi
+}
