@@ -6078,37 +6078,59 @@ repo_units_retire_all() {
   rm -f "$UNIT_DIR/ci-controller@.service" "$UNIT_DIR/ci-controller-watchdog@.service" "$UNIT_DIR/ci-controller-watchdog@.timer"
 }
 
-# livez_script <heartbeats> <threshold> <port> — the liveness responder.
+# livez_script <heartbeats> <threshold> <port> <long> — the liveness responder.
 #
 # <heartbeats> is a Python list body of ("<repository>", "<path>") pairs. The
 # single-repository controller passes one pair with an empty name, and for it
-# the answer is exactly what it always was.
+# the answer is exactly what it always was: one heartbeat, stale past
+# <threshold>, is every heartbeat stale.
+#
+# ONE WEDGED REPOSITORY DOES NOT DELETE THE MACHINE (#1497). A table controller
+# serves several repositories, and the answer is what the managed group acts on
+# by deleting the VM — which stops EVERY repository's scaling for the ~11
+# minutes a new controller takes to its first tick. So the machine is unhealthy
+# only when:
+#   - EVERY heartbeat is past <threshold>: nothing on this machine is ticking,
+#     which is the shape of a broken guest (disk, network, systemd) that no
+#     per-repository restart can fix; or
+#   - ANY heartbeat is past <long>: that repository's watchdog has restarted its
+#     unit every minute for that long and it still never ticked, so the rebuild
+#     is the only remedy left and the others pay for it.
+# Between the two a stale repository is still NAMED in the answer and in the
+# journal, while the machine answers 200 and its own watchdog keeps restarting
+# it alone.
 livez_script() {
   cat <<LIVEZEOF
 import http.server, os, sys, time
 
 HBS = [$1]
 THRESHOLD = $2
+LONG = $4
 WEDGED = []
 
 def verdict():
     # No heartbeat file yet: the group's initial_delay_sec covers a controller
     # that has not reached its first tick; past that, an absent heartbeat is
     # the same as an ancient one.
-    worst, stale = 0, []
+    worst, stale, ancient = 0, [], []
     for name, path in HBS:
         try:
             age = int(time.time() - os.stat(path).st_mtime)
         except OSError:
-            age = THRESHOLD + 1
+            age = LONG + 1
         worst = max(worst, age)
         if age >= THRESHOLD:
             stale.append(name)
+        if age >= LONG:
+            ancient.append(name)
     body = "age=%d threshold=%d" % (worst, THRESHOLD)
     named = [n for n in stale if n]
     if named:
         body += " wedged=" + ",".join(named)
-    return (not stale), body, named
+    # An empty list is "every heartbeat stale": a responder watching nothing
+    # must not answer 200 for ever.
+    every = len(stale) == len(HBS)
+    return not (every or ancient), body, named
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -6324,11 +6346,12 @@ WDTIMEOF
 
     # WHICH HEARTBEATS THE VERDICT IS OVER (#1486). The single-repository
     # controller has the one above. A table controller has one per repository,
-    # and is unhealthy when ANY of them is stale: each repository's watchdog has
-    # already had three thresholds to restart its own unit, so a heartbeat that
-    # is still old is a repository nothing on this machine could revive — and a
-    # machine that answers 200 because its OTHER repositories are fine would
-    # leave that one unserved for good. The answer names it.
+    # and is unhealthy when EVERY one is stale past three watchdog thresholds,
+    # or when ANY one is stale past twelve (#1497, see livez_script): one
+    # repository's watchdog restarts that repository alone, and the machine —
+    # every OTHER repository's scaling with it — is rebuilt only once twelve
+    # thresholds of those restarts (an hour at the default poll) have failed.
+    # Before that the answer names it.
     #
     # Each path is bound into the responder's view by a drop-in beside the unit
     # below; like the first, it must exist before the responder starts.
@@ -6346,7 +6369,7 @@ WDTIMEOF
       mkdir -p "$livez_dropin"
       printf '[Service]\nBindReadOnlyPaths=%s\n' "${livez_binds# }" >"$livez_dropin/repos.conf"
     fi
-    livez_script "$livez_hbs" "$((wd_threshold * 3))" "$HEALTH_PORT" >/opt/ci-controller/livez.py
+    livez_script "$livez_hbs" "$((wd_threshold * 3))" "$HEALTH_PORT" "$((wd_threshold * 12))" >/opt/ci-controller/livez.py
     chmod 0644 /opt/ci-controller/livez.py
 
     cat >/etc/systemd/system/ci-controller-livez.service <<'LIVEZSVCEOF'
