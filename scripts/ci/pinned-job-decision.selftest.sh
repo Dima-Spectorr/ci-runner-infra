@@ -377,6 +377,31 @@ is "an unreadable attempt cannot tell a re-run from a corpse, so it is skipped" 
 is "an unreadable clock acts on nothing" skip: \
   "$(rerun_run_decision 2 $((NOW - 90000)) $((NOW - 60)) "" $MAX)"
 
+# 1b. A FIRST attempt held past the window by a pool outage (#1466): IntegrateIT
+#     run 36786430489 was 6h21m old when its pool came back, and was never
+#     served. stranded_run_decision offers such a run a host for a grace, then
+#     spends it -- the fact that separates it from a corpse is that GitHub was
+#     given a host and still did not dispatch it.
+GR=3600
+is "the live shape: a first attempt queued 6h21m, never offered, is fetched" fetch: \
+  "$(stranded_run_decision 1 $((NOW - 22860)) - $NOW $MAX $GR)"
+is "and stays fetched while its offer runs" fetch: \
+  "$(stranded_run_decision 1 $((NOW - 22860)) $((NOW - 600)) $NOW $MAX $GR)"
+is "an offer past its grace is spent: a corpse holds no host forever" skip:spent \
+  "$(stranded_run_decision 1 $((NOW - 90000)) $((NOW - GR)) $NOW $MAX $GR)"
+is "a zero offer stamp (no jobs) is spent at once" skip:spent \
+  "$(stranded_run_decision 1 $((NOW - 90000)) 0 $NOW $MAX $GR)"
+is "a run created inside the window is the windowed list's, not fetched twice" skip: \
+  "$(stranded_run_decision 1 $((NOW - 60)) - $NOW $MAX $GR)"
+is "a re-run is rerun_run_decision's" skip: \
+  "$(stranded_run_decision 2 $((NOW - 90000)) - $NOW $MAX $GR)"
+is "an unreadable created cannot be bounded, so it is skipped" skip: \
+  "$(stranded_run_decision 1 - - $NOW $MAX $GR)"
+is "an unreadable offer stamp is skipped" skip: \
+  "$(stranded_run_decision 1 $((NOW - 90000)) x $NOW $MAX $GR)"
+is "an unreadable grace acts on nothing" skip: \
+  "$(stranded_run_decision 1 $((NOW - 90000)) - $NOW $MAX "")"
+
 # ...and once seen, its re-queued job is judged on its OWN age: the jobs of a
 # re-run are fresh objects, so the grace window still protects a booting host.
 expect wait: "a re-run's fresh pinned job gets the grace window like any other" \
@@ -571,6 +596,23 @@ src_has "and asks rerun_run_decision which of them to fetch" \
   'rerun_run_decision "$rr_attempt" "$rr_created" "$rr_started" "$sweep_start" "$DEMAND_MAX_AGE"'
 # shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "the re-run ids join the fetch list" 'printf '"'"'%s'"'"' "$rr_ids"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the sweep asks stranded_run_decision about first attempts (#1466)" \
+  'stranded_run_decision "$st_attempt" "$st_created" "$st_seen" "$sweep_start" "$DEMAND_MAX_AGE" "$DEMAND_STRANDED_GRACE"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "the stranded ids join the fetch list, last" 'printf '"'"'%s'"'"' "$st_ids"'
+# shellcheck disable=SC2016  # the controller source is the literal under test
+src_has "an offered run is exempt from the shelf life" '--argjson offer "$st_offer"'
+src_has "a run with no jobs is spent at once" "printf '%s 0 spent\\n'"
+# shellcheck disable=SC2016  # the controller source is the literal under test
+_st_ids_at=$(grep -nF 'printf '"'"'%s'"'"' "$st_ids"' "$CONTROLLER" | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016  # the controller source is the literal under test
+_ip_at=$(grep -nF 'printf '"'"'%s'"'"' "$runs_ip" | jq -r' "$CONTROLLER" | head -1 | cut -d: -f1)
+if [ -n "$_st_ids_at" ] && [ -n "$_ip_at" ] && [ "$_st_ids_at" -gt "$_ip_at" ]; then
+  printf 'ok   %s\n' "stranded runs sort after in-progress work, never ahead of it"
+else
+  printf 'FAIL %s\n' "stranded ids are not last in the fetch order (st=$_st_ids_at ip=$_ip_at)"; fail=1
+fi
 src_has "a cancelled pinned run tells the operator to re-run it in full" 'never --failed'
 # shellcheck disable=SC2016  # the controller source is the literal under test
 src_has "and so does a refused one, as an event rather than a log line" 'pin_run_warning "$run" "refused-$code"'
@@ -627,6 +669,17 @@ mutant "first attempts fetched too (every corpse costs a job call)" \
 mutant "a re-run created inside the window fetched twice" \
   's/if \[ "\$created" -ge "\$since" \]; then/if false; then/' \
   rerun_run_decision 2 $((NOW - 60)) $((NOW - 30)) $NOW $MAX skip:
+mutant "a stranded first attempt dropped like a corpse again (#1466)" \
+  's/"" | -) echo "fetch:queued/"" | -) echo "skip:queued/' \
+  stranded_run_decision 1 $((NOW - 22860)) - $NOW $MAX $GR fetch:
+# shellcheck disable=SC2016
+mutant "an offer that never runs out (a corpse holds a host forever)" \
+  's/if \[ "\$((now - offered))" -lt "\$grace" \]; then/if true; then/' \
+  stranded_run_decision 1 $((NOW - 90000)) $((NOW - GR)) $NOW $MAX $GR skip:
+# shellcheck disable=SC2016
+mutant "a run inside the window fetched twice" \
+  's/if \[ "\$created" -ge "\$((now - max_age))" \]; then/if false; then/' \
+  stranded_run_decision 1 $((NOW - 60)) - $NOW $MAX $GR skip:
 
 mutant "the cap removed: a run already re-run is re-run again" \
   's/    rerun) echo "cancel-only:the controller already re-ran/    rerun) echo "cancel-then-rerun:the controller already re-ran/' \
