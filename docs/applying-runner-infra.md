@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.147.2"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.148.0"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -332,15 +332,32 @@ has stopped receiving runner infrastructure* policy watches); what was missing
 was a way back. To silence the schedule for real maintenance, set
 `apply_schedule = null` in the consumer root and merge it.
 
-**`tf-apply-guard.sh` does not run here, and that is deliberate.** The guard
-refuses an apply whose checkout is not the remote default branch, and demands a
-plan-derived token before a destroy — a human-at-a-laptop defence, and the
-right one for that case. Inside a build fired by a push to `main` the checkout
-*is* the merged commit, and no one can type a confirmation token. What bounds
-destruction instead is the account: the protected kinds the guard names —
-service accounts and secrets — are exactly what a compute-scoped CD account
-cannot delete. Which is why prerequisite 3 is not merely tidiness about where
-identities get created.
+**The unattended apply refuses destroys (#1567).** Between `plan` and `apply`
+the build runs a `destroy-guard` step: `tf-apply-guard.sh --unattended-plan`,
+embedded from this repository, reads the saved plan as JSON and stops the build
+red — before anything is applied, listing each resource — on any destroy that is
+not a create-before-destroy replacement (plan actions exactly `create,delete`),
+or the deposed leftover of one, of a type in `unattended_destroy_allowed_types`.
+The default is instance templates only (`google_compute_instance_template`,
+`google_compute_region_instance_template`): they are immutable, so every host
+startup-script or machine-type change is a replacement, and refusing those
+would make every release a manual apply. The list takes exact type names, never
+a pattern, and may not name a service account or a secret. The apply step then
+runs only the `tf.plan` whose hash the guard recorded.
+
+When the guard refuses, nothing was applied. Read the listed addresses; if every
+destroy is intended, apply that change by hand through
+`scripts/ci/tf-apply-guard.sh <root>`, which asks for a token derived from the
+plan. The next unattended run then has nothing to destroy and goes green. No
+token or variable relaxes the unattended guard — its only knob is the allow-list.
+
+The guard's attended checks — checkout equals the remote default branch, a
+confirmation token per destroy — do not apply here: inside a build fired by a
+push to `main` the checkout *is* the merged commit, and nobody can type a token.
+The account still bounds which kinds can be destroyed at all: the protected
+kinds the guard names — service accounts and secrets — are exactly what a
+compute-scoped CD account cannot delete. Which is why prerequisite 3 is not
+merely tidiness about where identities get created.
 
 ## The GitHub Actions caller
 
@@ -404,7 +421,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.147.2"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.148.0"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -521,7 +538,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.147.2"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.148.0"
 
   project_id   = var.project_id
   region       = "<region>"

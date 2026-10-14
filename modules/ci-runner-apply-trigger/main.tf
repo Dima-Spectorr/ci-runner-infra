@@ -133,6 +133,33 @@ locals {
     fi
   EOT
 
+  # THE DESTROY GUARD (#1567), carried the same way and for the same reasons as
+  # the alert script: one copy in scripts/ci/, the one CI tests, embedded rather
+  # than fetched. It reads the plan JSON the plan step rendered and stops the
+  # build red on any destroy that is not a create-before-destroy replacement of
+  # an allowed type. On success it records the saved plan's hash, and the apply
+  # step refuses any tf.plan whose hash is not that one — so an apply cannot run
+  # a plan the guard did not judge, whatever order a later edit puts steps in.
+  #
+  # The allowed types reach a shell command, inside single quotes; the variable's
+  # validation admits only `[a-z][a-z0-9_]*`, so no value can close them.
+  guard_script_gz    = base64gzip(file("${path.module}/../../scripts/ci/tf-apply-guard.sh"))
+  guard_allowed_args = join(" ", [for t in var.unattended_destroy_allowed_types : "'${t}'"])
+  guard_plan_file    = "/workspace/${trim(var.terraform_root, "/")}/tf.plan"
+  guard_step_script  = <<-EOT
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -f /workspace/.apply-guarded
+    trap 'rm -f /workspace/.tf-plan.json' EXIT
+    if [ ! -f /workspace/.apply-pending ]; then
+      echo "plan reported no changes — nothing to guard"
+      exit 0
+    fi
+    printf '%s' '${local.guard_script_gz}' | base64 -d | gzip -d > /workspace/tf-apply-guard.sh
+    bash /workspace/tf-apply-guard.sh --unattended-plan /workspace/.tf-plan.json ${local.guard_allowed_args}
+    sha256sum '${local.guard_plan_file}' > /workspace/.apply-guarded
+  EOT
+
   # Only the flags the caller actually set. The script's own defaults mirror the
   # ci-runner-host-pool defaults, so a pool that has not overridden anything
   # wants NO flags here — passing the numbers again from a second place is how
@@ -270,16 +297,38 @@ resource "google_cloudbuild_trigger" "apply" {
         rc=$?
         case "$rc" in
           0) echo "no changes — nothing to apply"; rm -f /workspace/.apply-pending ;;
-          2) echo "changes pending"; : > /workspace/.apply-pending ;;
+          2) echo "changes pending"; : > /workspace/.apply-pending
+             terraform show -json tf.plan > /workspace/.tf-plan.json \
+               || { echo "could not render the saved plan as JSON for the destroy guard"; exit 1; } ;;
           *) echo "terraform plan failed (exit $rc)"; exit "$rc" ;;
         esac
       EOT
       ]
     }
 
+    # THE DESTROY GUARD (#1567). An unattended apply has nobody to confirm a
+    # destroy, so the build refuses every one that is not a create-before-destroy
+    # replacement of `var.unattended_destroy_allowed_types` and stops red before
+    # apply. The Print-Server incident in tf-apply-guard.sh's header is why: the
+    # account bounds WHICH kinds can be destroyed, not WHETHER compute that a
+    # stale or wrong config no longer names gets torn down — and that is exactly
+    # what an unattended apply would otherwise do without a word.
+    #
+    # In the cloud-sdk image because the guard reads the plan with jq or python3
+    # and the terraform image carries neither; the plan crosses as JSON on the
+    # workspace, like the mig name below. No input skips this step. A machine
+    # with neither reader fails the guard — red, never a silent pass.
+    step {
+      id     = "destroy-guard"
+      name   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+      script = local.guard_step_script
+    }
+
     # Applies the SAVED plan, never a re-planned one: between plan and apply a
     # floating tag can move, and applying something nobody printed is the
-    # failure mode this whole arrangement exists to remove.
+    # failure mode this whole arrangement exists to remove. And only the plan
+    # the destroy guard passed: its hash is in .apply-guarded, written by the
+    # guard and by nothing else.
     step {
       id         = "apply"
       name       = "hashicorp/terraform:${var.terraform_version}"
@@ -290,6 +339,10 @@ resource "google_cloudbuild_trigger" "apply" {
         if [ ! -f /workspace/.apply-pending ]; then
           echo "plan reported no changes — skipping apply"
           exit 0
+        fi
+        if [ ! -f /workspace/.apply-guarded ] || ! sha256sum -c /workspace/.apply-guarded; then
+          echo "the destroy guard did not pass THIS plan — refusing to apply"
+          exit 1
         fi
         terraform apply -input=false -lock-timeout=${var.lock_timeout} tf.plan
       EOT
@@ -441,6 +494,15 @@ resource "google_cloudbuild_trigger" "apply" {
     precondition {
       condition     = !var.manage_alert_policies || length(local.alert_step_script) < 100000
       error_message = "the alert-policies step is ${length(local.alert_step_script)} bytes of embedded script. Cloud Build silently never schedules a build once the whole config passes roughly 128 KiB — it fetches source, finishes SETUPBUILD, and sits with every step QUEUED until the queue TTL expires, with no error anywhere. This guard trips at 100000 to leave room for the rest of the config, which is why the number is lower than the cliff. Fetch ensure-alert-policies.sh from a bucket at build time instead of embedding it, or split the policies across steps."
+    }
+
+    # The destroy guard is the other embedded body, and it spends the headroom the
+    # precondition above leaves for "the rest of the config". It is a fixed-size
+    # script today (a few KB compressed); this keeps it from growing into the cliff
+    # unnoticed.
+    precondition {
+      condition     = length(local.guard_step_script) < 20000
+      error_message = "the destroy-guard step is ${length(local.guard_step_script)} bytes of embedded script; it must stay under 20000 so the whole build config stays clear of Cloud Build's ~128 KiB never-scheduled cliff."
     }
   }
 }

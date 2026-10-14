@@ -159,6 +159,76 @@ done
 unset PLAN_READER
 fails=$((fails + reader_fails))
 
+# ── unattended mode (ci-runner-apply-trigger, #1567) ──────────────────────────
+# Nobody can type a token inside a build, so the rule is absolute: only the
+# second half of a create-before-destroy replacement (or a deposed leftover of
+# one) of an allowed type gets through. Each row below is a way a destroy could
+# plausibly slip past a looser reading of "replacement".
+unattended_fixture="$(mktemp)"
+cat >"$unattended_fixture" <<'JSON'
+{"format_version":"1.2","resource_changes":[
+  {"address":"module.pool.google_compute_instance_template.host","type":"google_compute_instance_template","change":{"actions":["create","delete"]}},
+  {"address":"module.pool.google_compute_instance_template.old","type":"google_compute_instance_template","deposed":"0a1b2c3d","change":{"actions":["delete"]}},
+  {"address":"module.pool.google_compute_instance_template.controller","type":"google_compute_instance_template","change":{"actions":["delete","create"]}},
+  {"address":"module.pool.google_compute_instance_template.gone","type":"google_compute_instance_template","change":{"actions":["delete"]}},
+  {"address":"module.pool.google_compute_region_instance_group_manager.hosts","type":"google_compute_region_instance_group_manager","change":{"actions":["create","delete"]}},
+  {"address":"module.id.google_service_account.host","type":"google_service_account","change":{"actions":["create","delete"]}},
+  {"address":"module.pool.google_compute_instance_template_x.y","type":"google_compute_instance_template_x","change":{"actions":["create","delete"]}},
+  {"address":"module.pool.google_compute_instance.controller","type":"google_compute_instance","change":{"actions":["update"]}},
+  {"address":"module.pool.google_compute_firewall.ssh","type":"google_compute_firewall","change":{"actions":["create"]}}
+]}
+JSON
+# What must be refused, and only that: the delete-first replacement (a gap with
+# no template), the plain delete, the non-allowed types even as create-first
+# replacements, and a type whose NAME merely starts with an allowed one.
+want_refused='module.id.google_service_account.host [create,delete],module.pool.google_compute_instance_template.controller [delete,create],module.pool.google_compute_instance_template.gone [delete],module.pool.google_compute_instance_template_x.y [create,delete],module.pool.google_compute_region_instance_group_manager.hosts [create,delete],'
+allow_tpl='google_compute_instance_template
+google_compute_region_instance_template'
+
+ua_fails=0
+for r in $avail; do
+  # shellcheck disable=SC2034  # unattended_refusals, sourced from the guard, reads this.
+  PLAN_READER="$r"
+  got="$(unattended_refusals "$unattended_fixture" "$allow_tpl" | LC_ALL=C sort | tr '\n' ',')"
+  if [ "$got" = "$want_refused" ]; then
+    printf 'ok   %s unattended: refuses every destroy but a create-first template replacement\n' "$r"
+  else
+    printf 'FAIL %s unattended refusals: %s\n' "$r" "$got"; ua_fails=$((ua_fails + 1))
+  fi
+  # An empty allow-list makes every destroy a manual one.
+  n="$(unattended_refusals "$unattended_fixture" '' | grep -c . || true)"
+  if [ "$n" = 7 ]; then printf 'ok   %s unattended: an empty allow-list refuses all 7 destroys\n' "$r"
+  else printf 'FAIL %s unattended with no allow-list refused %s of 7\n' "$r" "$n"; ua_fails=$((ua_fails + 1)); fi
+  # A file that is not a plan must be an ERROR, never "nothing destroyed".
+  if printf '{"resource_changes":[]}' >"$unattended_fixture.bad" && ! unattended_refusals "$unattended_fixture.bad" "$allow_tpl" >/dev/null 2>&1; then
+    printf 'ok   %s unattended: a JSON that is not a plan is an error, not a pass\n' "$r"
+  else
+    printf 'FAIL %s unattended: a JSON with no format_version read as a clean plan\n' "$r"; ua_fails=$((ua_fails + 1))
+  fi
+done
+unset PLAN_READER
+
+# The live entry point, end to end: exit status is what Cloud Build reads.
+ua_run() { bash "$here/tf-apply-guard.sh" --unattended-plan "$@" >/dev/null 2>&1; echo $?; }
+clean_fixture="$(mktemp)"
+printf '%s' '{"format_version":"1.2","resource_changes":[{"address":"t.a","type":"google_compute_instance_template","change":{"actions":["create","delete"]}}]}' >"$clean_fixture"
+: >"$unattended_fixture.empty"
+check "unattended: a create-first template replacement applies" 0 "$(ua_run "$clean_fixture" google_compute_instance_template)"
+check "unattended: the mixed plan stops red" 2 "$(ua_run "$unattended_fixture" google_compute_instance_template google_compute_region_instance_template)"
+check "unattended: the same replacement with NO allowed type stops red" 2 "$(ua_run "$clean_fixture")"
+check "unattended: an empty plan JSON stops red" 2 "$(ua_run "$unattended_fixture.empty" google_compute_instance_template)"
+check "unattended: a missing plan JSON stops red" 2 "$(ua_run "$unattended_fixture.missing" google_compute_instance_template)"
+# Beside a valid type, so the plan alone would pass: only the input check refuses.
+check "unattended: a pattern as an allowed type stops red" 2 "$(ua_run "$clean_fixture" google_compute_instance_template 'google_.*')"
+check "unattended: a protected identity type cannot be allowed" 2 "$(ua_run "$clean_fixture" google_compute_instance_template google_service_account)"
+# There is no token in this mode: a confirmation left in the environment by an
+# attended run must not unlock an unattended destroy.
+ua_digest="$(plan_digest 'module.pool.google_compute_instance_template.gone')"
+check "unattended: a confirmation token in the environment unlocks nothing" 2 \
+  "$(TF_GUARD_CONFIRM_DESTROY="$ua_digest" TF_GUARD_CONFIRM_PROTECTED="$ua_digest" ua_run "$unattended_fixture" google_compute_instance_template)"
+rm -f "$unattended_fixture" "$unattended_fixture.bad" "$unattended_fixture.empty" "$clean_fixture"
+fails=$((fails + ua_fails))
+
 if [ "$fails" -eq 0 ]; then
   printf '\nPASS — a stale or dirty checkout, and any unconfirmed destroy, are refused before apply.\n'
 else

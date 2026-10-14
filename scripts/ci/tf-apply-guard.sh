@@ -32,6 +32,12 @@
 #   Every git and terraform call is made against that directory (`git -C` /
 #   `terraform -chdir`), never the current one.
 #
+#        scripts/ci/tf-apply-guard.sh --unattended-plan <plan.json> [allowed-type...]
+#
+#   The unattended form, run by ci-runner-apply-trigger between its plan and its
+#   apply: no checkout check, no tokens, no apply — it refuses (exit 2) any
+#   destroy that is not a create-before-destroy replacement of an allowed type.
+#
 # Confirmation tokens (printed by the refusal that asks for them):
 #   TF_GUARD_CONFIRM_DESTROY=<digest>    ordinary destroys
 #   TF_GUARD_CONFIRM_PROTECTED=<digest>  destroys an identity — see below
@@ -146,11 +152,97 @@ for rc in plan.get("resource_changes") or []:
   fi
 }
 
+# ── unattended mode (ci-runner-apply-trigger, #1567) ──────────────────────────
+# Inside a Cloud Build fired by a push or a schedule nobody can type a token, so
+# the confirmation path above does not exist there. The unattended rule is
+# therefore absolute: the ONLY destroy that may proceed is the second half of a
+# create-before-destroy replacement (actions exactly ["create","delete"]) of a
+# type on the allow-list, or the cleanup of a DEPOSED object of such a type —
+# the leftover of an earlier replacement whose delete failed (a template the
+# group still referenced, say). Everything else that deletes stops the build red
+# before apply: a plain delete, a delete-then-create replacement, any type not
+# listed. A human applies that one, through the token path above.
+#
+# Types are compared by EQUALITY, never as a pattern: an allow-list entry is a
+# module input, and a pattern there ("google_.*") would be one edit away from
+# allowing every destroy while still reading as an allow-list.
+#
+# A file that is not a terraform plan JSON is an error, not an empty list: an
+# empty or truncated plan.json would otherwise read as "nothing is destroyed".
+#
+# unattended_refusals <plan.json> <allowed types, newline-separated>
+#   -> one line per refused destroy; non-zero exit if the file is not a plan
+unattended_refusals() {
+  if [ "$PLAN_READER" = jq ]; then
+    jq -r --arg allow "$2" '
+      if (type != "object") or (has("format_version") | not)
+      then error("not a terraform plan JSON (no format_version)") else . end
+      | ($allow | split("\n") | map(select(length > 0))) as $a
+      | .resource_changes[]?
+      | select(.change.actions | index("delete"))
+      | select(
+          (.type as $t | any($a[]; . == $t))
+          and ((.change.actions == ["create","delete"])
+               or (.change.actions == ["delete"] and ((.deposed // "") != "")))
+          | not)
+      | "\(.address)\(if (.deposed // "") != "" then " (deposed \(.deposed))" else "" end) [\(.change.actions | join(","))]"
+    ' "$1"
+  else
+    python3 -c '
+import json, sys
+sys.stdout.reconfigure(newline="\n")
+allow = {t for t in sys.argv[2].split("\n") if t}
+with open(sys.argv[1], encoding="utf-8") as fh:
+    plan = json.load(fh)
+if not isinstance(plan, dict) or "format_version" not in plan:
+    sys.exit("not a terraform plan JSON (no format_version)")
+for rc in plan.get("resource_changes") or []:
+    actions = (rc.get("change") or {}).get("actions", [])
+    if "delete" not in actions:
+        continue
+    deposed = rc.get("deposed") or ""
+    if rc.get("type") in allow and (actions == ["create", "delete"] or (actions == ["delete"] and deposed)):
+        continue
+    print(rc["address"] + (" (deposed %s)" % deposed if deposed else "") + " [" + ",".join(actions) + "]")
+' "$1" "$2"
+  fi
+}
+
 # Sourced by the self-test; everything below is the live path only.
 [ "${TF_APPLY_GUARD_LIB:-0}" = "1" ] && return 0
 
 # ── live path ─────────────────────────────────────────────────────────────────
 die() { printf 'tf-apply-guard: REFUSED — %s\n' "$*" >&2; exit 2; }
+
+# Unattended: judge a plan JSON already produced by the caller, then stop. No git
+# check (the build's checkout IS the pushed commit) and no apply (the caller
+# applies the saved plan this JSON was rendered from). There is no token and no
+# environment variable that relaxes it — the allow-list is the only knob, and it
+# names types, not patterns.
+if [ "${1:-}" = "--unattended-plan" ]; then
+  plan_json="${2:?usage: tf-apply-guard.sh --unattended-plan <plan.json> [allowed-type...]}"; shift 2
+  [ "$PLAN_READER" = none ] && die "need jq or python3 to read the plan JSON; refusing to apply blind"
+  [ -s "$plan_json" ] || die "plan JSON $plan_json is missing or empty — refusing to apply a plan nobody read"
+  for t in "$@"; do
+    [[ "$t" =~ ^[a-z][a-z0-9_]*$ ]] \
+      || die "allowed type '$t' is not a terraform resource type name — the allow-list names types exactly, never a pattern"
+    [[ "$t" =~ $PROTECTED_TYPES ]] \
+      && die "allowed type '$t' is a protected identity type — destroying one is never unattended"
+  done
+  allowed="$(printf '%s\n' "$@")"
+  refused="$(unattended_refusals "$plan_json" "$allowed")" \
+    || die "could not read $plan_json as a terraform plan — refusing to apply a plan nobody read"
+  if [ -n "$refused" ]; then
+    printf '%s\n' "$refused" | sed 's/^/  /' >&2
+    die "the plan destroys resource(s) listed above, and this apply is unattended.
+The only destroy an unattended apply makes is a create-before-destroy replacement
+(or deposed cleanup) of an allowed type: ${*:-<none>}.
+Apply this one by hand through scripts/ci/tf-apply-guard.sh <root>, which asks for a
+plan-derived confirmation token."
+  fi
+  echo "tf-apply-guard: unattended plan OK — no destroy beyond allowed replacements (${*:-<none>})"
+  exit 0
+fi
 
 dir="${1:?usage: tf-apply-guard.sh <runner-root-dir> [terraform-args...]}"; shift || true
 [ -d "$dir" ] || die "no such directory: $dir"

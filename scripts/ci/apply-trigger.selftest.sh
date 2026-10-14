@@ -21,16 +21,15 @@
 # wrong, and nothing else in this repository would notice: terraform validate
 # accepts them, the plan succeeds, the apply succeeds.
 #
-# One property is deliberately NOT enforced here, and is worth stating so its
-# absence is not read as an oversight: this module does not run
-# `tf-apply-guard.sh`. That guard refuses an apply whose checkout is not the
-# remote default branch and demands a plan-derived token before a destroy — a
-# human-at-a-laptop defence, and the right one for that case. Inside a build
-# triggered by a push to main, the checkout IS the merged commit, and a destroy
-# token cannot be typed by anybody. What bounds destruction here instead is the
-# ACCOUNT: the protected kinds the guard names — service accounts and secrets —
-# are exactly what a compute-scoped CD account cannot delete. That is why
-# check 1 below is not merely tidiness about where identities are created.
+# Since #1567 the module DOES run `tf-apply-guard.sh`, in its unattended form
+# (checks 17-18). The attended form's checkout check and confirmation tokens
+# have no meaning inside a build fired by a push to main — the checkout IS the
+# merged commit and nobody can type a token — so the unattended rule is
+# absolute instead: no destroy except a create-before-destroy replacement of an
+# allowed type. The ACCOUNT still bounds which kinds can be destroyed at all:
+# the protected kinds the guard names — service accounts and secrets — are
+# exactly what a compute-scoped CD account cannot delete. That is why check 1
+# below is not merely tidiness about where identities are created.
 #
 # Each mutation breaks one property the way a real edit plausibly would — every
 # one phrased as "make the apply work" — and asserts this test notices. A gate
@@ -343,6 +342,54 @@ declares_the_schedule_is_running() {
   matches "$block" '^[[:space:]]*paused *= *false'                  || return 1
 }
 
+# 17. THE DESTROY GUARD (#1567) runs between plan and apply, unconditionally, and
+#     the apply runs only the plan it passed. An unattended apply has nobody to
+#     confirm a destroy, so tf-apply-guard.sh --unattended-plan refuses every one
+#     that is not a create-before-destroy replacement of an allowed type. Each
+#     link below is one edit from gone, and every one of those edits turns a red
+#     build green: the step dropped, the step made conditional, the JSON it reads
+#     never written, the apply no longer checking the guard's hash, the guard
+#     placed after the apply it is meant to stop.
+guards_destroys_before_apply() {
+  local code plan_n guard_n apply_n
+  code=$(code_of "$1")
+  # The carried script, the one CI tests — never a fetched copy.
+  matches "$code" 'base64gzip\(file\("\$\{path\.module\}/\.\./\.\./scripts/ci/tf-apply-guard\.sh"\)\)' || return 1
+  matches "$code" 'tf-apply-guard\.sh --unattended-plan /workspace/\.tf-plan\.json'                  || return 1
+  matches "$code" 'terraform show -json tf\.plan > /workspace/\.tf-plan\.json'                       || return 1
+  # A plain step, not a dynamic one: no input can switch it off.
+  [ "$(printf '%s\n' "$code" | grep -B1 -E 'id +=? *"destroy-guard"' | head -1 | tr -d ' ')" = 'step{' ] || return 1
+  matches "$code" 'script += local\.guard_step_script' || return 1
+  # Between plan and apply, in that order.
+  plan_n=$(printf '%s\n' "$code" | grep -nE 'id +=? *"plan"' | head -1 | cut -d: -f1)
+  guard_n=$(printf '%s\n' "$code" | grep -nE 'id +=? *"destroy-guard"' | head -1 | cut -d: -f1)
+  apply_n=$(printf '%s\n' "$code" | grep -nE 'id +=? *"apply"' | head -1 | cut -d: -f1)
+  [ -n "$plan_n" ] && [ -n "$guard_n" ] && [ -n "$apply_n" ] || return 1
+  [ "$plan_n" -lt "$guard_n" ] && [ "$guard_n" -lt "$apply_n" ] || return 1
+  # A refusal must END the step. Without errexit, or with the call's status
+  # swallowed, a refused plan falls through to the hash line below and the
+  # apply runs it. Read from THIS heredoc only: another body's errexit would
+  # satisfy a file-wide match and make the check vacuous.
+  local body set_n call_n
+  body=$(awk '/^  guard_step_script *= <<-EOT/,/^  EOT$/' "$1")
+  set_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*set -euo pipefail[[:space:]]*$' | head -1 | cut -d: -f1)
+  call_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*bash /workspace/tf-apply-guard\.sh --unattended-plan /workspace/\.tf-plan\.json \$\{local\.guard_allowed_args\}$' | head -1 | cut -d: -f1)
+  [ -n "$set_n" ] && [ -n "$call_n" ] && [ "$set_n" -lt "$call_n" ] || return 1
+  # The apply runs only the plan the guard hashed.
+  matches "$code" 'sha256sum .*> /workspace/\.apply-guarded'  || return 1
+  matches "$code" '! sha256sum -c /workspace/\.apply-guarded' || return 1
+}
+
+# 18. The allow-list is a list of exact type names, instance templates by
+#     default, and can never name an identity. A pattern or a broad default is
+#     the allow-list reading as one while allowing everything.
+allows_only_template_replacements_by_default() {
+  local block; block=$(var_block unattended_destroy_allowed_types "$1")
+  matches "$block" 'default *= *\["google_compute_instance_template", "google_compute_region_instance_template"\]' || return 1
+  matches "$block" 'regex\("\^\[a-z\]\[a-z0-9_\]\*\$"' || return 1
+  matches "$block" '"google_service_account", "google_secret_manager_secret"' || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -381,11 +428,17 @@ check fails_the_plan_before_the_build_is_unschedulable "$MAIN" "nothing measures
 check names_no_inbox                              "$VARS" "an email address is defaulted in the module — ten roots would page an inbox nobody chose, and it would work, which is why nothing would go red"
 check constrains_the_value_it_shells_out          "$VARS" "alert_notification_email reaches a shell command unvalidated — a quote in it runs arbitrary commands as the project's build account"
 check declares_the_schedule_is_running            "$MAIN" "the scheduler job does not state paused = false — a job paused by hand stays paused through every later apply, with no diff in any plan and nothing red anywhere"
+check guards_destroys_before_apply                "$MAIN" "the destroy guard is missing, conditional, after the apply, or not bound to the applied plan — an unattended apply can destroy anything the account can (#1567)"
+check allows_only_template_replacements_by_default "$VARS" "unattended_destroy_allowed_types is broader than instance templates by default, accepts a pattern, or can name an identity (#1567)"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
   tmp=$(mktemp)
   sed "$prog" "$f" >"$tmp"
+  # A sed that matches nothing leaves the file as it was; the predicate then
+  # fails on the CORRECT module only if the predicate is broken, and otherwise
+  # reports a pass for a mutation that never happened.
+  if cmp -s "$f" "$tmp"; then bad "mutation is vacuous (sed changed nothing): $desc"; rm -f "$tmp"; return; fi
   if "$pred" "$tmp"; then bad "mutation not detected: $desc"; else ok; fi
   rm -f "$tmp"
 }
@@ -485,6 +538,27 @@ mutate "'the type already says string' — address validation removed" "$VARS" \
 # test over an edit nobody made.
 mutate "'terraform does not need to state the obvious' — paused dropped" "$MAIN" \
   '/^resource "google_cloud_scheduler_job"/,/^}/ { /^[[:space:]]*paused[[:space:]]*=[[:space:]]*false/d }' declares_the_schedule_is_running
+
+# The destroy guard (#1567), each edit phrased as the fix for a red build.
+mutate "'the guard refuses our release' — the step deleted" "$MAIN" \
+  '/id     = "destroy-guard"/,/script = local.guard_step_script/d' guards_destroys_before_apply
+mutate "'make the guard optional' — every step made dynamic" "$MAIN" \
+  's|^    step {$|    dynamic "step" {|' guards_destroys_before_apply
+mutate "'show -json is slow' — the plan JSON never rendered" "$MAIN" \
+  's|terraform show -json tf.plan > /workspace/.tf-plan.json|true|' guards_destroys_before_apply
+mutate "'the marker check failed on a re-run' — apply stops checking the guard's hash" "$MAIN" \
+  's|! sha256sum -c /workspace/.apply-guarded|false|' guards_destroys_before_apply
+mutate "'run the guard after, as a report' — guard placed after the apply" "$MAIN" \
+  's|id     = "destroy-guard"|id     = "destroy-guard-report"|; s|id         = "mig-name"|id = "destroy-guard"|' guards_destroys_before_apply
+mutate "'the guard's exit kills the step' — errexit dropped from the guard body" "$MAIN" \
+  '/^  guard_step_script *= <<-EOT/,/^  EOT$/ { /set -euo pipefail/d; }' guards_destroys_before_apply
+# shellcheck disable=SC2016  # ${local...} is HCL, matched literally.
+mutate "'a refusal should not fail the build' — the guard's status swallowed" "$MAIN" \
+  's|--unattended-plan /workspace/.tf-plan.json ${local.guard_allowed_args}$|& \|\| true|' guards_destroys_before_apply
+mutate "'the controller template is recreated too' — default broadened to instances" "$VARS" \
+  '/^variable "unattended_destroy_allowed_types"/,/^}/ s|"google_compute_region_instance_template"\]|"google_compute_region_instance_template", "google_compute_instance"]|' allows_only_template_replacements_by_default
+mutate "'let callers pass a pattern' — name validation removed" "$VARS" \
+  '/^variable "unattended_destroy_allowed_types"/,/^}/ s|regex("^\[a-z\]\[a-z0-9_\]\*\$", t)|true|' allows_only_template_replacements_by_default
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

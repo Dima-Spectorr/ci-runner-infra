@@ -55,6 +55,14 @@ variable "terraform_root" {
     condition     = !startswith(var.terraform_root, "/") && !strcontains(var.terraform_root, "..")
     error_message = "terraform_root is a path INSIDE the repository, relative to its root (e.g. customer/<customer>/terraform/ci-runner-hosts). A leading slash or a .. segment escapes the workspace."
   }
+
+  # The destroy guard names the saved plan by this path inside a shell command,
+  # in single quotes (#1567). A path character outside this set — a quote above
+  # all — would close them.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._/-]+$", var.terraform_root))
+    error_message = "terraform_root may contain only letters, digits, '.', '_', '-' and '/': the destroy guard quotes it in a shell command."
+  }
 }
 
 variable "backend_config" {
@@ -226,6 +234,30 @@ variable "scheduler_service_account" {
 # The apply is the only thing in these projects that runs with project-scoped
 # credentials on a schedule, which is why the fleet's alerting is reconciled
 # from here. See the `alert-policies` step in main.tf for why it is best-effort.
+
+variable "unattended_destroy_allowed_types" {
+  type        = list(string)
+  default     = ["google_compute_instance_template", "google_compute_region_instance_template"]
+  description = <<-EOT
+    Resource types the UNATTENDED apply may destroy — and only as the second half of a create-before-destroy replacement (plan actions exactly create,delete), or as cleanup of a deposed object left by one. Any other destroy in the plan stops the build red before apply, naming each resource; a human then applies it through scripts/ci/tf-apply-guard.sh, which asks for a plan-derived token (#1567).
+
+    Instance templates by default, because they are immutable: every change to a host's startup script or machine type IS a replacement, and refusing those would turn every release into a manual apply. Exact type names, compared by equality — not patterns. An empty list makes every destroy a manual one.
+  EOT
+
+  validation {
+    condition     = alltrue([for t in var.unattended_destroy_allowed_types : can(regex("^[a-z][a-z0-9_]*$", t))])
+    error_message = "unattended_destroy_allowed_types takes exact terraform resource type names ([a-z][a-z0-9_]*), never a pattern: a pattern here would be one edit away from allowing every destroy."
+  }
+
+  # Never an identity. A service account id is unusable for 30 days after
+  # deletion and a secret takes its versions with it; tf-apply-guard.sh treats
+  # both as protected even with a token, so the unattended path must not be
+  # able to do what the attended one guards hardest.
+  validation {
+    condition     = length(setintersection(var.unattended_destroy_allowed_types, ["google_service_account", "google_secret_manager_secret"])) == 0
+    error_message = "unattended_destroy_allowed_types may not name google_service_account or google_secret_manager_secret: destroying an identity is never unattended."
+  }
+}
 
 variable "manage_alert_policies" {
   type        = bool
