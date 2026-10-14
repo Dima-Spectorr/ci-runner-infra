@@ -1423,6 +1423,21 @@ same key listing, and its value is the literal `1`, so unlike the token it may
 sit on the command line. A fourth marker file could not have expressed any of
 this: the problem was never which fact was recorded, it was where.
 
+**All three are per BOOT, not per instance (#1469).** A MIG recreate is carried
+out in place — same instance id, same `creationTimestamp`, a new
+`lastStartTimestamp` — so an instance-scoped answer refused every recreated host
+for good: "created days ago", "already issued one", plus the controller's own
+`regtoken-`/`regkey-`/`regfail-`/`cordon-` files, named after the host. The
+issued marker is now `<key>-issued-<id>-<lastStart epoch>`, the durable age runs
+from the later of the two timestamps, and those four files are dropped when the
+instance's boot changes (the cordon is re-adopted from the instance's own
+`ci-cordon` flag). The mint decision also counts only agents that can be handed a
+job — online or busy — so the dead boot's offline registrations no longer read as
+`present`; the host's `config.cmd --replace` takes the names over. A boot is a
+cold start, so nothing of the previous boot's job survives into it; a guest-OS
+reboot keeps `lastStartTimestamp` and stays refused. The legacy bare `<key>-issued`
+is still read as "issued to this boot".
+
 **One copy of the token the delete cannot reach.** Writing the registration token
 with `compute.instances.setMetadata` produces an Admin Activity audit entry, and
 Admin Activity logging cannot be switched off and is retained for 400 days. If

@@ -871,10 +871,12 @@ MIG_TEMPLATE=""
 # adoption arm tests for `present` and the mint arm for `absent`, so an
 # unfillable key fact matches neither and nothing happens. DUR_ISSUED is read
 # the other way round — the mint is refused unless it is provably `absent` — so
-# that the same `unknown` refuses there too.
+# that the same `unknown` refuses there too. DUR_BOOT empty is "no boot to mint
+# for", which the step and the write both refuse.
 DUR_AGE=999999999
 DUR_KEY="unknown"
 DUR_ISSUED="unknown"
+DUR_BOOT=""
 
 # --- GitHub rate telemetry (#1486) ---------------------------------------------
 #
@@ -3121,7 +3123,7 @@ reap_orphan_registrations() {
   done
 }
 
-# host_facts <host> -> sets HOST_BUSY, HOST_PRESENT, HOST_REG
+# host_facts <host> -> sets HOST_BUSY, HOST_PRESENT, HOST_REG, HOST_REG_LIVE
 # Slot agents are named "<host>-s<N>" by host-startup.sh; that naming IS the
 # join key between GCE instances and GitHub registrations.
 host_facts() {
@@ -3130,20 +3132,55 @@ host_facts() {
     HOST_BUSY=0
     HOST_PRESENT=-1
     HOST_REG="unknown"
+    HOST_REG_LIVE="unknown"
     return 0
   fi
 
-  local line present busy
+  local line present busy live
   line=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg h "$host" '
     [ .runners[]? | select(.name | startswith($h + "-s")) ] as $mine
     | [ ($mine | length),
-        ([ $mine[] | select(.busy == true) ] | length)
+        ([ $mine[] | select(.busy == true) ] | length),
+        ([ $mine[] | select(.busy == true or .status == "online" or (has("status") | not)) ] | length)
       ] | @tsv' 2>/dev/null)
 
   present=$(printf '%s' "$line" | cut -f1)
   busy=$(printf '%s' "$line" | cut -f2)
+  live=$(printf '%s' "$line" | cut -f3)
   present=${present:-0}
   busy=${busy:-0}
+  case "${live:-}" in '' | *[!0-9]*) live=$present ;; esac
+
+  # HOST_REG_LIVE — the same three states over the registrations that can be
+  # handed a job: online, or busy (a busy agent is executing one whatever its
+  # connection says). It is what registration_token_step reads, and ONLY that.
+  #
+  # A host recreated under its own name inherits the dead machine's
+  # registrations: GitHub still lists `<host>-s1..N`, offline, and HOST_REG
+  # reads them as `present`. On a pool where the controller mints the token
+  # that was a deadlock (#1469): `present` never reaches the mint arm, the host
+  # waits for a token nobody will write, and an operator had to delete the
+  # registrations by hand. The host's own `config.cmd --replace` takes the
+  # names over once it has a token, so nothing needs deleting — the mint
+  # decision only has to stop counting registrations no job can reach.
+  #
+  # This is not a looser credential rule. Job code can read the key only once a
+  # job is dispatched, and GitHub dispatches only to an online agent, so the
+  # key's expiry now fires on the thing that can actually read it. And a host
+  # whose CURRENT boot registered and then dropped offline is still refused a
+  # second token: the per-boot issued marker (instance_durable_facts) is the
+  # gate, not this count. Drain and recycle keep HOST_REG — an offline agent is
+  # still a registration to deregister.
+  #
+  # A list with no `status` field (an older fixture, a format change) counts
+  # every registration, which is the old answer.
+  if [ "$live" -eq 0 ]; then
+    HOST_REG_LIVE="absent"
+  elif [ "$live" -lt "$SLOTS" ]; then
+    HOST_REG_LIVE="partial"
+  else
+    HOST_REG_LIVE="present"
+  fi
 
   HOST_BUSY=$busy
   # How many of this host's slots ANSWER, as opposed to how many it was built
@@ -3274,15 +3311,29 @@ index_host_boots() {
 # The host's AGE needs nothing here: host_age_seconds reads lastStartTimestamp
 # from the same list, so a new boot is a young host by construction.
 #
+# The registration-credential markers go too (#1469), and each may go only
+# because the decision it stood in for is asked again of the GCE API:
+#   regtoken-  MINTED, a refusal. Named after the host, so a recreate kept it and
+#              the new boot was never handed a token. Without it the mint path
+#              still ends at instance_durable_facts, whose issued marker is
+#              keyed on the BOOT — the durable form of this same refusal.
+#   regfail-   the attempt cap, about calls made for the previous boot.
+#   regkey-    "a key may be live". The new boot is judged on what the instance
+#              carries now: a key still there is adopted by the durable gate
+#              (DUR_KEY), one that is gone is not waited on until the grace
+#              runs out — which is what the inherited marker did.
+#   cordon-    the cordon is re-derived from the instance's own `ci-cordon` flag
+#              by adopt_flagged_cordons, which runs next in the same tick. A
+#              recreate that kept the flag is cordoned again; one that did not
+#              is a fresh machine, and is no longer in the recycle budget.
+# Removing any of them is the state a controller REPLACEMENT already produces
+# for every host at once, and the mint path is built to be safe there.
+#
 # DELIBERATELY LEFT ALONE, each for its own reason:
 #   pinhold-   the monotonic cache that makes a pin hold un-shortenable. It is
 #              about the host LABEL a run was promised, it only ever keeps, and
 #              it expires by itself.
 #   absent-    whether the NAME is listed, which a restart does not change.
-#   cordon-, regtoken-, regkey-, regfail-   the registration-credential path.
-#              Its rules are asked of the instance itself (instance_durable_facts)
-#              precisely because a marker is not evidence, and loosening any of
-#              them on an inference made here is not this function's call.
 #
 # A host seen for the first time, or one whose start time is not readable yet
 # (an instance still PROVISIONING has none), records nothing and resets nothing.
@@ -3302,8 +3353,10 @@ forget_restarted_hosts() {
     if [ -n "$known" ]; then
       rm -f "$STATE_DIR/idle-$name" "$STATE_DIR/partial-$name" "$STATE_DIR/unreg-$name" \
         "$STATE_DIR/beaconmiss-$name" "$STATE_DIR/beaconerr-$name" \
-        "$STATE_DIR/pinerr-$name" "$STATE_DIR/pinveto-$name"
-      event INFO host-restarted "$name" "$name: cold-started since its clocks were stamped (was $known, now $boot) -- age, idle and beacon-miss clocks restart" was="$known" now="$boot"
+        "$STATE_DIR/pinerr-$name" "$STATE_DIR/pinveto-$name" \
+        "$STATE_DIR/regtoken-$name" "$STATE_DIR/regfail-$name" "$STATE_DIR/regkey-$name" \
+        "$STATE_DIR/cordon-$name"
+      event INFO host-restarted "$name" "$name: cold-started since its clocks were stamped (was $known, now $boot) -- age, idle and beacon-miss clocks restart; registration-token markers and the cordon are re-read from the instance" was="$known" now="$boot"
     fi
     printf '%s' "$boot" >"$f" 2>/dev/null || true
   done <<<"$HOST_BOOTS"
@@ -3592,8 +3645,9 @@ unreg_seconds() {
 # TWO markers, not one, and they are not the same fact:
 #
 #   regtoken-<host>  MINTED. Written once the host has been given a token, and
-#                    removed only by the sweep, when the host leaves the MIG.
-#                    It is what makes minting once-per-instance. Overloading it
+#                    removed by the sweep when the host leaves the MIG, or by
+#                    forget_restarted_hosts when the instance cold-starts (#1469).
+#                    It is what makes minting once-per-boot locally. Overloading it
 #                    with the delete's bookkeeping made "the key is gone" also
 #                    mean "mint another one", which on a cordoned host — still
 #                    executing a pull request, agents already deregistered, so
@@ -3654,9 +3708,11 @@ zone_of_uri() {
   printf '%s' "$zone"
 }
 
-# write_registration_token <instance-self-link> <regkey-marker>
+# write_registration_token <instance-self-link> <regkey-marker> <boot>
+# <boot> is DUR_BOOT (`<id>-<start-epoch>`) as instance_durable_facts read it,
+# and names the issued marker this write leaves behind.
 write_registration_token() {
-  local uri="$1" keylive="$2"
+  local uri="$1" keylive="$2" boot="${3:-}"
   local tok resp reg f zone host rc
 
   # The parse comes FIRST, before anything is minted. A registration token is
@@ -3668,6 +3724,19 @@ write_registration_token() {
   host=${uri##*/}
   if [ -z "$zone" ] || [ -z "$host" ]; then
     log "regtoken: cannot read a zone from $uri"
+    return 1
+  fi
+  # Also before anything is minted, and for the same reason: with no boot to
+  # name, the issued marker could not be written, and a token handed out with
+  # no durable record of it is the H-4 case. It becomes part of a metadata KEY,
+  # so only the shape instance_durable_facts builds is accepted.
+  case "$boot" in
+    *[!0-9-]* | -* | *- | *-*-*) boot="" ;;
+    *-*) ;;
+    *) boot="" ;;
+  esac
+  if [ -z "$boot" ]; then
+    log "regtoken: no boot to record the token against for $host"
     return 1
   fi
 
@@ -3717,9 +3786,16 @@ write_registration_token() {
     # controller that wrote it. `--metadata`, not `--metadata-from-file`, because
     # the value is the literal `1` and carries no secret; the token beside it is
     # still passed by file.
+    #
+    # The key names the BOOT it was issued to (#1469): `<key>-issued-<id>-<start>`.
+    # A bare `<key>-issued` outlived the boot it described — a MIG recreate is
+    # in place and keeps the instance — so a recreated host carried "already
+    # issued one" into a boot that never had a token, and never registered. A
+    # marker per boot still says "one token per boot, ever" to any controller
+    # that reads it, and says nothing about a boot it was not written for.
     timeout 60 gcloud compute instances add-metadata "$host" \
       --project="$PROJECT" --zone="$zone" \
-      --metadata="${REG_TOKEN_KEY}-issued=1" \
+      --metadata="${REG_TOKEN_KEY}-issued-${boot}=1" \
       --metadata-from-file="$REG_TOKEN_KEY=$f" >/dev/null 2>&1
     rc=$?
   fi
@@ -3763,8 +3839,28 @@ delete_registration_token() {
 # the key half of this answer needs the instance's metadata, which is one
 # describe per host. This is not per tick — see the call site, which sits below
 # both the `minted` marker and the failure cap.
+#
+# THE BOOT, not the instance (#1469). A MIG recreate is an in-place update: the
+# id and creationTimestamp survive, only lastStartTimestamp moves. So:
+#   DUR_AGE    is measured from the LATER of creationTimestamp and
+#              lastStartTimestamp — the boot that is running, the same rule
+#              host_age_seconds applies. From creation alone a host recreated a
+#              minute ago read as days old and was refused for ever.
+#   DUR_BOOT   `<id>-<lastStartTimestamp epoch>`, EMPTY while the instance has
+#              no start time (it has not booted, so nothing on it can read a key).
+#   DUR_ISSUED is `present` for the issued marker of THIS boot, or for the
+#              legacy unversioned `<key>-issued`, which cannot say which boot it
+#              was written for and so is read as this one. A marker for an
+#              earlier boot is not this boot's.
+# Why a newer boot may be handed a token: every guard here exists so a token is
+# never written into the metadata of a job that is RUNNING. A new boot is a cold
+# start — every process of the previous one, and the job it ran, is gone — and
+# the new boot runs no job until its agents register, which is the expiry rule's
+# cue to take the key back. A guest-OS reboot does not move lastStartTimestamp,
+# so it stays the same boot and is refused, which is the safe direction.
 instance_durable_facts() {
-  local uri="$1" zone host created now keyrow k
+  local uri="$1" zone host created started now keyrow k id born t epoch
+  DUR_BOOT=""
   # Reset to the REFUSING pair, not to zero: every `return 1` below leaves these
   # behind, and a caller that ignored the return code would otherwise read the
   # most permissive answer this function can give. Same reasoning as the
@@ -3786,15 +3882,31 @@ instance_durable_facts() {
 
   # A plain scalar projection, and `timeout` for the reason every gcloud call in
   # this file is bounded: gcloud has its own retry loop and can outlive a tick.
-  created=$(timeout 60 gcloud compute instances describe "$host" \
+  # ONE describe for all three: `value()` prints them tab-separated, and an
+  # instance that has never started prints an empty last field.
+  keyrow=$(timeout 60 gcloud compute instances describe "$host" \
     --project="$PROJECT" --zone="$zone" \
-    --format="value(creationTimestamp)" 2>/dev/null) || return 1
-  [ -n "$created" ] || return 1
-  created=$(date -u -d "$created" +%s 2>/dev/null) || return 1
-  case "${created:-}" in '' | *[!0-9]*) return 1 ;; esac
+    --format="value(id,creationTimestamp,lastStartTimestamp)" 2>/dev/null) || return 1
+  IFS=$'\t' read -r id created started <<<"$keyrow"
+  case "${id:-}" in '' | *[!0-9]*) return 1 ;; esac
+  [ -n "${created:-}" ] || return 1
+  case "$created" in *[!0-9TZ:.+-]*) return 1 ;; esac
+  born=$(date -u -d "$created" +%s 2>/dev/null) || return 1
+  case "${born:-}" in '' | *[!0-9]*) return 1 ;; esac
+  # The start time is optional — PROVISIONING has none — but one that is there
+  # and is not a timestamp is an unreadable fact, not a missing one.
+  if [ -n "${started:-}" ]; then
+    case "$started" in *[!0-9TZ:.+-]*) return 1 ;; esac
+    epoch=$(date -u -d "$started" +%s 2>/dev/null) || return 1
+    case "${epoch:-}" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$epoch" -gt "$born" ] && born=$epoch
+    t="$id-$epoch"
+  else
+    t=""
+  fi
 
   now=$(date -u +%s)
-  DUR_AGE=$((now - created))
+  DUR_AGE=$((now - born))
   # Clock skew between this controller and the API must not read as "brand new
   # in the future"; the safe direction is old — and `0` is the opposite of old.
   # A negative age means this controller's clock is BEHIND the API's, so every
@@ -3837,9 +3949,15 @@ instance_durable_facts() {
       "$REG_TOKEN_KEY") DUR_KEY="present" ;;
       "${REG_TOKEN_KEY}-issued") DUR_ISSUED="present" ;;
     esac
+    # A separate test, and only with a boot to compare: an empty `t` would make
+    # this `<key>-issued-`, which no write ever produces.
+    if [ -n "$t" ] && [ "$k" = "${REG_TOKEN_KEY}-issued-$t" ]; then
+      DUR_ISSUED="present"
+    fi
   done <<EOF
 $keyrow
 EOF
+  DUR_BOOT="$t"
   return 0
 }
 
@@ -4021,17 +4139,17 @@ registration_token_step() {
       if delete_registration_token "$uri"; then
         rm -f "$keylive"
         : >"$minted"
-        log "regtoken $host: created ${DUR_AGE}s ago and still carrying $REG_TOKEN_KEY — deleted"
+        log "regtoken $host: booted ${DUR_AGE}s ago and still carrying $REG_TOKEN_KEY — deleted"
       else
         # The key is still out there. `keylive` so the expiry rule keeps trying,
         # and NO `minted`: claiming the work is done is the one outcome a failed
         # delete must never produce.
         : >"$keylive"
-        log "regtoken $host: created ${DUR_AGE}s ago, delete of $REG_TOKEN_KEY FAILED — will retry"
+        log "regtoken $host: booted ${DUR_AGE}s ago, delete of $REG_TOKEN_KEY FAILED — will retry"
       fi
     else
       : >"$minted"
-      log "regtoken $host: created ${DUR_AGE}s ago, not booting — no token minted"
+      log "regtoken $host: booted ${DUR_AGE}s ago, not booting — no token minted"
     fi
     return 0
   fi
@@ -4066,11 +4184,21 @@ registration_token_step() {
   # is that it did.
   if [ "$DUR_ISSUED" != "absent" ]; then
     : >"$minted"
-    log "regtoken $host: already issued a token once (${REG_TOKEN_KEY}-issued) — not minting a second"
+    log "regtoken $host: already issued a token for this boot (${REG_TOKEN_KEY}-issued) — not minting a second"
     return 0
   fi
 
-  if write_registration_token "$uri" "$keylive"; then
+  # NO BOOT YET. An instance with no lastStartTimestamp has not started, so no
+  # boot script can read a key, and a token written now could only be recorded
+  # against a boot that does not exist — the next read, with a start time, would
+  # not find it and mint a second. Wait; not charged to the cap, because nothing
+  # failed, and no `minted`, because nothing was decided.
+  if [ -z "$DUR_BOOT" ]; then
+    log "regtoken $host: not started yet — minting nothing this tick"
+    return 0
+  fi
+
+  if write_registration_token "$uri" "$keylive" "$DUR_BOOT"; then
     : >"$minted"
     rm -f "$fails"
     log "regtoken $host: minted and written to $REG_TOKEN_KEY"
@@ -5266,7 +5394,9 @@ tick_pool() {
     # now, and the step's expiry rule is the one place that has to be certain of
     # it. It is read from HOST_BUSY above, after host_facts.
     if [ "$MINT_REG" = "true" ] && [ -n "$host_uri" ]; then
-      registration_token_step "$host" "$host_uri" "$HOST_REG" "$age" "$status" "$busy"
+      # HOST_REG_LIVE, not HOST_REG: a recreated host's offline registrations
+      # from the previous boot must not read as this boot's agents (#1469).
+      registration_token_step "$host" "$host_uri" "$HOST_REG_LIVE" "$age" "$status" "$busy"
     fi
 
     # A host the MIG is already deleting or abandoning is past every verdict
