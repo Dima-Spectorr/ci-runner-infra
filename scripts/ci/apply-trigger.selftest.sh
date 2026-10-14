@@ -366,6 +366,15 @@ guards_destroys_before_apply() {
   apply_n=$(printf '%s\n' "$code" | grep -nE 'id +=? *"apply"' | head -1 | cut -d: -f1)
   [ -n "$plan_n" ] && [ -n "$guard_n" ] && [ -n "$apply_n" ] || return 1
   [ "$plan_n" -lt "$guard_n" ] && [ "$guard_n" -lt "$apply_n" ] || return 1
+  # A refusal must END the step. Without errexit, or with the call's status
+  # swallowed, a refused plan falls through to the hash line below and the
+  # apply runs it. Read from THIS heredoc only: another body's errexit would
+  # satisfy a file-wide match and make the check vacuous.
+  local body set_n call_n
+  body=$(awk '/^  guard_step_script *= <<-EOT/,/^  EOT$/' "$1")
+  set_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*set -euo pipefail[[:space:]]*$' | head -1 | cut -d: -f1)
+  call_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*bash /workspace/tf-apply-guard\.sh --unattended-plan /workspace/\.tf-plan\.json \$\{local\.guard_allowed_args\}$' | head -1 | cut -d: -f1)
+  [ -n "$set_n" ] && [ -n "$call_n" ] && [ "$set_n" -lt "$call_n" ] || return 1
   # The apply runs only the plan the guard hashed.
   matches "$code" 'sha256sum .*> /workspace/\.apply-guarded'  || return 1
   matches "$code" '! sha256sum -c /workspace/\.apply-guarded' || return 1
@@ -426,6 +435,10 @@ mutate() { # <description> <file> <sed-program> <predicate> — predicate must g
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
   tmp=$(mktemp)
   sed "$prog" "$f" >"$tmp"
+  # A sed that matches nothing leaves the file as it was; the predicate then
+  # fails on the CORRECT module only if the predicate is broken, and otherwise
+  # reports a pass for a mutation that never happened.
+  if cmp -s "$f" "$tmp"; then bad "mutation is vacuous (sed changed nothing): $desc"; rm -f "$tmp"; return; fi
   if "$pred" "$tmp"; then bad "mutation not detected: $desc"; else ok; fi
   rm -f "$tmp"
 }
@@ -537,6 +550,11 @@ mutate "'the marker check failed on a re-run' — apply stops checking the guard
   's|! sha256sum -c /workspace/.apply-guarded|false|' guards_destroys_before_apply
 mutate "'run the guard after, as a report' — guard placed after the apply" "$MAIN" \
   's|id     = "destroy-guard"|id     = "destroy-guard-report"|; s|id         = "mig-name"|id = "destroy-guard"|' guards_destroys_before_apply
+mutate "'the guard's exit kills the step' — errexit dropped from the guard body" "$MAIN" \
+  '/^  guard_step_script *= <<-EOT/,/^  EOT$/ { /set -euo pipefail/d; }' guards_destroys_before_apply
+# shellcheck disable=SC2016  # ${local...} is HCL, matched literally.
+mutate "'a refusal should not fail the build' — the guard's status swallowed" "$MAIN" \
+  's|--unattended-plan /workspace/.tf-plan.json ${local.guard_allowed_args}$|& \|\| true|' guards_destroys_before_apply
 mutate "'the controller template is recreated too' — default broadened to instances" "$VARS" \
   '/^variable "unattended_destroy_allowed_types"/,/^}/ s|"google_compute_region_instance_template"\]|"google_compute_region_instance_template", "google_compute_instance"]|' allows_only_template_replacements_by_default
 mutate "'let callers pass a pattern' — name validation removed" "$VARS" \
