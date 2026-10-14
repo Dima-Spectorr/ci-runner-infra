@@ -315,6 +315,11 @@ do_sign() {
     || die "sign ran without the signer's access token — the auth step must run with token_format: access_token, and only this step receives it."
   validate_armed
   require_tools
+  # Checked before anything is signed. Single digits: no octal surprise in
+  # $(( )), and the wait stays bounded (each sleep is capped at 30s below).
+  local attempts="${RIS_VERIFY_ATTEMPTS:-5}" delay0="${RIS_VERIFY_DELAY_SECONDS:-2}" delay attempt verdict
+  matches "$attempts" '^[1-9]$' || die "RIS_VERIFY_ATTEMPTS must be 1-9, got '$attempts'."
+  matches "$delay0" '^[0-9]$' || die "RIS_VERIFY_DELAY_SECONDS must be 0-9, got '$delay0'."
 
   local work err ref digest count i ok key missing="" bad="" unreadable=""
   work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ris.XXXXXXXX")"
@@ -356,48 +361,63 @@ do_sign() {
 
   materialize_keys "$work"
   echo "── verifying against $(basename "$RIS_PUBLIC_KEY_PEM") as committed at HEAD"
+  # The list is read moments after the write, and Container Analysis can answer
+  # it before the newest occurrence is visible: Apigee-Portal run 38443705735
+  # signed five digests and the verify pass found four, missing the one signed
+  # last (#1584). So a MISS or a BAD is read again, with backoff, before it
+  # counts; it still fails closed once the attempts are spent. A list that
+  # FAILS is not retried — that is permissions or a wrong project, not lag.
   for ref in "${REFS[@]}"; do
     digest="${ref##*@}"
-    rm -rf "$work/sig" && mkdir -p "$work/sig"
-    # A failed list (permissions, wrong project) is its own failure, with
-    # gcloud's own words — never an empty list, and never a pass.
-    if ! gcloud beta container binauthz attestations list \
-        --project="$ATTESTOR_PROJECT" \
-        --attestor="$ATTESTOR" \
-        --attestor-project="$ATTESTOR_PROJECT" \
-        --artifact-url="$ref" \
-        --format=json > "$work/list.json" 2>"$err"; then
-      sed 's/^/    /' "$err"
-      log "FAIL $ref (attestations list failed)"
-      unreadable="$unreadable $ref"
-      continue
-    fi
+    attempt=1
+    delay="$delay0"
+    while :; do
+      rm -rf "$work/sig" && mkdir -p "$work/sig"
+      # A failed list (permissions, wrong project) is its own failure, with
+      # gcloud's own words — never an empty list, and never a pass.
+      if ! gcloud beta container binauthz attestations list \
+          --project="$ATTESTOR_PROJECT" \
+          --attestor="$ATTESTOR" \
+          --attestor-project="$ATTESTOR_PROJECT" \
+          --artifact-url="$ref" \
+          --format=json > "$work/list.json" 2>"$err"; then
+        sed 's/^/    /' "$err"
+        verdict=FAIL
+        break
+      fi
 
-    if ! python3 -c 'import json,sys; t=open(sys.argv[1]).read().strip(); sys.exit(0 if t and json.loads(t) else 1)' "$work/list.json" 2>/dev/null; then
-      log "MISS $ref (no attestation)"
-      missing="$missing $ref"
-      continue
-    fi
+      if ! python3 -c 'import json,sys; t=open(sys.argv[1]).read().strip(); sys.exit(0 if t and json.loads(t) else 1)' "$work/list.json" 2>/dev/null; then
+        verdict=MISS
+      else
+        count="$(extract_signed_payloads "$work/list.json" "$digest" "$work/sig")"
+        ok=""
+        i=0
+        while [ -z "$ok" ] && [ "$i" -lt "$count" ]; do
+          for key in "${VERIFY_KEYS[@]}"; do
+            if openssl dgst -sha256 -verify "$key" -signature "$work/sig/$i.sig" "$work/sig/$i.payload" >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+          done
+          i=$((i + 1))
+        done
+        if [ -n "$ok" ]; then verdict=OK; else verdict=BAD; fi
+      fi
 
-    count="$(extract_signed_payloads "$work/list.json" "$digest" "$work/sig")"
-    ok=""
-    i=0
-    while [ -z "$ok" ] && [ "$i" -lt "$count" ]; do
-      for key in "${VERIFY_KEYS[@]}"; do
-        if openssl dgst -sha256 -verify "$key" -signature "$work/sig/$i.sig" "$work/sig/$i.payload" >/dev/null 2>&1; then
-          ok=1
-          break
-        fi
-      done
-      i=$((i + 1))
+      [ "$verdict" = OK ] && break
+      [ "$attempt" -ge "$attempts" ] && break
+      log "     $ref: $verdict on read $attempt of $attempts — reading again in ${delay}s"
+      sleep "$delay"
+      delay=$((delay * 2 > 30 ? 30 : delay * 2))
+      attempt=$((attempt + 1))
     done
 
-    if [ -n "$ok" ]; then
-      log "OK   $ref"
-    else
-      log "BAD  $ref (attestation present, but no signature over this digest verifies against the committed key)"
-      bad="$bad $ref"
-    fi
+    case "$verdict" in
+      OK)   log "OK   $ref" ;;
+      FAIL) log "FAIL $ref (attestations list failed)"; unreadable="$unreadable $ref" ;;
+      MISS) log "MISS $ref (no attestation after $attempt read(s))"; missing="$missing $ref" ;;
+      BAD)  log "BAD  $ref (attestation present, but no signature over this digest verifies against the committed key, after $attempt read(s))"; bad="$bad $ref" ;;
+    esac
   done
 
   if [ -n "$missing$bad$unreadable" ]; then

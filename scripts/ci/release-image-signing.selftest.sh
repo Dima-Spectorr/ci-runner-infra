@@ -9,7 +9,9 @@
 #   - signed with another key (fresh, or an ALREADY_EXISTS one):       FAIL
 #   - the signed payload names another digest:                         FAIL
 #   - sign-and-create "succeeds" but no attestation exists:            FAIL
-#   - `attestations list` itself fails:                                FAIL
+#   - `attestations list` itself fails (and is not retried):           FAIL
+#   - the list shows the attestation only on a later read:            PASS
+#   - the list lags past every read:                                   FAIL
 #   - required and an input missing, or no access token at sign:       FAIL
 #   - a key that is untracked by git, or not EC P-256:                 FAIL
 #   - a tracked key edited in the working tree, or staged not committed: FAIL
@@ -121,6 +123,12 @@ case "$args" in
     exit 0 ;;
   *" attestations list "*)
     if [ "$STUB_LIST" = fail ]; then echo "ERROR: (gcloud) PERMISSION_DENIED: containeranalysis.occurrences.list" >&2; exit 1; fi
+    # STUB_LIST_LAG=N: the first N reads of a digest answer [] even after it
+    # was written — the read-after-write lag #1584 saw.
+    reads="$store.reads"
+    n=$(( $(cat "$reads" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$reads"
+    if [ "$n" -le "${STUB_LIST_LAG:-0}" ]; then echo "[]"; exit 0; fi
     if [ -f "$store" ]; then cat "$store"; else echo "[]"; fi
     exit 0 ;;
 esac
@@ -150,6 +158,7 @@ run() {
       RIS_ATTESTOR="demo-release-images" RIS_ATTESTOR_PROJECT="signing-proj-0" \
       RIS_KEY_VERSION="$KEYVER" RIS_PUBLIC_KEY_PEM="keys/a.pub.pem" \
       RIS_DIGESTS="$REF1 $REF2" RIS_REQUIRED=true RIS_ACCESS_TOKEN=stub-token \
+      RIS_VERIFY_DELAY_SECONDS=0 \
       "$@" bash "$SCRIPT" "$mode" 2>&1)"
   RC=$?
   GH_OUT="$(cat "$case_dir/out")"
@@ -287,6 +296,25 @@ expect_fail "signed payload names another digest: fails" "does not verify"
 
 run missing-attestation sign STUB_SIGN=none
 expect_fail "no attestation after sign-and-create: fails" "No attestation found"
+check "  ...read five times per digest before it counts" count_is "$LOG" "attestations list" 10
+
+run list-lag sign STUB_LIST_LAG=2
+expect_pass "an attestation visible only on the third read: passes (#1584)" "OK   $REF2"
+check "  ...the lag is logged, not silent" has "$OUT" "MISS on read 2 of 5"
+check "  ...three reads per digest" count_is "$LOG" "attestations list" 6
+
+run list-lag-exhausted sign STUB_LIST_LAG=3 RIS_VERIFY_ATTEMPTS=3
+expect_fail "lag outlasting every read: still fails closed" "No attestation found"
+
+run list-fails-once sign STUB_LIST=fail
+check "  ...a failed list is not retried" count_is "$LOG" "attestations list" 2
+
+run bad-attempts sign RIS_VERIFY_ATTEMPTS=0
+expect_fail "zero verify attempts: refused" "RIS_VERIFY_ATTEMPTS must be"
+check "  ...refused before anything is signed" lacks "$LOG" "sign-and-create"
+
+run octal-delay sign RIS_VERIFY_DELAY_SECONDS=08
+expect_fail "a zero-padded delay: refused, not an octal crash" "RIS_VERIFY_DELAY_SECONDS must be"
 
 run list-fails sign STUB_LIST=fail
 expect_fail "attestations list exiting 1: fails, never an empty pass" "Could not read attestations"
