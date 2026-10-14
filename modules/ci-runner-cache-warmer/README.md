@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.149.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.150.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -28,9 +28,9 @@ module "ci_cache_warmer" {
   github_owner = "my-org"
   github_repo  = "myrepo"
 
-  # Optional: who is told when a warm fails or goes stale. Omit (or `[]`)
-  # for no alert policy at all.
-  alert_notification_channels = [var.ci_alert_channel]
+  # No alert_notification_channels: CI alert email is off fleet-wide (#1594).
+  # Omitted (or `[]`) means no alert policy at all; set it only with the
+  # owner's explicit consent.
 
   # 2nd-generation projects only; omit on a project using gen1 triggers.
   github_connection = var.cloudbuild_github_connection

@@ -390,6 +390,17 @@ allows_only_template_replacements_by_default() {
   matches "$block" '"google_service_account", "google_secret_manager_secret"' || return 1
 }
 
+# 19. The alert-policy step is OPT-IN (#1594). The owner does not want CI alert
+#     email, ever, and deleted every policy by hand on 2026-10-14; with the old
+#     `true` default the next scheduled apply in every pool project recreated
+#     them, because roots pin `?ref=v5` and never set the flag. A root turns it
+#     on only with the owner's explicit consent.
+alert_policies_are_opt_in() {
+  local block; block=$(var_block manage_alert_policies "$1")
+  matches "$block" '^[[:space:]]*default[[:space:]]*=[[:space:]]*false[[:space:]]*$' || return 1
+  ! matches "$block" 'default[[:space:]]*=[[:space:]]*true' || return 1
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -430,6 +441,7 @@ check constrains_the_value_it_shells_out          "$VARS" "alert_notification_em
 check declares_the_schedule_is_running            "$MAIN" "the scheduler job does not state paused = false — a job paused by hand stays paused through every later apply, with no diff in any plan and nothing red anywhere"
 check guards_destroys_before_apply                "$MAIN" "the destroy guard is missing, conditional, after the apply, or not bound to the applied plan — an unattended apply can destroy anything the account can (#1567)"
 check allows_only_template_replacements_by_default "$VARS" "unattended_destroy_allowed_types is broader than instance templates by default, accepts a pattern, or can name an identity (#1567)"
+check alert_policies_are_opt_in                   "$VARS" "manage_alert_policies is on by default — the next scheduled apply recreates every CI alert policy the owner deleted, and the emails start again (#1594)"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -559,6 +571,10 @@ mutate "'the controller template is recreated too' — default broadened to inst
   '/^variable "unattended_destroy_allowed_types"/,/^}/ s|"google_compute_region_instance_template"\]|"google_compute_region_instance_template", "google_compute_instance"]|' allows_only_template_replacements_by_default
 mutate "'let callers pass a pattern' — name validation removed" "$VARS" \
   '/^variable "unattended_destroy_allowed_types"/,/^}/ s|regex("^\[a-z\]\[a-z0-9_\]\*\$", t)|true|' allows_only_template_replacements_by_default
+
+# "Four projects had no alerts, so make them the default" — the edit #1594 undid.
+mutate "'a project that forgets needs it most' — alerts back on by default" "$VARS" \
+  '/^variable "manage_alert_policies"/,/^}/ s|default     = false|default     = true|' alert_policies_are_opt_in
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

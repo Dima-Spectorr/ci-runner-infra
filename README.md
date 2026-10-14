@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.149.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.150.0"
   # ...
 }
 ```
@@ -1011,12 +1011,12 @@ replaced controller offers each corpse one more hour.
 distinguish from "the pool is idle".
 
 `scripts/ci/ensure-alert-policies.sh --project <id> [--email <addr>]` brings one
-project's policies up to the fleet's, idempotently. **You should not normally
-have to run it**: `ci-runner-apply-trigger` carries it as a build step and
-reconciles the policies on every apply (`manage_alert_policies`, on by default).
-That step exists because the hand-run version did not roll out — on 2026-08-29,
-four of the ten pool projects had no CI alert policies at all, which looks from
-inside exactly like a project with nothing wrong. `--email` is optional and
+project's policies up to the fleet's, idempotently. `ci-runner-apply-trigger`
+can carry it as a build step that reconciles the policies on every apply, but
+**that step is OFF by default since v5.150.0** (`manage_alert_policies = false`,
+#1594): the owner does not want CI alert email, and a root turns it on only with
+his explicit consent. Turning it off deletes nothing; it only stops recreating
+policies that were deleted by hand. `--email` is optional and
 omitting it adopts the channel the project already pages; an address is needed
 only to bootstrap a project that has never had one, or to disambiguate a project
 that has several. The step never fails the apply: a build account

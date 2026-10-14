@@ -261,13 +261,13 @@ variable "unattended_destroy_allowed_types" {
 
 variable "manage_alert_policies" {
   type        = bool
-  default     = true
+  default     = false
   description = <<-EOT
-    Bring this project's CI alert policies up to the fleet's set on every apply.
+    Bring this project's CI alert policies (and their email notification channel) up to the fleet's set on every apply.
 
-    On by default, and that default is the point: measured on 2026-08-29, four of the ten pool projects had NO CI alert policies at all, because the script that creates them was operator-run and nobody had run it there. Opt-out rather than opt-in, because a project that forgets is exactly the project that needs it.
+    OFF by default since v5.150.0 (#1594). The owner does not want CI alert email, ever: on 2026-10-14 every "CI runners / ..." policy was deleted by hand in all pool projects, and the previous `true` default would have recreated them on the next scheduled apply. Opt-in only — set it to true in a root only with the owner's explicit consent.
 
-    The step never fails the build — a project whose build account cannot write monitoring policies gets a warning naming the role, not a red apply.
+    Setting it to false does NOT delete policies that already exist; it only stops this build from creating or updating them. When enabled, the step never fails the build — a project whose build account cannot write monitoring policies gets a warning naming the role, not a red apply.
   EOT
 }
 
