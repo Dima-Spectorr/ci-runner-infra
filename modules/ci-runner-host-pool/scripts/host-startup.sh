@@ -203,14 +203,65 @@ HOST_LABEL="host-$HOSTNAME_SHORT"
 LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
 
 # The label list ONE slot registers with: the pool's, plus `background` on the
-# lower BACKGROUND_SLOTS slots only. A pure function of its index so the
-# self-test can run it for every slot of a host rather than trust its text.
-slot_labels() { # <idx>
+# lower BACKGROUND_SLOTS slots only, plus `ci-unheld` when the slot loop found
+# the host admissible to a new run at mint time (#1600, host_admissible). A pure
+# function of its arguments so the self-test can run it for every slot of a host
+# rather than trust its text.
+slot_labels() { # <idx> [unheld:0|1]
+  local out="$LABELS"
   if [ "$1" -le "$BACKGROUND_SLOTS" ]; then
-    printf '%s,background' "$LABELS"
-  else
-    printf '%s' "$LABELS"
+    out="$out,background"
   fi
+  if [ "${2:-0}" = 1 ]; then
+    out="$out,ci-unheld"
+  fi
+  printf '%s' "$out"
+}
+
+# --- reservation-aware placement (#1600) --------------------------------------
+#
+# The shared-infra anchor lands on whichever slot GitHub hands it and only THEN
+# asks ci-pin-hold for the host. On a pool where several runs hold hosts, an
+# anchor that needs a host of its own kept landing on one somebody else holds,
+# was refused (`foreign_live`), and its run went unpinned -- or, for a consumer
+# whose isolated work must not run unpinned, did not run at all.
+#
+# So a host says, in a label, whether it would admit a new run: `ci-unheld` is
+# on a slot's registration only while host_admissible is true, and an anchor
+# that opts in (`require-unheld-host`) asks for it. The slot loop keeps the
+# label honest in both directions -- an idle runner minted under the other
+# answer is withdrawn and minted again (install_slot_loop).
+#
+# The label is ROUTING, never admission. ci-pin-hold still decides, under its
+# lock, and two anchors that reach one free host inside the relabel window get
+# one `pinned=1` and one `pinned=0` exactly as before. Nothing here releases,
+# renews, adopts or shortens a hold.
+#
+# host_admissible <record> <now> <boot-id> -- true iff `ci-pin-hold --run <a
+# new id>` would answer pinned=1 now. The exact mirror of its admission: no
+# record, one that does not parse, or one from an earlier boot is admissible
+# (ci-pin-hold reads all three as absent); a live hold is not; an EXPIRED
+# reservation is not either until the sweeper has released it, because
+# ci-pin-hold refuses that one too. A mirror that disagreed would advertise a
+# host the anchor is then refused on -- the collision this label removes -- or
+# hide one it would have been given.
+host_admissible() { # <record> <now> <boot-id>
+  local run="" slot="" ttl="" expiry="" reserve=0 boot="" k v
+  [ -f "$1" ] || return 0
+  while IFS='=' read -r k v; do
+    case "$k" in
+      run) run="$v" ;; slot) slot="$v" ;; ttl) ttl="$v" ;;
+      expiry) expiry="$v" ;; reserve) reserve="$v" ;; boot) boot="$v" ;;
+    esac
+  done <"$1" 2>/dev/null || return 0
+  case "$run:$slot:$ttl:$expiry:$reserve" in
+    ?*:[0-9]*:[0-9]*:[0-9]*:[01]) ;;
+    *) return 0 ;;
+  esac
+  [ "$boot" = "$3" ] || return 0
+  [ "$expiry" -gt "$2" ] && return 1
+  [ "$reserve" = 1 ] && return 1
+  return 0
 }
 [ -d "$RUNNER_HOME" ] || die "golden image is missing $RUNNER_HOME — this host was booted from the wrong image, and booting a bare image here would reintroduce the per-job install cost this pool removes"
 
@@ -340,9 +391,9 @@ runner_group_id() {
 # self-hosted/Linux/X64 by itself; generate-jitconfig documents only the labels
 # it is given, so they are named. Each label is checked against a conservative
 # alphabet because it is interpolated into a JSON body (the host has no jq).
-jit_labels_json() { # <idx>
+jit_labels_json() { # <idx> [unheld:0|1]
   local out="" seen="," l all
-  all="self-hosted,Linux,X64,$(slot_labels "$1")"
+  all="self-hosted,Linux,X64,$(slot_labels "$1" "${2:-0}")"
   local IFS=,
   for l in $all; do
     [ -n "$l" ] || continue
@@ -360,10 +411,10 @@ jit_labels_json() { # <idx>
 # The name is UNIQUE per registration: an ephemeral runner's deletion propagates
 # asynchronously, and reusing a name inside that window is a 409. One retry under
 # a fresh name on a 409; anything else fails the pass and the loop retries.
-mint_jit() { # <idx> <envfile>
+mint_jit() { # <idx> <envfile> [unheld:0|1]
   local idx="$1" envfile="$2" tok group labels name body resp code out id try
   group=$(runner_group_id) || return 1
-  labels=$(jit_labels_json "$idx") || return 1
+  labels=$(jit_labels_json "$idx" "${3:-0}") || return 1
   tok=$(gh_token) || return 1
   [ -n "$tok" ] || return 1
   for try in 1 2; do
@@ -2827,7 +2878,7 @@ install_slot_loop() {
     declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET RUNNER_GROUP HOSTNAME_SHORT \
       LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS
     declare -f log safe_for_log md gh_token slot_labels runner_group_id \
-      jit_labels_json mint_jit delete_runner
+      jit_labels_json mint_jit delete_runner host_admissible
     cat <<'EOF'
 
 idx="${1:-}"
@@ -2904,6 +2955,16 @@ job_running() {
   return 1
 }
 
+# 1 when this host would admit a new run's hold right now, 0 when it would not
+# -- the `ci-unheld` label a runner is minted with (#1600, host_admissible).
+unheld_now() {
+  if host_admissible "$PIN_DIR/host" "$(date +%s)" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
 # Prints why this slot must not register right now; false when it may.
 gate() {
   local d c
@@ -2959,7 +3020,8 @@ while :; do
   fi
 
   rm -f -- "$ENVFILE"
-  if ! id=$(mint_jit "$idx" "$ENVFILE"); then
+  unheld=$(unheld_now)
+  if ! id=$(mint_jit "$idx" "$ENVFILE" "$unheld"); then
     sleep 30
     continue
   fi
@@ -2982,10 +3044,11 @@ while :; do
     sleep 30
     continue
   fi
-  log "slot $idx: registered for one job as runner $id"
+  log "slot $idx: registered for one job as runner $id (ci-unheld=$unheld)"
 
   dirty=0
   withdrawn=0
+  relabel=0
   while agent_up; do
     sleep 5
     if [ "$withdrawn" -gt 0 ]; then
@@ -3007,12 +3070,33 @@ while :; do
     if [ "$dirty" -ge 12 ] && delete_runner "$id"; then
       log "slot $idx: its clean marker was withdrawn while runner $id waited for a job -- runner withdrawn so the slot is reset before it takes one"
       withdrawn=1
+      continue
+    fi
+    # THE HOST'S ANSWER CHANGED while this runner waited (#1600): a run took a
+    # hold, or the last one was released. A runner still advertising
+    # `ci-unheld` on a held host is where a reservation-aware anchor collides
+    # with someone else's hold; one NOT advertising it on a free host is
+    # capacity those anchors cannot see. Withdrawn through the same 422-guarded
+    # delete as above -- a job already assigned keeps its runner, and ITS end
+    # re-mints under the new answer.
+    if [ "$(unheld_now)" != "$unheld" ] && ! job_running && delete_runner "$id"; then
+      log "slot $idx: the host's pin hold changed while runner $id waited -- withdrawn to register again with ci-unheld=$((1 - unheld))"
+      withdrawn=1
+      relabel=1
     fi
   done
   systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
   rm -f -- "$ENVFILE"
   delete_runner "$id" || true
-  need_reset=1
+  # A runner withdrawn ONLY to change its label never had a job (GitHub refused
+  # no delete), so its slot is exactly as clean as its last reset left it;
+  # another full reset would add the reset's time to every hold change. A
+  # withdrawn clean marker still forces one.
+  if [ "$relabel" = 1 ] && [ -f "$dir/clean" ]; then
+    need_reset=0
+  else
+    need_reset=1
+  fi
 done
 EOF
   } >"$f.tmp" || { rm -f "$f.tmp"; return 1; }

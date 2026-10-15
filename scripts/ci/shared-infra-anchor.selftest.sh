@@ -171,6 +171,20 @@ suite() { # <workflow>
   CASES=$((CASES + 1))
   grep -cF "(github.event_name == 'push' || github.event_name == 'schedule') && ',\"background\"' || ''" "$1" >/dev/null \
     || { echo "  anchor runs-on: no longer adds background on push/schedule"; return 1; }
+  # 13. a reservation-aware caller (#1600) lands its anchor only on a host no
+  #     other run holds: `ci-unheld` joins the anchor's OWN runs-on, opt-in, and
+  #     never the published pool/pinned arrays (the job's work runs on the host
+  #     the anchor pinned, whatever label it carries by then).
+  CASES=$((CASES + 1))
+  grep -cF "inputs.require-unheld-host && ',\"ci-unheld\"' || ''" "$1" >/dev/null \
+    || { echo "  anchor runs-on: require-unheld-host no longer adds ci-unheld"; return 1; }
+  grep -cE '^      require-unheld-host:$' "$1" >/dev/null \
+    || { echo "  the require-unheld-host input is gone"; return 1; }
+  awk '/^      require-unheld-host:$/{f=1;next} f&&/^      [a-z#]/{exit} f' "$1" | grep -qE '^        default: false$' \
+    || { echo "  require-unheld-host is no longer opt-in (default false)"; return 1; }
+  if grep -F '"ci-unheld"' "$1" | grep -vF 'inputs.require-unheld-host' | grep -q .; then
+    echo "  ci-unheld appears outside the anchor's own runs-on"; return 1
+  fi
   # …and wires the new output through the job and the workflow.
   grep -cE '^      pool: \$\{\{ steps\.up\.outputs\.pool \}\}$' "$1" >/dev/null \
     || { echo "  job output 'pool' is not wired from the step"; return 1; }
@@ -221,6 +235,10 @@ mutate "the unpinned fallback is removed"          's/if \[ "\$slots" -lt 1 \]; 
 mutate "background width ignores the reserved slot" 's/slots=\$(( 10#\$b - 1 ))/slots=$(( 10#$b ))/'
 mutate "background width is the PR width"          's/slots=\$(( 10#\$b - 1 ))/slots="$(free_slots)"/'
 mutate "the anchor job never asks for background"  "s/(github.event_name == 'push' || github.event_name == 'schedule') \&\& ',\"background\"' || ''/''/"
+mutate "the anchor never asks for ci-unheld"        "s/inputs.require-unheld-host \&\& ',\"ci-unheld\"' || ''/''/"
+mutate "the reservation-aware input is removed"     '/^      require-unheld-host:$/d'
+mutate "reservation-aware routing is on by default" '/^      require-unheld-host:$/,/^        type: boolean$/s/^        default: false$/        default: true/'
+mutate "the pinned array asks for ci-unheld"        's/\["self-hosted","linux","gcp",\$l,\$h\]/["self-hosted","linux","gcp",$l,$h,"ci-unheld"]/'
 mutate "the job output pool is unwired"            '/^      pool: \${{ steps\.up\.outputs\.pool }}$/d'
 mutate "the event never reaches the shell"         '/^          EVENT_NAME: \${{ github\.event_name }}$/d'
 }

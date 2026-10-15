@@ -124,6 +124,20 @@ on:
         required: false
         default: ubuntu-latest
         type: string
+      require-unheld-host:
+        description: >-
+          Land the anchor only on a host that would admit this run's hold
+          (#1600). Each host registers the `ci-unheld` label while no other
+          run holds it, and this asks for it, so an anchor waits for a free
+          host instead of landing on a held one and running unpinned. For a
+          run whose work must not run unpinned. Routing only: admission is
+          still `ci-pin-hold`, and the rare anchor that loses a race to a free
+          host still publishes pinned 0, which such a run must treat as a
+          failure. The wait is bounded by the pool scaling out, or at worst by
+          the longest hold a host grants (2h). Ignored on a fork.
+        required: false
+        default: false
+        type: boolean
       # There is deliberately NO `timeout-minutes` input. `timeout-minutes:
       # ${{ inputs.timeout-minutes }}` is an expression this repository's own
       # RUNNER6 refuses, and it is right to: an expression that lands on 360 or
@@ -238,7 +252,13 @@ jobs:
     # The anchor asks for it here as well as in what it publishes, because the
     # host and slot the anchor lands on decide where the whole run pins — an
     # anchor on a top slot would hand a push run's stack the slot PR jobs need.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && inputs.hosted-runner || fromJSON(format('["self-hosted","linux","gcp","{0}"{1}]', inputs.repo-label, (github.event_name == 'push' || github.event_name == 'schedule') && ',"background"' || '')) }}
+    #
+    # RESERVATION-AWARE (#1600). With `require-unheld-host` the anchor also asks
+    # for `ci-unheld`, which a slot carries only while its host would admit a
+    # new hold (host-startup.sh `host_admissible`). Only the ANCHOR asks for it:
+    # once this run holds the host, that host's slots drop the label, and every
+    # consumer must still land there through the host label it publishes.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && inputs.hosted-runner || fromJSON(format('["self-hosted","linux","gcp","{0}"{1}{2}]', inputs.repo-label, (github.event_name == 'push' || github.event_name == 'schedule') && ',"background"' || '', inputs.require-unheld-host && ',"ci-unheld"' || '')) }}
     # Fixed, not an input — see the note in the input block above.
     timeout-minutes: 15
     outputs:

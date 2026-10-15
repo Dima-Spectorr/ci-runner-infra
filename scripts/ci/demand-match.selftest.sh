@@ -47,7 +47,7 @@ match_set() { # <configured-csv> <host_os>
   printf '%s' "$1" | jq -R -c --arg os "$2" '
     (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
     | split(",") + ["self-hosted", $osl, "X64"]
-      + (if $osl == "Linux" then ["background"] else [] end)
+      + (if $osl == "Linux" then ["background", "ci-unheld"] else [] end)
     | map(select(length > 0) | ascii_downcase) | unique'
 }
 POOL_LABELS=$(match_set "$POOL_CONFIGURED" linux)
@@ -424,12 +424,40 @@ bg_mutant "background dropped from the Linux match set" \
 bg_mutant "background added to the Windows match set" \
   "self-hosted,ci-runner-host-win,gcp,Telnet-Emulation" windows "$BG_EVERYWHERE" "$WIN_BG_JOB" 0
 
+# --- reservation-aware anchors are demand (#1600) -----------------------------
+#
+# A reservation-aware shared-infra anchor asks for `ci-unheld`, which a Linux
+# host adds to a slot only while no other run holds it. No pool configures it,
+# so a match set without it reads the anchor as another pool's job: ci_demand
+# drops it, and when every host is held the pool never scales out for the one
+# job that is waiting for a FREE host -- the anchor queues until a hold expires.
+# Windows hosts never register it (they run no pin hold).
+UNHELD_JOB='{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp","Telnet-Emulation","ci-unheld"]}]}'
+UNHELD_BG_JOB='{"jobs":[{"status":"queued","labels":["self-hosted","linux","gcp","Telnet-Emulation","background","ci-unheld"]}]}'
+WIN_UNHELD_JOB='{"jobs":[{"status":"queued","labels":["self-hosted","windows","gcp","ci-unheld"]}]}'
+expect 1 "a reservation-aware anchor is this Linux pool's demand" "$UNHELD_JOB"
+expect 1 "and so is one from a push run, which asks for background as well" "$UNHELD_BG_JOB"
+win 0 "a Windows pool does not answer for a reservation-aware anchor" "$WIN_UNHELD_JOB"
+
+# shellcheck disable=SC2016
+UNHELD_DROPPED='(if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+  | split(",") + ["self-hosted", $osl, "X64"] + (if $osl == "Linux" then ["background"] else [] end) | map(select(length > 0) | ascii_downcase) | unique'
+# shellcheck disable=SC2016
+UNHELD_EVERYWHERE='(if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
+  | split(",") + ["self-hosted", $osl, "X64", "ci-unheld"] + (if $osl == "Linux" then ["background"] else [] end) | map(select(length > 0) | ascii_downcase) | unique'
+bg_mutant "ci-unheld dropped from the Linux match set" \
+  "$POOL_CONFIGURED" linux "$UNHELD_DROPPED" "$UNHELD_JOB" 1
+bg_mutant "ci-unheld dropped, a push run's anchor" \
+  "$POOL_CONFIGURED" linux "$UNHELD_DROPPED" "$UNHELD_BG_JOB" 1
+bg_mutant "ci-unheld added to the Windows match set" \
+  "self-hosted,ci-runner-host-win,gcp,Telnet-Emulation" windows "$UNHELD_EVERYWHERE" "$WIN_UNHELD_JOB" 0
+
 # A fixture that derives the match set the way the controller does proves
 # nothing once the controller stops doing it, so the derivation is pinned too.
 # shellcheck disable=SC2016  # matching jq source text literally, on purpose.
 for needle in \
   'split(",") + ["self-hosted", $osl, "X64"]' \
-  '+ (if $osl == "Linux" then ["background"] else [] end)' \
+  '+ (if $osl == "Linux" then ["background", "ci-unheld"] else [] end)' \
   'map(select(length > 0) | ascii_downcase) | unique' \
   'def jlabels: ((.labels // []) | map(ascii_downcase));'
 do
