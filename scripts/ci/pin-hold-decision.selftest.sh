@@ -231,8 +231,11 @@ counted() { # <description> <ere> <n>
 # its verdict, so drain_decision() is never consulted for a host being recycled:
 # a veto on the drain path alone is bypassed entirely by a stale-template
 # cordon, and a cordoned host stops answering its own affinity label while the
-# run pinned to it still has jobs to place. Two call sites, no fewer.
-counted "the veto is applied on both removal paths" 'pin_hold_gate "\$host" "\$host_uri"' 2
+# run pinned to it still has jobs to place. Two call sites, no fewer -- plus the
+# third (#1596): a capacity-lost verdict asks before the reserve arm, because a
+# held slot is unregistered on purpose and is not lost capacity.
+counted "the veto is applied on both removal paths and the capacity-lost reserve" 'pin_hold_gate "\$host" "\$host_uri"' 3
+wired "the capacity-lost verdict is vetoed before it reserves" '^ +\*:capacity-lost\*\)$'
 wired "the recycle path is vetoed before it acts" '^ +cordon:\* \| retire:\*\)$'
 wired "the drain path is vetoed before it acts" 'VETOED by pin hold'
 
