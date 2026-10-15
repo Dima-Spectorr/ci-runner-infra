@@ -16,7 +16,7 @@ Consumers now reference this module by tag:
 
 ```hcl
 module "ci" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.150.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-host-pool?ref=v5.150.1"
   # ...
 }
 ```
@@ -1013,7 +1013,7 @@ distinguish from "the pool is idle".
 `scripts/ci/ensure-alert-policies.sh --project <id> [--email <addr>]` brings one
 project's policies up to the fleet's, idempotently. `ci-runner-apply-trigger`
 can carry it as a build step that reconciles the policies on every apply, but
-**that step is OFF by default since v5.150.0** (`manage_alert_policies = false`,
+**that step is OFF by default since v5.150.1** (`manage_alert_policies = false`,
 #1594): the owner does not want CI alert email, and a root turns it on only with
 his explicit consent. Turning it off deletes nothing; it only stops recreating
 policies that were deleted by hand. `--email` is optional and
