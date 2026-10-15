@@ -231,8 +231,11 @@ counted() { # <description> <ere> <n>
 # its verdict, so drain_decision() is never consulted for a host being recycled:
 # a veto on the drain path alone is bypassed entirely by a stale-template
 # cordon, and a cordoned host stops answering its own affinity label while the
-# run pinned to it still has jobs to place. Two call sites, no fewer.
-counted "the veto is applied on both removal paths" 'pin_hold_gate "\$host" "\$host_uri"' 2
+# run pinned to it still has jobs to place. Two call sites, no fewer -- plus the
+# third (#1596): a capacity-lost verdict asks before the reserve arm, because a
+# held slot is unregistered on purpose and is not lost capacity.
+counted "the veto is applied on both removal paths and the capacity-lost reserve" 'pin_hold_gate "\$host" "\$host_uri"' 3
+wired "the capacity-lost verdict is vetoed before it reserves" '^ +\*:capacity-lost\*\)$'
 wired "the recycle path is vetoed before it acts" '^ +cordon:\* \| retire:\*\)$'
 wired "the drain path is vetoed before it acts" 'VETOED by pin hold'
 
@@ -539,7 +542,7 @@ counted "both gates classify the namespace 404" \
 
 # The veto reaches Cloud Logging. log() stops at this VM's own file, which is
 # why a veto that never lifted was invisible on three pools (#1384).
-counted "both vetoes are events" '^ +pin_veto_event "\$host" "\$verdict" "\$hold"$' 2
+counted "every veto is an event" '^ +pin_veto_event "\$host" "\$verdict" "\$hold"$' 3
 counted "no veto is left on log() alone" '^ +log "\$host: \$verdict -- VETOED' 0
 wired "the veto event is throttled per host" 'throttled_event "\$STATE_DIR/pinveto-\$host" "\$cls" "\$sev" pin-hold-veto'
 wired "an unexplained beacon read failure is a throttled event too" \
