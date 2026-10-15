@@ -2965,6 +2965,19 @@ unheld_now() {
   fi
 }
 
+# withdraw_idle <id> -- delete_runner for a runner that is waiting for a job,
+# tried at most once a minute after a failure (#1605). Each attempt reads the App
+# key and mints a token, and the two withdraw paths below poll every 5s: with
+# GitHub degraded or answering 403, every idle slot of every host would do that
+# twelve times a minute. A 422 (a job was just assigned) backs off too, harmlessly
+# -- that runner is busy until the agent exits.
+withdraw_idle() { # <id>
+  [ "$(date +%s)" -ge "$retry_at" ] || return 1
+  delete_runner "$1" && return 0
+  retry_at=$(($(date +%s) + 60))
+  return 1
+}
+
 # Prints why this slot must not register right now; false when it may.
 gate() {
   local d c
@@ -3049,6 +3062,7 @@ while :; do
   dirty=0
   withdrawn=0
   relabel=0
+  retry_at=0
   while agent_up; do
     sleep 5
     if [ "$withdrawn" -gt 0 ]; then
@@ -3067,7 +3081,7 @@ while :; do
     # A minute without a marker and without a job: the marker was withdrawn
     # while the agent waited. GitHub refuses the delete if a job was assigned in
     # the meantime, and then the job runs and its own hooks decide.
-    if [ "$dirty" -ge 12 ] && delete_runner "$id"; then
+    if [ "$dirty" -ge 12 ] && withdraw_idle "$id"; then
       log "slot $idx: its clean marker was withdrawn while runner $id waited for a job -- runner withdrawn so the slot is reset before it takes one"
       withdrawn=1
       continue
@@ -3079,7 +3093,7 @@ while :; do
     # capacity those anchors cannot see. Withdrawn through the same 422-guarded
     # delete as above -- a job already assigned keeps its runner, and ITS end
     # re-mints under the new answer.
-    if [ "$(unheld_now)" != "$unheld" ] && ! job_running && delete_runner "$id"; then
+    if [ "$(unheld_now)" != "$unheld" ] && ! job_running && withdraw_idle "$id"; then
       log "slot $idx: the host's pin hold changed while runner $id waited -- withdrawn to register again with ci-unheld=$((1 - unheld))"
       withdrawn=1
       relabel=1

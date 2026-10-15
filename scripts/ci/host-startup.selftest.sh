@@ -1369,7 +1369,7 @@ has_slot_sweep() { # <file>
   matches "$code" 'cg=\$\(systemctl show -p ControlGroup --value "\$UNIT"' || return 1
   matches "$code" '\[ "\$c" = Runner\.Worker \] && return 0' || return 1
   ! matches "$code" "pgrep[^#]*Runner" || return 1
-  matches "$code" 'if \[ "\$dirty" -ge 12 \] && delete_runner "\$id"; then' || return 1
+  matches "$code" 'if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then' || return 1
   matches "$code" '\[ "\$withdrawn" -lt 14 \] \|\| systemctl stop "\$UNIT"' || return 1
   counts "$code" 'systemctl stop "\$UNIT"' 1 || return 1
 
@@ -2046,6 +2046,8 @@ host_admissible_behaves() { # <file>
   rec "$root/edge" r1 1000 0 "$boot";  want 0 "$root/edge"     || ok_all=1   # expiry == now is expired (admission uses -gt)
   rec "$root/old" r1 2000 1 b0;        want 0 "$root/old"      || ok_all=1   # earlier boot: admission reads it as absent
   printf 'garbage\n' >"$root/bad";      want 0 "$root/bad"      || ok_all=1   # unparseable: admission reads it as absent
+  printf 'run=r1\nslot=2\nexpiry=2000\nreserve=1\nboot=%s\n' "$boot" >"$root/nottl"
+  want 0 "$root/nottl"                                  || ok_all=1   # no ttl: admission's parse refuses it, so absent (#1605)
   rm -rf -- "$root"
   [ "$ok_all" = 0 ] || return 1
 
@@ -2058,12 +2060,61 @@ host_admissible_behaves() { # <file>
   matches "$code" '^  unheld=\$\(unheld_now\)$' || return 1
   matches "$code" 'id=\$\(mint_jit "\$idx" "\$ENVFILE" "\$unheld"\)' || return 1
   # a stale answer on an idle runner is withdrawn, never one with a job
-  matches "$code" 'if \[ "\$\(unheld_now\)" != "\$unheld" \] && ! job_running && delete_runner "\$id"; then' || return 1
+  matches "$code" 'if \[ "\$\(unheld_now\)" != "\$unheld" \] && ! job_running && withdraw_idle "\$id"; then' || return 1
   # a relabel skips the reset only while the clean marker stands
   matches "$code" 'if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then' || return 1
   return 0
 }
 
+# A FAILING WITHDRAW IS NOT RETRIED EVERY 5 SECONDS (#1605). Both idle-runner
+# withdraw paths poll every 5s, and each delete reads the App key and mints a
+# token; with GitHub degraded or answering 403, every idle slot of the fleet
+# would do that twelve times a minute. withdraw_idle is extracted and RUN with a
+# stubbed clock and delete: a failure blocks further attempts for 60s, and only
+# for 60s.
+withdraw_backs_off() { # <file>
+  local body code
+  body=$(extract_fn "$1" withdraw_idle)
+  case "$body" in
+    *retry_at*) : ;;
+    *) return 1 ;;
+  esac
+  (
+    eval "$body"
+    # shellcheck disable=SC2034  # retry_at is read by the eval'd body
+    t=1000 calls=0 answer=1 retry_at=0
+    # shellcheck disable=SC2317  # the stubs are called by the eval'd body
+    date() { echo "$t"; }
+    # shellcheck disable=SC2317
+    delete_runner() { calls=$((calls + 1)); return "$answer"; }
+    withdraw_idle 7 && exit 1                        # GitHub refuses
+    [ "$calls" = 1 ] || exit 1
+    t=1030; withdraw_idle 7 && exit 1                # inside the minute: no call
+    [ "$calls" = 1 ] || exit 1
+    t=1059; withdraw_idle 7 && exit 1
+    [ "$calls" = 1 ] || exit 1
+    t=1060; answer=0; withdraw_idle 7 || exit 1      # a minute on: tried, and it works
+    [ "$calls" = 2 ] || exit 1
+    t=1061; withdraw_idle 7 || exit 1                # a success arms no back-off
+    [ "$calls" = 3 ] || exit 1
+  ) || return 1
+  code=$(code_of "$1")
+  # shipped in the loop's own script, and armed afresh for each runner
+  matches "$code" '^withdraw_idle\(\) \{ # <id>$' || return 1
+  # ... immediately before the wait for THIS runner, so no runner inherits the
+  # previous one's back-off
+  printf '%s\n' "$code" | grep -A1 -E '^  retry_at=0$' | grep -qE '^  while agent_up; do$' || return 1
+  # neither idle withdraw path calls the delete directly
+  matches "$code" 'if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then' || return 1
+  matches "$code" '! job_running && withdraw_idle "\$id"; then' || return 1
+  return 0
+}
+
+if withdraw_backs_off "$SCRIPT"; then
+  ok
+else
+  bad "an idle runner's failing withdraw is retried every 5s -- with GitHub degraded every idle slot reads the App key and mints a token twelve times a minute (#1605)"
+fi
 if host_admissible_behaves "$SCRIPT"; then
   ok
 else
@@ -2392,10 +2443,18 @@ mutate "an earlier boot is hidden"           's@  \[ "\$boot" = "\$3" \] || retu
 mutate "a garbled record is hidden"          '/^host_admissible() {/,/^}/s@    \*) return 0 ;;@    *) return 1 ;;@' host_admissible_behaves
 mutate "expiry compared inclusively"         's@  \[ "\$expiry" -gt "\$2" \] && return 1@  [ "$expiry" -ge "$2" ] \&\& return 1@' host_admissible_behaves
 mutate "no record reads as held"             's@  \[ -f "\$1" \] || return 0@  [ -f "$1" ] || return 1@'           host_admissible_behaves
+mutate "a record without a ttl is held"      '/^host_admissible() {/,/^}/{s@"\$run:\$slot:\$ttl:\$expiry:\$reserve"@"$run:$slot:$expiry:$reserve"@;s@?\*:\[0-9\]\*:\[0-9\]\*:\[0-9\]\*:\[01\])@?*:[0-9]*:[0-9]*:[01])@;}' host_admissible_behaves
 mutate "the loop never ships the predicate"  's@jit_labels_json mint_jit delete_runner host_admissible$@jit_labels_json mint_jit delete_runner@' host_admissible_behaves
 mutate "the mint ignores the answer"         's@id=\$(mint_jit "\$idx" "\$ENVFILE" "\$unheld")@id=$(mint_jit "$idx" "$ENVFILE")@' host_admissible_behaves
-mutate "a stale label is never withdrawn"    '/if \[ "\$(unheld_now)" != "\$unheld" \] && ! job_running && delete_runner "\$id"; then/d' host_admissible_behaves
-mutate "a relabel withdraws a busy runner"   's@\] && ! job_running && delete_runner "\$id"; then@] \&\& delete_runner "$id"; then@' host_admissible_behaves
+mutate "a stale label is never withdrawn"    '/if \[ "\$(unheld_now)" != "\$unheld" \] && ! job_running && withdraw_idle "\$id"; then/d' host_admissible_behaves
+mutate "a relabel withdraws a busy runner"   's@\] && ! job_running && withdraw_idle "\$id"; then@] \&\& withdraw_idle "$id"; then@' host_admissible_behaves
+mutate "a failed withdraw never backs off"     '/^withdraw_idle() {/,/^}/s@^  retry_at=\$((\$(date +%s) + 60))$@  :@' withdraw_backs_off
+mutate "the back-off never lifts"            '/^withdraw_idle() {/,/^}/s@-ge "\$retry_at"@-ge "$((retry_at + 600))"@' withdraw_backs_off
+mutate "the back-off holds a success"        '/^withdraw_idle() {/,/^}/s@delete_runner "\$1" && return 0@delete_runner "$1" \&\& { retry_at=$(($(date +%s) + 60)); return 0; }@' withdraw_backs_off
+mutate "the dirty path bypasses the back-off" 's@if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then@if [ "$dirty" -ge 12 ] \&\& delete_runner "$id"; then@' withdraw_backs_off
+mutate "the relabel bypasses the back-off"   's@! job_running && withdraw_idle "\$id"; then@! job_running \&\& delete_runner "$id"; then@' withdraw_backs_off
+mutate "a new runner inherits the back-off"  '/^  retry_at=0$/d' withdraw_backs_off
+mutate "the back-off is armed once per boot" '/^  retry_at=0$/d;/^need_reset=1$/a\  retry_at=0' withdraw_backs_off
 mutate "a relabel skips a needed reset"      's@if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then@if [ "$relabel" = 1 ]; then@' host_admissible_behaves
 mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
 mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves
@@ -2532,7 +2591,7 @@ mutate "the loops never started"          's|systemctl start "ci-slot-loop@\$i\.
 mutate "a dead loop stays dead"           's@^Restart=always$@Restart=no@'                                     has_slot_sweep
 mutate "dirty alone is enough to stop"    's@! job_running; then@true; then@'                                   has_slot_sweep
 mutate "a job is a name in the process table" 's@cg=\$(systemctl show -p ControlGroup --value "\$UNIT"@cg=$(pgrep -f Runner@' has_slot_sweep
-mutate "a runner stopped while assigned"  's@ \&\& delete_runner "\$id"; then@; then@'                          has_slot_sweep
+mutate "a runner stopped while assigned"  's@ \&\& withdraw_idle "\$id"; then@; then@'                          has_slot_sweep
 mutate "one sample is enough to stop"     's@-ge 12 \]@-ge 0 ]@'                                               has_slot_sweep
 mutate "reset under a previous loop's job" 's@^while agent_up; do sleep 5; done$@:@'                          has_slot_sweep
 mutate "the gate asked once"              '0,/if why=\$(gate); then/s@if why=\$(gate); then@if false; then@'     has_slot_sweep
