@@ -506,11 +506,10 @@ a re-run appears to fix.
 
 **What the opt-in does.** Pass `require-unheld-host: true` to the anchor. The
 anchor job then also asks for the `ci-unheld` label, and lands only on a host
-that would admit this run's hold:
+that would admit this run's hold. Add it to the `with:` of the §1 call, pinned
+to the SHA of v5.151.0 or later (earlier anchors reject the unknown input):
 
 ```yaml
-  anchor:
-    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@<sha> # v5.x
     with:
       repo-label: <Repo>
       require-unheld-host: true
