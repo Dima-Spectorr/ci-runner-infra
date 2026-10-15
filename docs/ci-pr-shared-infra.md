@@ -496,6 +496,87 @@ GitHub already matches on. These were rejected:
   a runner, not *which event* triggered the run, so it cannot separate push from
   pull_request inside one workflow.
 
+### Reservation-aware anchors: `require-unheld-host` (#1600)
+
+**The problem.** The anchor is unpinned, so it can land on a host another run
+already holds. `ci-pin-hold` then answers `pinned=0` and the run continues
+unpinned (§2). For most runs that is a slower run. For a run whose work **must**
+share one host — an isolated job that cannot run unpinned — it is a failure that
+a re-run appears to fix.
+
+**What the opt-in does.** Pass `require-unheld-host: true` to the anchor. The
+anchor job then also asks for the `ci-unheld` label, and lands only on a host
+that would admit this run's hold:
+
+```yaml
+  anchor:
+    uses: Dima-Spectorr/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@<sha> # v5.x
+    with:
+      repo-label: <Repo>
+      require-unheld-host: true
+```
+
+**What a host does.** Each Linux slot registers `ci-unheld` while its host would
+admit a **new** run's hold, and drops it while it would not. The test is the same
+one `ci-pin-hold` applies (`host_admissible` in `host-startup.sh`):
+
+| The host's pin record | `ci-unheld` |
+|---|---|
+| none, unreadable, or written in an earlier boot | yes |
+| a live hold (pin or reservation) | no |
+| an expired pin | yes |
+| an expired reservation that is not yet released | no — admission refuses it until the sweep finishes |
+
+The slot loop checks every 5 seconds while a runner waits for a job. When the
+answer changes, the idle runner is withdrawn and registered again with the new
+label set. The withdraw uses the same delete that GitHub refuses (422) once a
+job is assigned, so a runner that already has a job keeps it. A slot withdrawn
+only to relabel skips the slot reset, unless its clean marker was withdrawn too.
+Each hold change costs one runner delete and one JIT mint per idle slot.
+
+**The controller** counts a queued job that asks for `ci-unheld` as Linux demand
+(`P_MATCH_JSON`). So when every host is held, the waiting anchor scales the pool
+out instead of waiting for a hold to expire. Windows hosts never register the
+label.
+
+**What it does not change.**
+
+- **Admission stays in `ci-pin-hold`.** Two anchors can reach the same free host
+  in the seconds before its slots relabel. The second one still gets
+  `pinned=0`. A run that opted in must treat `pinned != 1` as a failure:
+  ```yaml
+      - if: needs.anchor.outputs.pinned != '1'
+        run: |
+          echo "::error::no host could be pinned"
+          exit 1
+  ```
+- **Only the anchor asks for the label.** Once the run holds the host, that
+  host's slots drop `ci-unheld`. The run's other jobs reach the host through the
+  `runs-on` the anchor publishes, which never contains `ci-unheld`.
+- **The wait is bounded.** If the pool can scale out, the anchor waits for a new
+  host. At `max_hosts`, it waits for a hold to end; the longest hold a host
+  grants is 2h (`PIN_MAX_TTL`). The anchor job's own `timeout-minutes` does not
+  count queue time.
+- **Forks** run on the hosted runner, as before; the input is ignored.
+
+**Rollout.** The label is registered by host bytes, not by the workflow. Until a
+pool's hosts run a release that carries it, no runner has `ci-unheld`. An anchor
+that opts in then queues with no runner to match it. Check before you opt in:
+
+```sh
+gh api repos/<owner>/<repo>/actions/runners --paginate \
+  -q '.runners[] | select(any(.labels[]; .name == "ci-unheld")) | .name'
+```
+
+An empty answer on a pool with a free host means its hosts predate the label.
+
+**Why relabelling is acceptable here, when it was rejected for `background`.**
+The objection to relabelling `background` was that a job can be assigned in
+between, which is the very case the label was meant to prevent. Here, a job
+assigned in between is caught by admission (`pinned=0`, above), so the label
+only has to be right almost always, not always. No new permission is needed
+either: a slot already deletes and mints its own JIT runner on every pass.
+
 ## 3. The infrastructure owner job
 
 Exactly one job in the workflow brings the stack up, and it is the anchor.

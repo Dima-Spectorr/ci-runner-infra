@@ -1977,6 +1977,16 @@ slot_labels_behaves() { # <file>
   # shellcheck disable=SC2034
   got=$(LABELS="self-hosted,pool"; BACKGROUND_SLOTS=1; eval "$body"; slot_labels 1)
   [ "$got" = "self-hosted,pool,background" ] || return 1
+  # `ci-unheld` (#1600) only when the loop says the host is admissible, on a
+  # background slot and an interactive one alike, and never by default.
+  # shellcheck disable=SC2034
+  got=$(
+    LABELS="self-hosted,pool,host-x"
+    BACKGROUND_SLOTS=1
+    eval "$body"
+    printf '%s|%s|%s|%s' "$(slot_labels 1 1)" "$(slot_labels 2 1)" "$(slot_labels 2 0)" "$(slot_labels 2)"
+  )
+  [ "$got" = "self-hosted,pool,host-x,background,ci-unheld|self-hosted,pool,host-x,ci-unheld|self-hosted,pool,host-x|self-hosted,pool,host-x" ] || return 1
 
   code=$(code_of "$1")
   # the split comes from the module, not a literal on the host
@@ -1986,8 +1996,8 @@ slot_labels_behaves() { # <file>
   matches "$code" '\[ "\$INTERACTIVE_SLOTS" -lt "\$SLOTS" \]' || return 1
   matches "$code" '\|\| die "ci-interactive-slots \(' || return 1
   # every slot registers ITS list, never the pool's
-  matches "$code" '^  all="self-hosted,Linux,X64,\$\(slot_labels "\$1"\)"$' || return 1
-  matches "$code" 'labels=\$\(jit_labels_json "\$idx"\) \|\| return 1' || return 1
+  matches "$code" '^  all="self-hosted,Linux,X64,\$\(slot_labels "\$1" "\$\{2:-0\}"\)"$' || return 1
+  matches "$code" 'labels=\$\(jit_labels_json "\$idx" "\$\{3:-0\}"\) \|\| return 1' || return 1
   ! matches "$code" '--labels "\$LABELS"' || return 1
   # and the anchor can size a background fan-out from it
   matches "$code" '^Environment=CI_HOST_BACKGROUND_SLOTS=\$BACKGROUND_SLOTS$'
@@ -1997,6 +2007,66 @@ if slot_labels_behaves "$SCRIPT"; then
   ok
 else
   bad "the background label is not on exactly the lower slots of a host -- on every slot, push runs take the slots pull-request jobs wait for; on none, push jobs queue against a label nothing carries"
+fi
+
+# RESERVATION-AWARE PLACEMENT (#1600). A slot carries `ci-unheld` while its host
+# would admit a NEW run's hold, and a reservation-aware anchor asks for it. The
+# predicate must be the exact mirror of ci-pin-hold's admission: advertising a
+# host admission then refuses is the very collision the label exists to remove
+# (`foreign_live`), and hiding one admission would grant starves the anchor.
+#
+# So `host_admissible` is extracted and RUN against every record shape
+# ci-pin-hold distinguishes, and the slot loop is pinned to mint with its answer
+# and to withdraw an idle runner whose answer went stale.
+host_admissible_behaves() { # <file>
+  local body code root boot=b1 now=1000
+  body=$(extract_fn "$1" host_admissible)
+  case "$body" in
+    *expiry*) : ;;
+    *) return 1 ;;
+  esac
+  root=$(mktemp -d) || return 1
+  [ -d "$root" ] || return 1
+  rec() { # <file> <run> <expiry> <reserve> <boot>
+    printf 'run=%s\nslot=2\nttl=600\nexpiry=%s\nreserve=%s\nboot=%s\n' "$2" "$3" "$4" "$5" >"$1"
+  }
+  # want <0|1> <record-file> -- 0 admissible, 1 not
+  want() {
+    local rc
+    ( eval "$body"; host_admissible "$2" "$now" "$boot" ); rc=$?
+    [ "$rc" = "$1" ]
+  }
+  local ok_all=0
+  want 0 "$root/absent"                                 || ok_all=1   # no hold at all
+  rec "$root/live" r1 2000 0 "$boot";  want 1 "$root/live"     || ok_all=1   # foreign live pin
+  rec "$root/liver" r1 2000 1 "$boot"; want 1 "$root/liver"    || ok_all=1   # foreign live reservation
+  rec "$root/exp" r1 900 0 "$boot";    want 0 "$root/exp"      || ok_all=1   # expired pin: free
+  rec "$root/expr" r1 900 1 "$boot";   want 1 "$root/expr"     || ok_all=1   # expired, unswept reservation: NOT free
+  rec "$root/edge" r1 1000 0 "$boot";  want 0 "$root/edge"     || ok_all=1   # expiry == now is expired (admission uses -gt)
+  rec "$root/old" r1 2000 1 b0;        want 0 "$root/old"      || ok_all=1   # earlier boot: admission reads it as absent
+  printf 'garbage\n' >"$root/bad";      want 0 "$root/bad"      || ok_all=1   # unparseable: admission reads it as absent
+  rm -rf -- "$root"
+  [ "$ok_all" = 0 ] || return 1
+
+  code=$(code_of "$1")
+  # the loop asks the predicate about THE record ci-pin-hold writes, this boot
+  matches "$code" 'host_admissible "\$PIN_DIR/host" "\$\(date \+%s\)" "\$\(cat /proc/sys/kernel/random/boot_id' || return 1
+  # the predicate is shipped into the loop
+  matches "$code" 'jit_labels_json mint_jit delete_runner host_admissible$' || return 1
+  # every mint carries the answer
+  matches "$code" '^  unheld=\$\(unheld_now\)$' || return 1
+  matches "$code" 'id=\$\(mint_jit "\$idx" "\$ENVFILE" "\$unheld"\)' || return 1
+  # a stale answer on an idle runner is withdrawn, never one with a job
+  matches "$code" 'if \[ "\$\(unheld_now\)" != "\$unheld" \] && ! job_running && delete_runner "\$id"; then' || return 1
+  # a relabel skips the reset only while the clean marker stands
+  matches "$code" 'if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then' || return 1
+  return 0
+}
+
+if host_admissible_behaves "$SCRIPT"; then
+  ok
+else
+  bad "ci-unheld does not mirror ci-pin-hold's admission, or the slot loop does not keep it current -- a reservation-aware anchor lands on a host another run holds (#1600)"
 fi
 
 # Ubuntu's unattended upgrades, off before any slot unit starts (#1480). Left
@@ -2307,9 +2377,25 @@ mutate "host totals dropped"          '/^Environment=CI_HOST_VCPUS=/d'          
 mutate "slot count dropped"           '/^Environment=CI_HOST_SLOTS=/d'                            has_slot_share
 
 mutate "background on every slot"            's@if \[ "\$1" -le "\$BACKGROUND_SLOTS" \]; then@if true; then@'   slot_labels_behaves
-mutate "background on no slot"               "s@'%s,background'@'%s'@"                                              slot_labels_behaves
-mutate "every slot registers the pool list"  's@all="self-hosted,Linux,X64,\$(slot_labels "\$1")"@all="$LABELS"@' slot_labels_behaves
-mutate "the minted labels ignore the slot"   's@labels=\$(jit_labels_json "\$idx") || return 1@labels=x@' slot_labels_behaves
+mutate "background on no slot"               's@    out="\$out,background"@    :@'                                    slot_labels_behaves
+mutate "every slot registers the pool list"  's@all="self-hosted,Linux,X64,\$(slot_labels "\$1" "\${2:-0}")"@all="$LABELS"@' slot_labels_behaves
+mutate "the minted labels ignore the slot"   's@labels=\$(jit_labels_json "\$idx" "\${3:-0}") || return 1@labels=x@' slot_labels_behaves
+mutate "ci-unheld on every slot"             's@  if \[ "\${2:-0}" = 1 \]; then@  if true; then@'                   slot_labels_behaves
+mutate "ci-unheld on no slot"                's@    out="\$out,ci-unheld"@    :@'                                     slot_labels_behaves
+mutate "the minted labels ignore unheld"     's@all="self-hosted,Linux,X64,\$(slot_labels "\$1" "\${2:-0}")"@all="self-hosted,Linux,X64,$(slot_labels "$1")"@' slot_labels_behaves
+
+mutate "a live hold is advertised"           's@  \[ "\$expiry" -gt "\$2" \] && return 1@  :@'                       host_admissible_behaves
+mutate "an unswept reservation is advertised" 's@  \[ "\$reserve" = 1 \] && return 1@  :@'                           host_admissible_behaves
+mutate "an expired pin is hidden"            's@  \[ "\$reserve" = 1 \] && return 1@  return 1@'                     host_admissible_behaves
+mutate "an earlier boot is hidden"           's@  \[ "\$boot" = "\$3" \] || return 0@  [ "$boot" = "$3" ] || return 1@' host_admissible_behaves
+mutate "a garbled record is hidden"          '/^host_admissible() {/,/^}/s@    \*) return 0 ;;@    *) return 1 ;;@' host_admissible_behaves
+mutate "expiry compared inclusively"         's@  \[ "\$expiry" -gt "\$2" \] && return 1@  [ "$expiry" -ge "$2" ] \&\& return 1@' host_admissible_behaves
+mutate "no record reads as held"             's@  \[ -f "\$1" \] || return 0@  [ -f "$1" ] || return 1@'           host_admissible_behaves
+mutate "the loop never ships the predicate"  's@jit_labels_json mint_jit delete_runner host_admissible$@jit_labels_json mint_jit delete_runner@' host_admissible_behaves
+mutate "the mint ignores the answer"         's@id=\$(mint_jit "\$idx" "\$ENVFILE" "\$unheld")@id=$(mint_jit "$idx" "$ENVFILE")@' host_admissible_behaves
+mutate "a stale label is never withdrawn"    '/if \[ "\$(unheld_now)" != "\$unheld" \] && ! job_running && delete_runner "\$id"; then/d' host_admissible_behaves
+mutate "a relabel withdraws a busy runner"   's@\] && ! job_running && delete_runner "\$id"; then@] \&\& delete_runner "$id"; then@' host_admissible_behaves
+mutate "a relabel skips a needed reset"      's@if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then@if [ "$relabel" = 1 ]; then@' host_admissible_behaves
 mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
 mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves
 mutate "interactive count never read"        '/^INTERACTIVE_SLOTS=\$(md /d'                                         slot_labels_behaves

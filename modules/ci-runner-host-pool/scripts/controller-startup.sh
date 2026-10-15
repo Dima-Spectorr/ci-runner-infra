@@ -593,10 +593,15 @@ while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   # whose only work was a push run would never buy the host that runs it.
   # Linux only, like the slots that carry it: a Windows host registers no such
   # label, and answering for it there would buy Windows hosts for Linux work.
+  #
+  # `ci-unheld` (#1600) is the fifth, for the same reason: a Linux slot carries
+  # it while its host would admit a new run's hold, and a reservation-aware
+  # anchor asks for it. Left out, an anchor queued because every host is held
+  # is nobody's demand, and the pool never buys the free host it is waiting for.
   P_MATCH_JSON["$p_name"]=$(printf '%s' "$p_labels" | jq -R -c --arg os "$p_hostos" '
     (if ($os | ascii_downcase) == "windows" then "Windows" else "Linux" end) as $osl
     | split(",") + ["self-hosted", $osl, "X64"]
-      + (if $osl == "Linux" then ["background"] else [] end)
+      + (if $osl == "Linux" then ["background", "ci-unheld"] else [] end)
     | map(select(length > 0) | ascii_downcase) | unique')
   P_MATCH_CSV["$p_name"]=$(printf '%s' "${P_MATCH_JSON[$p_name]}" | jq -r 'join(",")')
 done <<<"$pool_rows"
