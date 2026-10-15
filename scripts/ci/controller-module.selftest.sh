@@ -508,7 +508,8 @@ check "and restarts its partial clock" 1 \
 # shellcheck disable=SC2016
 check "and gives its recycle budget back" 1 \
   "$(printf '%s\n' "$_pre_reserve" | grep -cF 'recycling=$((recycling - 1))')"
-check "only when the gate reads a hold" 1 \
+# 2: this veto and the cordon/retire veto, both above the reserve arm.
+check "only when the gate reads a hold" 2 \
   "$(printf '%s\n' "$_pre_reserve" | grep -cF 'hold:*)')"
 check "the base name is not a descriptor key" 0 \
   "$(printf '%s\n' "$descriptor" | grep -cx 'instance_base_name')"
