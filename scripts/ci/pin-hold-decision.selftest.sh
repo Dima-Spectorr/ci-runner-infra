@@ -542,7 +542,7 @@ counted "both gates classify the namespace 404" \
 
 # The veto reaches Cloud Logging. log() stops at this VM's own file, which is
 # why a veto that never lifted was invisible on three pools (#1384).
-counted "every veto is an event" '^ +pin_veto_event "$host" "$verdict" "$hold"$' 3
+counted "every veto is an event" '^ +pin_veto_event "\$host" "\$verdict" "\$hold"$' 3
 counted "no veto is left on log() alone" '^ +log "\$host: \$verdict -- VETOED' 0
 wired "the veto event is throttled per host" 'throttled_event "\$STATE_DIR/pinveto-\$host" "\$cls" "\$sev" pin-hold-veto'
 wired "an unexplained beacon read failure is a throttled event too" \
