@@ -2101,7 +2101,9 @@ withdraw_backs_off() { # <file>
   code=$(code_of "$1")
   # shipped in the loop's own script, and armed afresh for each runner
   matches "$code" '^withdraw_idle\(\) \{ # <id>$' || return 1
-  matches "$code" '^  retry_at=0$' || return 1
+  # ... immediately before the wait for THIS runner, so no runner inherits the
+  # previous one's back-off
+  printf '%s\n' "$code" | grep -A1 -E '^  retry_at=0$' | grep -qE '^  while agent_up; do$' || return 1
   # neither idle withdraw path calls the delete directly
   matches "$code" 'if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then' || return 1
   matches "$code" '! job_running && withdraw_idle "\$id"; then' || return 1
@@ -2452,6 +2454,7 @@ mutate "the back-off holds a success"        '/^withdraw_idle() {/,/^}/s@delete_
 mutate "the dirty path bypasses the back-off" 's@if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then@if [ "$dirty" -ge 12 ] \&\& delete_runner "$id"; then@' withdraw_backs_off
 mutate "the relabel bypasses the back-off"   's@! job_running && withdraw_idle "\$id"; then@! job_running \&\& delete_runner "$id"; then@' withdraw_backs_off
 mutate "a new runner inherits the back-off"  '/^  retry_at=0$/d' withdraw_backs_off
+mutate "the back-off is armed once per boot" '/^  retry_at=0$/d;/^need_reset=1$/a\  retry_at=0' withdraw_backs_off
 mutate "a relabel skips a needed reset"      's@if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then@if [ "$relabel" = 1 ]; then@' host_admissible_behaves
 mutate "interactive slots ignored"           's@^BACKGROUND_SLOTS=\$((10#\$SLOTS - 10#\$INTERACTIVE_SLOTS))$@BACKGROUND_SLOTS=$SLOTS@' slot_labels_behaves
 mutate "a bad interactive count is run"      's@|| die "ci-interactive-slots (@|| log "ci-interactive-slots (@'     slot_labels_behaves

@@ -562,8 +562,10 @@ label.
   `ci-unheld`, and the anchor lands on another free host, or waits for one.
   `runs-on` requires every label it lists, so an anchor cannot ask for "a free
   host or my own". The re-run is still pinned, on the new host. The old host's
-  hold is never renewed again, because renewal is per run and per host, so it
-  lapses within its TTL (at most 2h). Until then, that host serves only this run.
+  hold is renewed only when a job of this run starts there, and the run's jobs
+  now follow the new host's label, so it lapses within its TTL (at most 2h); a
+  reservation is cleared by the next pin sweep after that. Until then, that host
+  serves only this run.
   "Re-run failed jobs" does not re-run a successful anchor and is unaffected.
 - **Forks** run on the hosted runner, as before; the input is ignored.
 
