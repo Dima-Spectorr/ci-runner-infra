@@ -316,11 +316,11 @@ bg_split_ok() { # <jq-program>
 bg_split_ok "$match_prog" && r=yes || r=no
 check "match set: background in the Linux pool's set, not the Windows pool's" yes "$r"
 # shellcheck disable=SC2016
-mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background"\] else \[\] end)/[]/')
+mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background", "ci-unheld"\] else \[\] end)/[]/')
 if [ "$mut" = "$match_prog" ]; then r=stale; elif bg_split_ok "$mut"; then r=missed; else r=caught; fi
 check "mutation: background dropped from every set is caught" caught "$r"
 # shellcheck disable=SC2016
-mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background"\] else \[\] end)/["background"]/')
+mut=$(printf '%s' "$match_prog" | sed 's/(if \$osl == "Linux" then \["background", "ci-unheld"\] else \[\] end)/["background", "ci-unheld"]/')
 if [ "$mut" = "$match_prog" ]; then r=stale; elif bg_split_ok "$mut"; then r=missed; else r=caught; fi
 check "mutation: background added to the Windows set too is caught" caught "$r"
 

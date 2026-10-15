@@ -1373,9 +1373,10 @@ has_slot_sweep() { # <file>
   matches "$code" '\[ "\$withdrawn" -lt 14 \] \|\| systemctl stop "\$UNIT"' || return 1
   counts "$code" 'systemctl stop "\$UNIT"' 1 || return 1
 
-  # After the agent exits: its runner deleted, and the slot reset before the next.
+  # After the agent exits: its runner deleted, and the slot reset before the next
+  # -- unless it was withdrawn only to relabel (#1600) and its clean marker stands.
   matches "$code" '^  delete_runner "\$id" \|\| true$' || return 1
-  matches "$code" '^  need_reset=1$'
+  matches "$code" '^  if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then$'
 }
 
 # --- the host half of a cordon (#948) -----------------------------------------
@@ -2537,7 +2538,7 @@ mutate "reset under a previous loop's job" 's@^while agent_up; do sleep 5; done$
 mutate "the gate asked once"              '0,/if why=\$(gate); then/s@if why=\$(gate); then@if false; then@'     has_slot_sweep
 mutate "a gated runner started anyway"    's@delete_runner "\$id" || log "slot \$idx: could not withdraw runner@: || log "x@' has_slot_sweep
 mutate "the dead agent's runner kept"     's@^  delete_runner "\$id" || true$@  true@'                          has_slot_sweep
-mutate "a second stop path"               's@^  need_reset=1$@  systemctl stop "$UNIT"; need_reset=1@'           has_slot_sweep
+mutate "a second stop path"               's@^  if \[ "\$relabel" = 1 \]@  systemctl stop "$UNIT"; if [ "$relabel" = 1 ]@'           has_slot_sweep
 mutate "the loop cleans its own way"      's@timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx"@rm -rf "$dir"@' has_slot_sweep
 
 # --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
