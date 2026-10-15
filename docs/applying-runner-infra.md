@@ -56,7 +56,7 @@ ref-scoped `principalSet` is how it is bounded. Read the section below.
 
 ```hcl
 module "ci_runner_apply_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.150.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-trigger?ref=v5.150.1"
 
   project_id     = var.project_id
   region         = "<region>"
@@ -173,7 +173,7 @@ done
 ### The WRITE grants, and why they are separate
 
 **Needed only in a root that sets `manage_alert_policies = true`.** Since
-v5.150.0 (#1594) the alert-policies step is OFF by default: the owner does not
+v5.150.1 (#1594) the alert-policies step is OFF by default: the owner does not
 want CI alert email, and turns it on per project only by explicit consent. A
 root that leaves the default needs neither grant below.
 
@@ -426,7 +426,7 @@ repository's README anyway. Anything that *is* a secret stays where it is.
 
 ```hcl
 module "ci_runner_apply_identity" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.150.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-apply-identity?ref=v5.150.1"
 
   project_id             = var.project_id
   name                   = var.pool_name
@@ -543,7 +543,7 @@ provisioner has already run.
 
 ```hcl
 module "ci_host_image_trigger" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.150.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-host-image-trigger?ref=v5.150.1"
 
   project_id   = var.project_id
   region       = "<region>"

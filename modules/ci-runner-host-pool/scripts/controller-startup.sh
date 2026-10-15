@@ -5432,6 +5432,45 @@ tick_pool() {
       "$age" "$REGISTER_GRACE" "$recycling" "$RECYCLE_MAX_UNAVAILABLE" "$cordoned" \
       "$partial_for" "$reserved_for")
 
+    # A SLOT A LIVE RUN HOLDS IS NOT LOST CAPACITY (#1596). A pinned run's hold
+    # stops its slot re-registering for up to the hold's TTL -- "not registering
+    # -- a live run's hold reserves this slot" -- so the host reads `partial` for
+    # the whole hold, and every arm of capacity-lost fires on a slot that is
+    # exactly where its owner left it. The cordon and the retire were already
+    # vetoed below; the reserve was not, and a reserve that cannot progress to a
+    # cordon stays surge demand for the life of the hold. Measured on the
+    # IntegrateIT pool 2026-10-15: ~30 hosts a day replaced, and the MIG held at
+    # max_hosts + recycle_max_unavailable (24 of 20) because the ONLY_UP
+    # autoscaler kept every replacement it was asked for.
+    #
+    # So every capacity-lost verdict asks the hold first. A held host releases
+    # its reservation the way the skip arm does, and its partial clock restarts
+    # -- otherwise the hold's whole TTL is already past the window the moment
+    # it lifts, and the slot's ordinary re-registration races a cordon. The
+    # stale-template arm is untouched: a held host on an old template still
+    # reserves its replacement, as designed.
+    case "$verdict" in
+      *:capacity-lost*)
+        hold=$(pin_hold_gate "$host" "$host_uri")
+        case "$hold" in
+          hold:*)
+            pin_veto_event "$host" "$verdict" "$hold"
+            PIN_HELD=$((PIN_HELD + 1))
+            rm -f "$STATE_DIR/partial-$host"
+            if [ "$reserved_for" -ge 0 ] && [ "$cordoned" -eq 0 ]; then
+              rm -f "$STATE_DIR/reserve-$host"
+              recycling=$((recycling - 1))
+              if [ "$in_set" -eq 1 ]; then
+                recycle_hosts=$((recycle_hosts - 1))
+                recycle_busy=$((recycle_busy - busy))
+              fi
+            fi
+            continue
+            ;;
+        esac
+        ;;
+    esac
+
     # THE PIN HOLD VETO, first half. A cordon is not "less than" a delete here:
     # it deregisters the host's idle agents, and a cordoned host stops answering
     # its own affinity label while the run pinned to it still has jobs to place.

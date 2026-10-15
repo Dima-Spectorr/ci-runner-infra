@@ -488,6 +488,23 @@ check "the orphan reaper is bounded by it" 1 \
 # shellcheck disable=SC2016
 check "the pinned-run rule is bounded by it" 1 \
   "$(grep -cF 'pinned_job_decision "$status" "$labels" "$RUNNER_MATCH_LABELS" "$MIG_BASE"' "$STARTUP")"
+
+# #1596: a slot a live pin hold keeps unregistered is not lost capacity. The
+# veto has to sit BETWEEN the recycle verdict and the reserve arm -- below it,
+# the reserve has already been published as surge -- and it has to release the
+# reservation and restart the partial clock, or the hold only delays the churn.
+# The region stops at the reserve arm, so the skip arm's own release (further
+# down) cannot satisfy these.
+# shellcheck disable=SC2016
+_pre_reserve=$(sed -n '/verdict=\$(recycle_decision "\$status"/,/^      reserve:\*)$/p' "$STARTUP")
+check "a capacity-lost verdict asks the pin hold before the reserve arm" 1 \
+  "$(printf '%s\n' "$_pre_reserve" | grep -cF '*:capacity-lost*)')"
+# shellcheck disable=SC2016
+check "a held capacity-lost host releases its reservation" 1 \
+  "$(printf '%s\n' "$_pre_reserve" | grep -cF 'rm -f "$STATE_DIR/reserve-$host"')"
+# shellcheck disable=SC2016
+check "and restarts its partial clock" 1 \
+  "$(printf '%s\n' "$_pre_reserve" | grep -cF 'rm -f "$STATE_DIR/partial-$host"')"
 check "the base name is not a descriptor key" 0 \
   "$(printf '%s\n' "$descriptor" | grep -cx 'instance_base_name')"
 check "nor a column of the controller module's pools type" 0 \
