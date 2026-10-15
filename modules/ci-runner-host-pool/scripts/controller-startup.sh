@@ -5456,7 +5456,12 @@ tick_pool() {
           hold:*)
             pin_veto_event "$host" "$verdict" "$hold"
             PIN_HELD=$((PIN_HELD + 1))
-            rm -f "$STATE_DIR/partial-$host"
+            # Not for a cordoned host: it reads partial by construction, and a
+            # restarted clock would hold its retire a full window after the
+            # hold lifts.
+            if [ "$cordoned" -eq 0 ]; then
+              rm -f "$STATE_DIR/partial-$host"
+            fi
             if [ "$reserved_for" -ge 0 ] && [ "$cordoned" -eq 0 ]; then
               rm -f "$STATE_DIR/reserve-$host"
               recycling=$((recycling - 1))

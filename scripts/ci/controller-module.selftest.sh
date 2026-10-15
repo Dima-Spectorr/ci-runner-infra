@@ -505,6 +505,11 @@ check "a held capacity-lost host releases its reservation" 1 \
 # shellcheck disable=SC2016
 check "and restarts its partial clock" 1 \
   "$(printf '%s\n' "$_pre_reserve" | grep -cF 'rm -f "$STATE_DIR/partial-$host"')"
+# shellcheck disable=SC2016
+check "and gives its recycle budget back" 1 \
+  "$(printf '%s\n' "$_pre_reserve" | grep -cF 'recycling=$((recycling - 1))')"
+check "only when the gate reads a hold" 1 \
+  "$(printf '%s\n' "$_pre_reserve" | grep -cF 'hold:*)')"
 check "the base name is not a descriptor key" 0 \
   "$(printf '%s\n' "$descriptor" | grep -cx 'instance_base_name')"
 check "nor a column of the controller module's pools type" 0 \
