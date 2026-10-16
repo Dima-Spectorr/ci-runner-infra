@@ -102,7 +102,10 @@ pool_slot_host() {
 # unreadable base means for its budget.
 pool_marker_count() {
   local dir="${1:-}" base="${2:-}" kind f m n=0
-  [ "$#" -ge 2 ] && [ -n "$dir" ] && [ -n "$base" ] || { echo 0; return 0; }
+  if [ "$#" -lt 2 ] || [ -z "$dir" ] || [ -z "$base" ]; then
+    echo 0
+    return 0
+  fi
   shift 2
   for kind in "$@"; do
     for f in "$dir/$kind-"*; do

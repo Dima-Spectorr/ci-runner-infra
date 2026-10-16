@@ -453,6 +453,8 @@ for _list in "$POOL_TF/main.tf" "$ROOT/modules/ci-runner-controller/main.tf"; do
   check "host-ownership.sh is embedded in the controller script: ${_list#"$ROOT"/}" 1 \
     "$(grep -cE '^ +file\(.*/host-ownership\.sh"\),$' "$_list")"
 done
+# A literal $MIG_BASE in the searched text, not an expansion.
+# shellcheck disable=SC2016
 check "and the controller calls it, rather than a prefix glob" yes \
   "$(grep -qF 'pool_owns_host "$MIG_BASE"' "$STARTUP" && echo yes || echo no)"
 
