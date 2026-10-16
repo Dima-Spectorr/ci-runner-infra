@@ -274,6 +274,25 @@ mutate "every quoted string counts as a runner fallback" \
 mutate "a commented block-scalar header no longer opens a block" \
   's@(#\.\*)?@@g'
 
+# 19-24. The Codex findings closed on 2026-10-16 (S2R#2149-#2153, #2170), one
+#        case each: the fix reverted to the behaviour the finding described.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "any needs output counts as a pin again (S2R#2149)" \
+  's@owner_job "$file" "$records" "$pin_ref" </dev/null || pin_bad=1@:@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "invocations counted per direct edge again (S2R#2150)" \
+  's@si_inv="$(invocation_count "$cfile" </dev/null)"@si_inv=1@'
+mutate "an accepted dynamic runner proves Linux by default (S2R#2151)" \
+  's@^linux_pool_proven() {$@linux_pool_proven() { return 0@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "quoted scalars no longer tracked across lines (S2R#2152)" \
+  's@openq = scan($0, "")@openq = ""@'
+mutate "host and band port in separate keys no longer read (S2R#2153)" \
+  's@out("#LOOPBACKBAND", vid, split\["port"\])@pass@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a required input pins whatever the caller passes (#380)" \
+  's@caller_passes_anchor "$abs_in" "$in_name" 0 </dev/null && pins_to_caller=1@pins_to_caller=1@'
+
 }
 
 # --- the worker entry point ---------------------------------------------------
@@ -449,7 +468,7 @@ CASES="$(case_list | wc -l)"
 # asks for: the six cases mutated code that no longer exists, so keeping the
 # floor would have failed the suite for the absence of rules this repository
 # decided to delete.
-FLOOR=19
+FLOOR=25
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
