@@ -94,7 +94,7 @@ locals {
   #
   # Reuse creates NOTHING for the controller: not the account, and not one of
   # its grants. Every controller grant this module writes is either project-level
-  # (metrics, logs, instance-admin, IAP) or on the one App-key secret, so the
+  # (metrics, logs, instance-admin) or on the one App-key secret, so the
   # first identity's copies already cover the second pool. Writing them again
   # from a second resource would put two Terraform resources on one identical
   # binding, where removing either one revokes it for both.
@@ -230,18 +230,6 @@ resource "google_project_iam_member" "compute" {
   count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
   project = var.project_id
   role    = "roles/compute.instanceAdmin.v1"
-  member  = "serviceAccount:${local.controller_email}"
-}
-
-# Unused since #931; kept because the apply SA cannot remove project IAM (403 on destroy) -- removal tracked in #932.
-# The drain proves a host idle from GitHub's `busy` flag (plus the Windows
-# beacon) and never logs in to a host, and runner hosts have no IAP-SSH ingress
-# by default, so this grant opens nothing an automated path uses. An IAM admin
-# removes the binding out of band, then this resource goes with it.
-resource "google_project_iam_member" "controller_iap_tunnel" {
-  count   = var.grant_compute_admin && var.controller_service_account_email == "" ? 1 : 0
-  project = var.project_id
-  role    = "roles/iap.tunnelResourceAccessor"
   member  = "serviceAccount:${local.controller_email}"
 }
 
