@@ -166,23 +166,30 @@ check "pool_select: jobs_per_host is this pool's" \
 
 # --- 2. the marker sweep cannot reach another pool's markers ------------------
 #
-# The guard is a glob against the MIG's baseInstanceName, so it is tested as
-# one: the sweep's own `case` pattern, run over a directory holding two pools'
-# markers with only one pool's hosts alive.
+# The guard is pool_owns_host against the MIG's baseInstanceName — the real
+# helper, sourced — run over a directory holding three pools' markers with only
+# one pool's hosts alive. One of the other two has a base that EXTENDS the
+# ticked pool's with a hyphen (`ci-lin-b`), which the old `"$MIG_BASE"-*` glob
+# covered and swept (#1487).
+OWN="$ROOT/modules/ci-runner-host-pool/scripts/host-ownership.sh"
 sweep_out=$(
   set -uo pipefail
+  # shellcheck disable=SC1090
+  . "$OWN"
   STATE_DIR=$(mktemp -d)
-  # Pool A is the one being ticked. Its host lin-1 is alive; lin-2 is gone.
-  : >"$STATE_DIR/cordon-ci-lin-1"
-  : >"$STATE_DIR/cordon-ci-lin-2"
+  # Pool A is the one being ticked. Its host ab12 is alive; cd34 is gone.
+  : >"$STATE_DIR/cordon-ci-lin-ab12"
+  : >"$STATE_DIR/cordon-ci-lin-cd34"
   # Pool B is not being ticked at all. Its markers are none of A's business —
-  # and regtoken-ci-win-1 records a live registration token in an instance's
+  # and regtoken-ci-win-ab12 records a live registration token in an instance's
   # metadata, so deleting it strands a credential nothing will ever revoke.
-  : >"$STATE_DIR/cordon-ci-win-1"
-  : >"$STATE_DIR/regtoken-ci-win-1"
+  : >"$STATE_DIR/cordon-ci-win-ab12"
+  : >"$STATE_DIR/regtoken-ci-win-ab12"
+  # Pool C's base is `ci-lin-b`: inside A's old prefix, not A's grammar.
+  : >"$STATE_DIR/regtoken-ci-lin-b-ef56"
 
   MIG_BASE="ci-lin"
-  live_hosts="ci-lin-1"
+  live_hosts="ci-lin-ab12"
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/regtoken-*; do
     [ -n "$live_hosts" ] || break
     [ -n "$MIG_BASE" ] || break
@@ -190,7 +197,7 @@ sweep_out=$(
     mname=$(basename "$f")
     mname=${mname#cordon-}
     mname=${mname#regtoken-}
-    case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
+    pool_owns_host "$MIG_BASE" "$mname" || continue
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
       *) rm -f "$f" ;;
@@ -201,9 +208,9 @@ sweep_out=$(
 )
 check "sweep: a dead host's marker in the ticked pool is still collected" \
   "no" \
-  "$(case ",$sweep_out," in *,cordon-ci-lin-2,*) echo yes ;; *) echo no ;; esac)"
+  "$(case ",$sweep_out," in *,cordon-ci-lin-cd34,*) echo yes ;; *) echo no ;; esac)"
 check "sweep: another pool's markers survive a tick they had no part in" \
-  "cordon-ci-lin-1,cordon-ci-win-1,regtoken-ci-win-1" "$sweep_out"
+  "cordon-ci-lin-ab12,cordon-ci-win-ab12,regtoken-ci-lin-b-ef56,regtoken-ci-win-ab12" "$sweep_out"
 
 # And the fail-safe: with no base name — a describe that failed — the sweep must
 # do NOTHING. Guessing is not available to it, and a marker deleted in error is
@@ -229,23 +236,44 @@ check "sweep: a controller that cannot name its MIG sweeps nothing" \
 # The source is checked too, because the two loops above are a copy: a scoping
 # guard that is dropped from the controller must not leave this file green.
 # shellcheck disable=SC2016
-grep -qF 'case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac' "$CTRL" &&
+grep -qF 'pool_owns_host "$MIG_BASE" "$mname" || continue' "$CTRL" &&
   r=yes || r=no
 check "sweep: the controller really carries the scoping guard" yes "$r"
+# And the old prefix glob is gone from it, not merely joined by the new test.
+# shellcheck disable=SC2016
+grep -qF 'case "$mname" in "$MIG_BASE"-*)' "$CTRL" && r=yes || r=no
+check "sweep: the prefix glob that claimed a longer base's markers is gone" no "$r"
 
 # --- 3. the recycle budget is this pool's, not the controller's ---------------
 #
 # `find -name 'cordon-*'` counts every pool's cordons and reservations. With
 # four pools rolling out at once and a budget of one, three of them never start.
-grep -qF "find \"\$STATE_DIR\" -maxdepth 1 \\( -name \"cordon-\$MIG_BASE-*\" -o -name \"reserve-\$MIG_BASE-*\" \\)" "$CTRL" &&
+# A prefix-scoped count still spent this pool's budget on a `<base>-b` pool's
+# rollout (#1487), so the count is pool_marker_count, run here for real.
+# shellcheck disable=SC2016
+grep -qF 'recycling=$(pool_marker_count "$STATE_DIR" "$MIG_BASE" cordon reserve)' "$CTRL" &&
   r=yes || r=no
 check "recycle: the cordon and reserve count is scoped to this pool's MIG" yes "$r"
+recycle_n=$(
+  set -uo pipefail
+  # shellcheck disable=SC1090
+  . "$OWN"
+  STATE_DIR=$(mktemp -d)
+  : >"$STATE_DIR/cordon-ci-lin-ab12"
+  : >"$STATE_DIR/reserve-ci-lin-cd34"
+  : >"$STATE_DIR/cordon-ci-lin-b-ef56"
+  : >"$STATE_DIR/reserve-ci-lin-b-ab12"
+  : >"$STATE_DIR/cordon-ci-win-ab12"
+  pool_marker_count "$STATE_DIR" ci-lin cordon reserve
+  rm -rf "$STATE_DIR"
+)
+check "recycle: a longer base's cordons and reserves are not this pool's budget" 2 "$recycle_n"
 
 # No base name means the budget reads FULLY SPENT. A pool that cannot count its
 # own cordons must not start new ones — the failure mode of the opposite choice
 # is recycling the whole pool while blind.
 # shellcheck disable=SC2016
-r=$(sed -n '/recycling=$(find/,/^  fi$/p' "$CTRL" | grep -c 'recycling="\$RECYCLE_MAX_UNAVAILABLE"')
+r=$(sed -n '/recycling=$(pool_marker_count/,/^  fi$/p' "$CTRL" | grep -c 'recycling="\$RECYCLE_MAX_UNAVAILABLE"')
 check "recycle: an unreadable MIG spends the budget rather than ignoring it" 1 "$r"
 
 # --- 4. the pre-table controller still boots ----------------------------------

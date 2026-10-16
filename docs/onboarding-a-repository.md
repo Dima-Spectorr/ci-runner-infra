@@ -362,11 +362,10 @@ Only the host and agent names change. The runner labels, the `pool` metric
 label, the cache prefix and every resource name stay on `name`, so workflows,
 dashboards and warm caches behave as before.
 
-Two rules, both enforced or stated by the module:
+Any distinct base works, `ci-myrepo-b` included: a controller owns exactly
+`<base>-<4 characters>` and the agents named after those hosts, never a longer
+name that merely starts with its base (#1487).
 
-- **Not `ci-myrepo-b`.** The controller's test is the prefix `<base>-`, so the
-  old controller would still claim `ci-myrepo-b-xxxx` as its own. The plan
-  refuses a base that is the pool name extended by a hyphen, and the reverse.
 - **Set it at creation, not afterwards.** The base name is immutable on a
   managed instance group: changing it on a live pool replaces the group and
   deletes every host at once, mid-job. The old pool keeps its name until it is

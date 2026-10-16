@@ -286,6 +286,7 @@ locals {
   controller_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${path.module}/scripts/drain-decision.sh"),
+    file("${path.module}/scripts/host-ownership.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
     file("${path.module}/scripts/pinned-job-decision.sh"),
     file("${path.module}/scripts/recycle-decision.sh"),
@@ -769,22 +770,12 @@ resource "google_compute_region_instance_group_manager" "hosts" {
   lifecycle {
     ignore_changes = [target_size]
 
-    # A precondition rather than a variable `validation` for the reason given on
-    # the host template: it reads two variables, and that needs Terraform 1.9
-    # where this module supports >= 1.5.
-    #
-    # The controller's ownership test is the PREFIX `<base>-`, in three places
-    # (orphan_decision, pinned_job_decision, the marker sweep). `instance_base_name`
-    # exists for two pools that share a pool name — the same labels imply it,
-    # the pool name is one of them — so the other side's base is most likely
-    # that pool name. A base of `<name>-b` is then still inside the other
-    # controller's `<name>-*`, and it goes on reaping these agents and
-    # cancelling these pinned runs: the input set, and nothing changed. The
-    # reverse pairing fails the same way in the other direction.
-    precondition {
-      condition     = local.instance_base_name == var.name || (!startswith(local.instance_base_name, "${var.name}-") && !startswith(var.name, "${local.instance_base_name}-"))
-      error_message = "instance_base_name '${local.instance_base_name}' and pool name '${var.name}' must not be one another extended by a hyphen. A controller recognises its hosts by the prefix '<base>-', so the side holding the shorter name would still claim the other's hosts, reaping their agents and cancelling their pinned runs — the very thing this input is set to prevent. Use a name that shares no such prefix, e.g. 'ci-b-myrepo' beside 'ci-myrepo', not 'ci-myrepo-b'."
-    }
+    # No precondition on the base name. The controller recognises its hosts by
+    # the EXACT grammar `<base>-<4 chars>` (scripts/host-ownership.sh), not by
+    # the prefix `<base>-`, so a base that extends another with a hyphen
+    # (`<name>-b` beside `<name>`) no longer falls inside the other pool's
+    # ownership — and two differently named pools in one repository, which no
+    # plan-time check could see, are bounded the same way (#1487).
   }
 
   update_policy {

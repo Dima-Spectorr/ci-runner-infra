@@ -254,15 +254,15 @@ pinned_job_decision() {
   #    controller looking at a job pinned to a Windows instance must not read
   #    "that host is not in my MIG" as "that host is gone" and cancel somebody's
   #    run over a host it does not own and cannot see. Same join key the orphan
-  #    reaper uses: every instance a pool can create is "<base>-<suffix>".
+  #    reaper uses, from the same helper (host-ownership.sh): every instance a
+  #    pool can create is EXACTLY "<base>-<4>". A prefix test claimed a pool
+  #    whose base extends ours with a hyphen and cancelled its healthy runs.
   local pin_host="${pins#host-}"
   case "$pins" in
     *,*) ;;   # rule 6 handles it, and it must not be short-circuited here
     *)
-      case "$pin_host" in
-        "$base"-*) ;;
-        *) echo "ignore:host $pin_host is not from this pool"; return 0 ;;
-      esac
+      pool_owns_host "$base" "$pin_host" ||
+        { echo "ignore:host $pin_host is not from this pool"; return 0; }
       ;;
   esac
 

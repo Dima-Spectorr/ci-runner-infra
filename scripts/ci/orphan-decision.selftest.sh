@@ -12,6 +12,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
+source "$HERE/../../modules/ci-runner-host-pool/scripts/host-ownership.sh"
+# shellcheck source=/dev/null
 source "$HERE/../../modules/ci-runner-host-pool/scripts/orphan-decision.sh"
 
 PASS=0
@@ -77,7 +79,28 @@ expect keep "a non-slot name is not resolvable to an instance" \
 
 # A host name that merely PREFIXES a live one must not read as alive.
 expect reap "prefix collision does not count as a live host" \
+  "$BASE-abcd-s1" offline 0 "$BASE" "$BASE-abcde,$BASE-abc" 2 2
+# A host suffix that is not the MIG's four characters is not an instance this
+# pool could have created, so its agent is left alone rather than guessed at.
+expect keep "a two-character host suffix is not this pool's instance" \
   "$BASE-ab-s1" offline 0 "$BASE" "$BASE-abcd" 2 2
+
+# --- the name grammar the bound now reads (#1487) -----------------------------
+# Linux JIT slots carry a per-mint hex nonce after the slot number.
+expect reap "a Linux run-once slot with its nonce is resolved to its instance" \
+  "$BASE-0ff6-s1-deadbeef" offline 0 "$BASE" "$BASE-pnph" 2 2
+expect keep "and that slot is alive while its instance is" \
+  "$BASE-0ff6-s1-deadbeef" offline 0 "$BASE" "$BASE-0ff6" 9 2
+expect keep "a nonce that is not hex is not a slot name" \
+  "$BASE-0ff6-s1-zz" offline 0 "$BASE" "" 9 2
+expect keep "a slot number that is not digits is not a slot name" \
+  "$BASE-0ff6-sx" offline 0 "$BASE" "" 9 2
+expect keep "an owned instance name with no slot is not a slot name" \
+  "$BASE-0ff6" offline 0 "$BASE" "" 9 2
+expect keep "the pool's own controller instance is never this pool's agent" \
+  "$BASE-controller-ab12" offline 0 "$BASE" "" 9 2
+expect keep "an upper-case suffix is not a name GCE gives an instance" \
+  "$BASE-0FF6-s1" offline 0 "$BASE" "" 9 2
 
 # --- two pools, one label set, two controllers (#1486) ------------------------
 # A pool being moved to another project exists twice for a while: the same
@@ -101,17 +124,89 @@ expect keep "seen from the other controller, this pool's agents are the foreign 
 expect reap "and that controller reaps its own" \
   "$OTHER-0ff6-s1" offline 0 "$OTHER" "$OTHER-pnph" 9 2
 
-# WHY THE MODULE REFUSES `<pool name>-<anything>` AS A BASE NAME. The bound is a
-# prefix, so a base that merely EXTENDS this one with a hyphen is still inside
-# it: this controller claims the other pool's agent, finds no instance of its
-# own behind it, and reaps a slot that is serving jobs somewhere else. That is
-# the failure the input exists to prevent, reached by the most natural choice of
-# name. The case below is that behaviour, pinned so that nobody relaxes the
-# precondition on the host MIG believing the decision function has their back.
-# If the bound ever becomes an exact match, this flips to `keep` and the
-# precondition can go.
-expect reap "a base that extends ours with a hyphen is still claimed — hence the precondition" \
+# A BASE THAT EXTENDS OURS WITH A HYPHEN (#1487). The bound used to be the prefix
+# `<base>-`, so `<base>-b-0ff6-s1` was inside it: this controller claimed the
+# other pool's agent, found no instance of its own behind it, and reaped a slot
+# that was serving jobs somewhere else. The bound is now the exact grammar
+# `<base>-<4>-s<N>[-<hex>]`, so the other pool's agent is not ours — whichever
+# of the two controllers is asking — and the plan-time precondition that kept
+# such a pair apart is gone.
+expect keep "a base that extends ours with a hyphen is the other pool's, not ours" \
   "$BASE-b-0ff6-s1" offline 0 "$BASE" "$BASE-pnph" 9 2
+expect keep "nor its Linux run-once slot, nonce and all" \
+  "$BASE-b-0ff6-s1-deadbeef" offline 0 "$BASE" "$BASE-pnph" 9 2
+expect keep "a four-character extension is not ours either" \
+  "$BASE-b123-0ff6-s1" offline 0 "$BASE" "" 9 2
+expect reap "while the longer base still reaps its own orphans" \
+  "$BASE-b-0ff6-s1" offline 0 "$BASE-b" "$BASE-b-pnph" 9 2
+expect keep "and does not claim the shorter base's agents" \
+  "$BASE-b0ff-s1" offline 0 "$BASE-b" "" 9 2
+
+# --- the helper itself ----------------------------------------------------------
+# pool_owns_host / pool_slot_host / pool_marker_count are what every other
+# ownership site in the controller calls (the pinned-run rule, the marker sweep,
+# the recycle count, the boot list), so their contract is asserted directly.
+ok() {
+  local desc="$1"
+  shift
+  if "$@"; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  cmd: %s\n' "$desc" "$*"
+  fi
+}
+no() {
+  local desc="$1"
+  shift
+  if "$@"; then
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  cmd: %s (unexpectedly true)\n' "$desc" "$*"
+  else PASS=$((PASS + 1)); fi
+}
+eq() {
+  local desc="$1" want="$2" got="$3"
+  if [ "$want" = "$got" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$desc" "$want" "$got"
+  fi
+}
+
+ok "an instance the MIG could have named is owned" pool_owns_host ci-a ci-a-0ff6
+no "a longer base's instance is not" pool_owns_host ci-a ci-a-b-0ff6
+no "a five-character suffix is not" pool_owns_host ci-a ci-a-0ff6x
+no "a three-character suffix is not" pool_owns_host ci-a ci-a-0ff
+no "an upper-case suffix is not" pool_owns_host ci-a ci-a-0FF6
+no "a suffix holding a hyphen is not" pool_owns_host ci-a ci-a-0f-6
+no "the controller is not" pool_owns_host ci-a ci-a-controller-ab12
+no "the base itself is not" pool_owns_host ci-a ci-a
+no "an empty base owns nothing" pool_owns_host "" -0ff6
+no "a glob character in the base is literal" pool_owns_host 'ci-*' ci-a-0ff6
+no "a different base is not" pool_owns_host ci-b ci-a-0ff6
+
+eq "a Windows slot resolves to its instance" ci-a-0ff6 "$(pool_slot_host ci-a ci-a-0ff6-s2)"
+eq "a Linux JIT slot resolves to its instance" ci-a-0ff6 "$(pool_slot_host ci-a ci-a-0ff6-s12-0a1b2c3d)"
+no "a longer base's slot does not resolve" pool_slot_host ci-a ci-a-b-0ff6-s1
+no "a slot with nothing after -s does not" pool_slot_host ci-a ci-a-0ff6-s
+no "a slot with an empty nonce does not" pool_slot_host ci-a ci-a-0ff6-s1-
+no "a slot with two nonces does not" pool_slot_host ci-a ci-a-0ff6-s1-ab-cd
+no "an instance name alone is not a slot" pool_slot_host ci-a ci-a-0ff6
+eq "a refused slot prints nothing" "" "$(pool_slot_host ci-a ci-a-b-0ff6-s1)"
+
+MDIR=$(mktemp -d)
+trap 'rm -rf "$MDIR"' EXIT
+: >"$MDIR/cordon-ci-a-0ff6"
+: >"$MDIR/reserve-ci-a-pnph"
+: >"$MDIR/cordon-ci-a-b-0ff6"   # the longer base's host: not ours
+: >"$MDIR/reserve-ci-a-b-pnph"  # ditto
+: >"$MDIR/cordon-ci-b-0ff6"     # an unrelated pool
+: >"$MDIR/drain-ci-a-abcd"      # a kind that was not asked for
+mkdir "$MDIR/cordon-ci-a-zzzz"  # not a file
+eq "the recycle count is this pool's own cordons and reserves" 2 \
+  "$(pool_marker_count "$MDIR" ci-a cordon reserve)"
+eq "seen from the longer base, only its own two" 2 \
+  "$(pool_marker_count "$MDIR" ci-a-b cordon reserve)"
+eq "one kind counts only that kind" 1 "$(pool_marker_count "$MDIR" ci-a cordon)"
+eq "an empty base counts nothing" 0 "$(pool_marker_count "$MDIR" "" cordon reserve)"
+eq "a missing directory counts nothing" 0 "$(pool_marker_count "$MDIR/nope" ci-a cordon reserve)"
 
 printf 'orphan-decision selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
