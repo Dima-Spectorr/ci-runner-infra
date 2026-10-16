@@ -379,6 +379,8 @@ guards_destroys_before_apply() {
   # plan step hashes both, and the guard checks that pair — and stops — before
   # the call that reads the JSON. A check after the call, or one that does not
   # exit, binds nothing.
+  # A literal $PWD in a regex, not an expansion.
+  # shellcheck disable=SC2016
   matches "$code" 'sha256sum "\$PWD/tf\.plan" /workspace/\.tf-plan\.json > /workspace/\.tf-plan\.sha256' || return 1
   local verify_n
   verify_n=$(printf '%s\n' "$body" | grep -nE '! sha256sum -c /workspace/\.tf-plan\.sha256; then$' | head -1 | cut -d: -f1)
