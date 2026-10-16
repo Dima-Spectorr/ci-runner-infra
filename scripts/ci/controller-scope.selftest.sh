@@ -1981,24 +1981,27 @@ boot_list() { # <MIG_BASE> <gcloud rc>
     HOST_BOOTS=stale-from-the-last-tick
     declare -A HOST_BORN=([stale]=1) HOST_CORDON_FLAG=([stale]=1)
     timeout() { shift; \"\$@\"; }
-    gcloud() { echo \"\$*\" >>'$dir/calls'; echo 'h1,1,2026-01-01T00:00:00.000-07:00,2026-01-02T00:00:00.000-07:00,1'; return $2; }
+    # The second row is a pool whose base extends ours with a hyphen: inside the
+    # server-side prefix filter, outside the pool (#1487).
+    gcloud() { echo \"\$*\" >>'$dir/calls'; printf '%s\n' 'pool-a-ab12,1,2026-01-01T00:00:00.000-07:00,2026-01-02T00:00:00.000-07:00,1' 'pool-a-b-cd34,2,2026-01-01T00:00:00.000-07:00,2026-01-02T00:00:00.000-07:00,1'; return $2; }
+    . '$ROOT/modules/ci-runner-host-pool/scripts/host-ownership.sh'
     $(fn collect_host_boots)
     $(fn index_host_boots)
     collect_host_boots
-    echo \"rc=\$? boots=[\$HOST_BOOTS] born=\${HOST_BORN[h1]:-none} flag=\${HOST_CORDON_FLAG[h1]:-none} stale=\${HOST_BORN[stale]:-gone}\"
+    echo \"rc=\$? boots=[\$HOST_BOOTS] born=\${HOST_BORN[pool-a-ab12]:-none} flag=\${HOST_CORDON_FLAG[pool-a-ab12]:-none} stale=\${HOST_BORN[stale]:-gone} foreign=\${HOST_BORN[pool-a-b-cd34]:-none}\"
   " 2>&1 | tr '\n' ' '
   printf 'calls=%s' "$(tr '\n' ';' <"$dir/calls" 2>/dev/null)"
   rm -rf "$dir"
 }
 _B2=$(date -d '2026-01-02T00:00:00.000-07:00' +%s)
-check "boot list: one bounded list per pool; age from the later timestamp, flag indexed" \
-  "rc=0 boots=[h1,1,2026-01-01T00:00:00.000-07:00,2026-01-02T00:00:00.000-07:00,1] born=$_B2 flag=1 stale=gone calls=compute instances list --project=test-project --filter=name~^pool-a- --format=$_PROJ;" \
+check "boot list: one bounded list per pool; age from the later timestamp, flag indexed, a longer base's host dropped" \
+  "rc=0 boots=[pool-a-ab12,1,2026-01-01T00:00:00.000-07:00,2026-01-02T00:00:00.000-07:00,1] born=$_B2 flag=1 stale=gone foreign=none calls=compute instances list --project=test-project --filter=name~^pool-a- --format=$_PROJ;" \
   "$(boot_list pool-a 0)"
 check "boot list: a failed list leaves nothing, not last tick's answer" \
-  "rc=0 boots=[] born=none flag=none stale=gone calls=compute instances list --project=test-project --filter=name~^pool-a- --format=$_PROJ;" \
+  "rc=0 boots=[] born=none flag=none stale=gone foreign=none calls=compute instances list --project=test-project --filter=name~^pool-a- --format=$_PROJ;" \
   "$(boot_list pool-a 1)"
 check "boot list: no base name means no call at all, not an unbounded one" \
-  'rc=0 boots=[] born=none flag=none stale=gone calls=' "$(boot_list '' 0)"
+  'rc=0 boots=[] born=none flag=none stale=gone foreign=none calls=' "$(boot_list '' 0)"
 fn collect_host_boots | grep -c 'timeout 60 gcloud compute instances list' >/dev/null && r=yes || r=no
 check "boot list: the call is bounded by a timeout" yes "$r"
 
@@ -2061,7 +2064,7 @@ _tick=$(fn tick_pool)
 _n() { printf '%s\n' "$_tick" | grep -n "$1" | head -1 | cut -d: -f1; }
 _fgt=$(_n '^  forget_restarted_hosts$'); _adp=$(_n '^  adopt_flagged_cordons$')
 # shellcheck disable=SC2016
-_cnt=$(_n 'recycling=\$(find ')
+_cnt=$(_n 'recycling=\$(pool_marker_count ')
 if [ -n "$_fgt" ] && [ -n "$_adp" ] && [ -n "$_cnt" ] && [ "$_fgt" -lt "$_adp" ] && [ "$_adp" -lt "$_cnt" ]; then r=yes
 else r="forget=$_fgt adopt=$_adp count=$_cnt"; fi
 check "adopt: runs after the list and before the recycle budget is counted" yes "$r"

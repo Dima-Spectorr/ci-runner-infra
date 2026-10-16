@@ -8,6 +8,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../modules/ci-runner-host-pool/scripts/host-ownership.sh
+. "$here/../../modules/ci-runner-host-pool/scripts/host-ownership.sh"
 # shellcheck source=../../modules/ci-runner-host-pool/scripts/pinned-job-decision.sh
 . "$here/../../modules/ci-runner-host-pool/scripts/pinned-job-decision.sh"
 
@@ -72,8 +74,13 @@ expect ignore: "a bracket expression is refused too" \
 # --- membership is fenced, not substring --------------------------------------
 expect ignore: "a job label that merely EXTENDS one of ours is not one of ours" \
   queued "self-hosted,linux-arm64" "$POOL" "$BASE" "$LIVE" 0 300
-expect orphan: "a pin that is a PREFIX of a live host is not that host" \
+# A pin that is a PREFIX of a live host is not that host — and, being two
+# characters short of a name this MIG could have created, it is not this
+# pool's host at all (#1487), so it is left for whoever owns it.
+expect ignore: "a pin that is a PREFIX of a live host is not that host, nor ours" \
   queued "self-hosted,linux,host-ci-lin-a1" "$POOL" "$BASE" "$LIVE" 301 300
+expect orphan: "a pin of the MIG's own shape that no live host answers is orphaned" \
+  queued "self-hosted,linux,host-ci-lin-a1b3" "$POOL" "$BASE" "$LIVE" 301 300
 
 # --- the guards that stop a wrong cancellation --------------------------------
 expect pinned: "an in-flight job is never cancelled on age alone, whatever the host list says" \
@@ -277,14 +284,19 @@ expect ignore: "seen from the other controller, our pinned jobs are the foreign 
 expect pinned: "and that controller still sees its own live pin" \
   in_progress "self-hosted,linux,gcp,Repo,host-ci-moved-e5f6" "$POOL" "$OTHER_BASE" "$OTHER_LIVE" 0 300
 
-# WHY THE MODULE REFUSES `<pool name>-<anything>` AS A BASE NAME: rule 5 is a
-# prefix test, so a base that extends ours with a hyphen is still inside it and
-# its perfectly healthy pinned run is cancelled here as an orphan. Pinned as
-# the behaviour it is, so that the precondition on the host MIG is not relaxed
-# on the belief that this function would catch it. An exact-match rule 5 flips
-# this to `ignore:` and retires the precondition.
-expect orphan: "a base that extends ours with a hyphen is still claimed — hence the precondition" \
+# A BASE THAT EXTENDS OURS WITH A HYPHEN (#1487). Rule 5 used to be the prefix
+# `<base>-`, so `host-ci-lin-b-e5f6` was inside it and the other pool's healthy
+# pinned run was cancelled here as an orphan. Rule 5 is now the exact grammar
+# `<base>-<4>` (host-ownership.sh), so the run is the other controller's, and
+# the plan-time precondition that kept such a pair apart is gone.
+expect ignore: "a base that extends ours with a hyphen is the other pool's, not ours" \
   queued "self-hosted,linux,gcp,Repo,host-ci-lin-b-e5f6" "$POOL" "$BASE" "$LIVE" 99999 300
+expect ignore: "nor is its running job ours to cancel as vanished" \
+  in_progress "self-hosted,linux,gcp,Repo,host-ci-lin-b-e5f6" "$POOL" "$BASE" "" 99999 300 99999
+expect ignore: "the pool's controller is never a pinned host" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-lin-controller-ab12" "$POOL" "$BASE" "$LIVE" 99999 300
+expect orphan: "while the longer base still orphans its own dead pin" \
+  queued "self-hosted,linux,gcp,Repo,host-ci-lin-b-e5f6" "$POOL" "ci-lin-b" "ci-lin-b-a1b2" 99999 300
 
 # And the base the controller hands rule 5 is the one read off the LIVE group,
 # which is what makes a renamed pool need no controller change at all — and a
@@ -730,6 +742,10 @@ mutant "F2: retry-after ignored" \
 mutant "F3: a mint 422 read as transient (the missing permission never surfaced)" \
   's/    422) echo refused ;;/    422) echo transient ;;/' \
   actions_token_mint_class 422 refused
+# shellcheck disable=SC2016
+mutant "#1487: rule 5 back to the prefix glob (a longer base's pin claimed)" \
+  's/      pool_owns_host "\$base" "\$pin_host" ||/      case "$pin_host" in "$base"-*) false ;; *) true ;; esac \&\&/' \
+  pinned_job_decision queued "self-hosted,linux,gcp,Repo,host-ci-lin-b-e5f6" "$POOL" "$BASE" "$LIVE" 99999 300 ignore:
 
 [ "$fail" = 0 ] && printf '\npinned-job-decision: all cases pass\n'
 exit "$fail"

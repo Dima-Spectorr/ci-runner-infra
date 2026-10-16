@@ -85,11 +85,10 @@ variable "instance_base_name" {
     every resource name keep the pool name, so workflows, dashboards, the
     autoscaler and warm caches all behave as before.
 
-    It must not be the pool name extended by a hyphen (`<name>-…`), nor may the
-    pool name be this value extended by one: the controller's test is the prefix
-    `<base>-`, so such a pair is still one pool to the side holding the shorter
-    name. Choose a name that shares no such prefix — `ci-b-myrepo` beside
-    `ci-myrepo`, not `ci-myrepo-b`. The plan refuses the other shape.
+    The controller's test is the exact grammar `<base>-<4 characters>`
+    (scripts/host-ownership.sh), not a prefix, so a base that extends the pool
+    name with a hyphen (`ci-myrepo-b` beside `ci-myrepo`) is as separate as any
+    other name (#1487).
 
     Choose it when the pool is created. The base name is immutable on a managed
     instance group, so changing it on a live pool replaces the group — every

@@ -37,7 +37,8 @@
 #   runner_status       : "online" | "offline" per the GitHub API.
 #   runner_busy         : 1 if GitHub says the agent is executing a job.
 #   base_instance_name  : the MIG's baseInstanceName. Every instance this pool
-#                         can create is "<base>-<suffix>", so it bounds the
+#                         can create is exactly "<base>-<4>" (see
+#                         host-ownership.sh), so it bounds the
 #                         reaper to this pool's own agents even when a repo is
 #                         served by several pools (linux + windows) or still
 #                         carries a retired pool's registrations.
@@ -60,23 +61,23 @@ orphan_decision() {
   # 1. Not one of ours. A repo's runner list also holds the windows pool, other
   #    products' pools, and whatever a retired pool left behind. Reaping by
   #    "looks offline" instead of "is mine" would delete another pool's agents.
-  #    An empty base is checked FIRST: it would otherwise degrade the prefix
-  #    test to "-*" and make the reaper unbounded.
+  #    An empty base is checked FIRST so the verdict says why.
+  #
+  #    Ownership is the EXACT name grammar in host-ownership.sh, not a prefix:
+  #    a pool whose base extends ours with a hyphen (`<base>-b`) names its
+  #    agents `<base>-b-<4>-s<N>`, which a `"$base"-*` glob claimed — and then
+  #    reaped as hostless, because its instance is in the other pool's MIG.
   if [ -z "$base" ]; then
     echo "keep:no-base-instance-name"
     return 0
   fi
-  case "$name" in
-    "$base"-*) ;;
-    *)
+  local host
+  if ! host=$(pool_slot_host "$base" "$name"); then
+    if pool_owns_host "$base" "$name"; then
+      echo "keep:not-a-slot-name name=$name"
+    else
       echo "keep:not-this-pool name=$name base=$base"
-      return 0
-      ;;
-  esac
-
-  local host="${name%-s*}"
-  if [ "$host" = "$name" ]; then
-    echo "keep:not-a-slot-name name=$name"
+    fi
     return 0
   fi
 

@@ -3268,10 +3268,21 @@ collect_host_boots() {
   HOST_BOOTS=""
   # Without the base name there is no bound on the list, and an unbounded one
   # is every instance in the project.
+  #
+  # The server-side filter is a PREFIX and only narrows the call: a pool whose
+  # base extends this one with a hyphen (`<base>-b-<4>`) is inside it. Each row
+  # is then kept only if pool_owns_host says this MIG could have created it —
+  # every reader of HOST_BOOTS (the restart reset, cordon adoption, host age)
+  # acts on the names it finds there, and another pool's are not ours to touch.
   if [ -n "$MIG_BASE" ]; then
-    HOST_BOOTS=$(timeout 60 gcloud compute instances list --project="$PROJECT" \
+    local listed row
+    listed=$(timeout 60 gcloud compute instances list --project="$PROJECT" \
       --filter="name~^$MIG_BASE-" \
-      --format="csv[no-heading](name,id,creationTimestamp,lastStartTimestamp,metadata.items.filter(key:ci-cordon).extract(value).flatten())" 2>/dev/null) || HOST_BOOTS=""
+      --format="csv[no-heading](name,id,creationTimestamp,lastStartTimestamp,metadata.items.filter(key:ci-cordon).extract(value).flatten())" 2>/dev/null) || listed=""
+    while IFS= read -r row; do
+      pool_owns_host "$MIG_BASE" "${row%%,*}" || continue
+      HOST_BOOTS="${HOST_BOOTS:+$HOST_BOOTS$'\n'}$row"
+    done <<<"$listed"
   fi
   index_host_boots
   return 0
@@ -5261,7 +5272,9 @@ tick_pool() {
   # as belonging to hosts that no longer exist and delete them — handing back
   # recycle budget across the whole controller and, worse, forgetting that a
   # live registration token is sitting in another pool's instance metadata. Only
-  # markers whose host name this pool's MIG could have created are considered,
+  # markers whose host name this pool's MIG could have created are considered —
+  # exactly `<base>-<4>` (pool_owns_host), not the prefix `<base>-`, which also
+  # covered a pool whose base extends this one with a hyphen (#1487) —
   # and if the MIG's base name could not be read, nothing is swept at all.
   for f in "$STATE_DIR"/cordon-* "$STATE_DIR"/reserve-* "$STATE_DIR"/regtoken-* "$STATE_DIR"/regkey-* \
     "$STATE_DIR"/regfail-* "$STATE_DIR"/beaconmiss-* "$STATE_DIR"/pinhold-* \
@@ -5281,7 +5294,7 @@ tick_pool() {
     mname=${mname#pinerr-}
     mname=${mname#beaconerr-}
     mname=${mname#unreg-}
-    case "$mname" in "$MIG_BASE"-*) ;; *) continue ;; esac
+    pool_owns_host "$MIG_BASE" "$mname" || continue
     case $'\n'"$live_hosts"$'\n' in
       *$'\n'"$mname"$'\n'*) ;;
       *) rm -f "$f" ;;
@@ -5298,7 +5311,7 @@ tick_pool() {
   # other, never both — the cordon arm removes the reserve marker — so the sum
   # counts each host once.
   if [ -n "$MIG_BASE" ]; then
-    recycling=$(find "$STATE_DIR" -maxdepth 1 \( -name "cordon-$MIG_BASE-*" -o -name "reserve-$MIG_BASE-*" \) 2>/dev/null | wc -l)
+    recycling=$(pool_marker_count "$STATE_DIR" "$MIG_BASE" cordon reserve)
   else
     recycling="$RECYCLE_MAX_UNAVAILABLE"
   fi

@@ -441,21 +441,20 @@ for _keeps in \
     "$(printf '%s\n' "$_not_hosts_mig" | grep -F -- "$_keeps" >/dev/null && echo yes || echo no)"
 done
 
-# (c) The plan refuses a base name the OTHER controller would still claim. The
-# ownership test is the prefix `<base>-`, so a base that is the pool name plus
-# a hyphenated suffix — or the reverse — separates nothing. Both directions,
-# inside a precondition on the host MIG, with the unset case let through.
-_pre=$(printf '%s\n' "$_hosts_mig" | sed -n '/^    precondition {/,/^    }/p')
-check "the host MIG carries a precondition on the base name" yes \
-  "$([ "$(printf '%s\n' "$_pre" | grep -c .)" -ge 3 ] && echo yes || echo no)"
-# shellcheck disable=SC2016  # HCL interpolation, matched literally.
-check "it refuses a base that extends the pool name with a hyphen" 1 \
-  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF '!startswith(local.instance_base_name, "${var.name}-")')"
-# shellcheck disable=SC2016
-check "and a pool name that extends the base with a hyphen" 1 \
-  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF '!startswith(var.name, "${local.instance_base_name}-")')"
-check "and lets the default — base equal to the pool name — through" 1 \
-  "$(printf '%s\n' "$_pre" | grep -E '^ +condition +=' | grep -cF 'local.instance_base_name == var.name || (')"
+# (c) Ownership is the EXACT grammar `<base>-<4 chars>` (host-ownership.sh,
+# #1487), so any distinct base separates two pools — `ci-x-b` beside `ci-x`
+# included — and the plan no longer refuses one. What replaces the plan-time
+# refusal is the helper itself: it must reach the controller from BOTH script
+# lists, or every pool_owns_host call is "command not found" — a nonzero that
+# reads as "not ours", i.e. a controller that silently owns nothing.
+check "the host MIG carries no precondition on the base name" 0 \
+  "$(printf '%s\n' "$_hosts_mig" | grep -c 'startswith(')"
+for _list in "$POOL_TF/main.tf" "$ROOT/modules/ci-runner-controller/main.tf"; do
+  check "host-ownership.sh is embedded in the controller script: ${_list#"$ROOT"/}" 1 \
+    "$(grep -cE '^ +file\(.*/host-ownership\.sh"\),$' "$_list")"
+done
+check "and the controller calls it, rather than a prefix glob" yes \
+  "$(grep -qF 'pool_owns_host "$MIG_BASE"' "$STARTUP" && echo yes || echo no)"
 
 # (d) Agents are named after the INSTANCE on both operating systems, never
 # after the pool. A host script that built the name from `ci-pool` would

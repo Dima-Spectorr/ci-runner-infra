@@ -47,6 +47,7 @@ locals {
   controller_startup_source = join("\n", [
     "#!/usr/bin/env bash",
     file("${local.pool_scripts}/drain-decision.sh"),
+    file("${local.pool_scripts}/host-ownership.sh"),
     file("${local.pool_scripts}/orphan-decision.sh"),
     file("${local.pool_scripts}/pinned-job-decision.sh"),
     file("${local.pool_scripts}/recycle-decision.sh"),
