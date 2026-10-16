@@ -131,7 +131,7 @@ fi
 #    flag), so the grant opened a path no automated flow used. The live bindings
 #    were removed out of band first, because the apply SA cannot edit project
 #    IAM; a refresh then drops the resource from state with nothing to destroy.
-if ! grep -q 'iap.tunnelResourceAccessor\|compute.osLogin' "$IDENTITY/main.tf"; then
+if ! cat "$IDENTITY"/*.tf | grep -Eq 'iap\.tunnelResourceAccessor|compute\.os(Admin)?Login'; then
   ok "controller holds no IAP tunnel or OS Login grant"
 else
   bad "ci-runner-identity grants IAP tunnel or OS Login — the controller never logs in to a host (#931, #1599)"

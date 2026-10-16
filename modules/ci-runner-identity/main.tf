@@ -94,7 +94,7 @@ locals {
   #
   # Reuse creates NOTHING for the controller: not the account, and not one of
   # its grants. Every controller grant this module writes is either project-level
-  # (metrics, logs, instance-admin, IAP) or on the one App-key secret, so the
+  # (metrics, logs, instance-admin) or on the one App-key secret, so the
   # first identity's copies already cover the second pool. Writing them again
   # from a second resource would put two Terraform resources on one identical
   # binding, where removing either one revokes it for both.
