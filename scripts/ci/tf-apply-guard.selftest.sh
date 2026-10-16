@@ -208,6 +208,57 @@ for r in $avail; do
 done
 unset PLAN_READER
 
+# ── a change with no actions array is an error, in both readers (#1588) ───────
+# jq's `null | index("delete")` is null, so a row whose `actions` was null or
+# missing used to be dropped as "not a destroy" by the jq reader while python
+# raised on it: the two readers disagreed, and the lenient one decided. Every
+# shape below must be an ERROR from every reader, in both the attended reader
+# (read_plan) and the unattended one — never an empty list, because an empty
+# list is what a plan that destroys nothing looks like.
+shape_fails=0
+shape_dir="$(mktemp -d)"
+n_shape=0
+for rc in '{"address":"a.b","type":"google_compute_instance_template","change":{"actions":null}}' \
+          '{"address":"a.b","type":"google_compute_instance_template","change":{}}' \
+          '{"address":"a.b","type":"google_compute_instance_template"}' \
+          '{"address":"a.b","type":"google_compute_instance_template","change":{"actions":"delete"}}' \
+          '{"address":"a.b","type":"google_compute_instance_template","change":{"actions":{"0":"delete"}}}'; do
+  n_shape=$((n_shape + 1))
+  printf '{"format_version":"1.2","resource_changes":[%s]}' "$rc" >"$shape_dir/$n_shape.json"
+done
+n_shape=$((n_shape + 1))
+printf '{"format_version":"1.2","resource_changes":{"a.b":{"change":{"actions":["delete"]}}}}' >"$shape_dir/$n_shape.json"
+# `false` is not "absent": jq's `//` would read it as an empty plan.
+n_shape=$((n_shape + 1))
+printf '{"format_version":"1.2","resource_changes":false}' >"$shape_dir/$n_shape.json"
+# A plan with no changes at all is still a clean plan, not an error — or the
+# rule above would turn every no-op plan red.
+printf '{"format_version":"1.2"}' >"$shape_dir/none.json"
+for r in $avail; do
+  # shellcheck disable=SC2034  # read by the sourced readers.
+  PLAN_READER="$r"
+  before=$shape_fails
+  for i in $(seq 1 "$n_shape"); do
+    f="$shape_dir/$i.json"
+    if unattended_refusals "$f" 'google_compute_instance_template' >/dev/null 2>&1; then
+      printf 'FAIL %s unattended: malformed shape %s (%s) read as a plan\n' "$r" "$i" "$(cat "$f")"; shape_fails=$((shape_fails + 1))
+    fi
+    if read_plan "$f" all >/dev/null 2>&1; then
+      printf 'FAIL %s read_plan: malformed shape %s (%s) read as a plan\n' "$r" "$i" "$(cat "$f")"; shape_fails=$((shape_fails + 1))
+    fi
+  done
+  if unattended_refusals "$shape_dir/none.json" 'google_compute_instance_template' >/dev/null 2>&1 \
+     && [ -z "$(read_plan "$shape_dir/none.json" all)" ]; then :; else
+    printf 'FAIL %s a plan with no resource_changes is refused — every no-op plan would go red\n' "$r"; shape_fails=$((shape_fails + 1))
+  fi
+  [ "$shape_fails" -eq "$before" ] && printf 'ok   %s refuses all %s change shapes without an actions array, in both readers\n' "$r" "$n_shape"
+done
+unset PLAN_READER
+check "unattended: a change whose actions is null stops red" 2 \
+  "$(bash "$here/tf-apply-guard.sh" --unattended-plan "$shape_dir/1.json" google_compute_instance_template >/dev/null 2>&1; echo $?)"
+rm -rf "$shape_dir"
+fails=$((fails + shape_fails))
+
 # The live entry point, end to end: exit status is what Cloud Build reads.
 ua_run() { bash "$here/tf-apply-guard.sh" --unattended-plan "$@" >/dev/null 2>&1; echo $?; }
 clean_fixture="$(mktemp)"

@@ -347,8 +347,14 @@ The default is instance templates only (`google_compute_instance_template`,
 `google_compute_region_instance_template`): they are immutable, so every host
 startup-script or machine-type change is a replacement, and refusing those
 would make every release a manual apply. The list takes exact type names, never
-a pattern, and may not name a service account or a secret. The apply step then
-runs only the `tf.plan` whose hash the guard recorded.
+a pattern, and can only narrow that default (#1588): any type outside those two
+immutable templates fails validation, so a consumer cannot opt a stateful
+resource into an unattended destroy. The plan step hashes `tf.plan` together
+with its JSON rendering, and the guard refuses unless both still match before it
+reads a byte; the apply step then runs only the `tf.plan` whose hash the guard
+recorded. A resource change whose `change.actions` is not an array stops the
+guard red in both of its readers rather than being skipped, and the guard,
+report and alert-policy steps run a `cloud-sdk` image pinned by digest.
 
 When the guard refuses, nothing was applied. Read the listed addresses; if every
 destroy is intended, apply that change by hand through
