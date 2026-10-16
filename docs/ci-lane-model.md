@@ -144,6 +144,23 @@ Pin the COMMIT, and check the digest. A tag is mutable: pinning one still lets
 whoever can move it change what every consuming repository tests — and what
 code it sources into a credentialed job — with no pull request anywhere.
 
+**Documents a test reads.** A file can look like documentation and still be
+read by a test — a permission matrix that a drift test compares against the
+controllers, for example. On its own, such a file takes the `none` lane, so the
+test skips and the drift surfaces on the next unrelated code change. Declare
+those paths on the `decide` step:
+
+```yaml
+        env:
+          # Newline- or space-separated globs, repository-relative,
+          # case-sensitive; `*` crosses `/`. A match is `partial`.
+          LANE_CODE_INPUTS: docs/permissions.md
+```
+
+The list can only widen a lane, never narrow one. A stale entry costs runner
+seconds and nothing more. The caller's affected-area filter must also map the
+path to the job that reads it, or `partial` runs nothing useful.
+
 ### 3. Gate at job level, never inside the job
 
 ```yaml
