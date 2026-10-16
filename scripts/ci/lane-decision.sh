@@ -104,6 +104,33 @@ lane_decision() {
 classify_path() {
   local p="$1"
   local lower="${p,,}"
+  local pattern
+
+  # ---------------------------------------------------------------------------
+  # -1. Repository-declared code inputs. Some repositories keep a document that
+  #     a TEST reads — a permission matrix a drift test compares against the
+  #     controllers, say. By extension it is documentation, so a pull request
+  #     editing only that file would take the lane that runs no CI, and the
+  #     drift would surface on somebody else's next code change.
+  #
+  #     The caller lists such paths in LANE_CODE_INPUTS, newline- or
+  #     space-separated shell globs matched against the repository-relative
+  #     path (case-sensitive, `*` crosses `/`). A match is `partial`: the
+  #     caller's affected-area filter decides which job reads it. The list can
+  #     only WIDEN a lane, never narrow one, so a stale entry costs runner
+  #     seconds and nothing else.
+  # ---------------------------------------------------------------------------
+  if [ -n "${LANE_CODE_INPUTS:-}" ]; then
+    local -a patterns
+    read -r -d '' -a patterns <<<"$LANE_CODE_INPUTS" || true
+    for pattern in "${patterns[@]}"; do
+      # shellcheck disable=SC2053 # unquoted on purpose: a glob match
+      if [[ "$p" == $pattern ]]; then
+        echo partial
+        return 0
+      fi
+    done
+  fi
 
   # ---------------------------------------------------------------------------
   # 0. Build inputs that WEAR a documentation costume. These must be tested

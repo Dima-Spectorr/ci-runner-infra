@@ -128,5 +128,31 @@ else
   printf 'FAIL: the full-lane reason names the path that caused it\n  got: %s\n' "$reason"
 fi
 
+# --- repository-declared code inputs (LANE_CODE_INPUTS) -----------------------
+# SOAP-To-REST's docs/permissions.md is read by a drift test. A pull request
+# editing only that file must run the test, not take the no-runner lane.
+# shellcheck disable=SC2034 # read by classify_path in the sourced lane-decision.sh
+LANE_CODE_INPUTS='docs/permissions.md'
+expect partial "a declared code-input document leaves the no-runner lane" \
+  docs/permissions.md
+expect none "an undeclared document beside it stays non-code" \
+  docs/architecture.md
+# shellcheck disable=SC2034 # read by classify_path in the sourced lane-decision.sh
+LANE_CODE_INPUTS=$'docs/openapi/*.md\n  docs/permissions.md  '
+expect partial "a glob entry matches, across a newline-separated list" \
+  docs/openapi/v1/admin.md
+expect partial "padding around an entry does not hide it" \
+  docs/permissions.md
+# shellcheck disable=SC2034 # read by classify_path in the sourced lane-decision.sh
+LANE_CODE_INPUTS='docs/permissions.md'
+expect full "a declared input never NARROWS a full-lane diff" \
+  docs/permissions.md go.mod
+# The match is on the path as written: a case-changed copy is a different file.
+expect none "the match is case-sensitive, like the repository's paths" \
+  DOCS/Permissions.md
+unset LANE_CODE_INPUTS
+expect none "with the list unset the same document is non-code again" \
+  docs/permissions.md
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
