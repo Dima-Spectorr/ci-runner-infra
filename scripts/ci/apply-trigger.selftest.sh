@@ -153,7 +153,7 @@ fires_only_for_the_root_it_applies() {
 #    looks like the report is broken, and gets fixed by deleting the report.
 runs_each_tool_in_an_image_that_has_it() {
   local sdk_step
-  sdk_step=$(awk '/name .*cloudsdktool/,/^    }/' "$1")
+  sdk_step=$(awk '/name .*local\.cloud_sdk_image/,/^    }/' "$1")
   # The step must exist, or this check is vacuous — and a vacuous check here
   # reads as "the tools are correctly separated".
   matches "$sdk_step" 'gcloud compute instance-groups' || return 1
@@ -375,19 +375,48 @@ guards_destroys_before_apply() {
   set_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*set -euo pipefail[[:space:]]*$' | head -1 | cut -d: -f1)
   call_n=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*bash /workspace/tf-apply-guard\.sh --unattended-plan /workspace/\.tf-plan\.json \$\{local\.guard_allowed_args\}$' | head -1 | cut -d: -f1)
   [ -n "$set_n" ] && [ -n "$call_n" ] && [ "$set_n" -lt "$call_n" ] || return 1
+  # The JSON the guard judges is the one rendered from THIS tf.plan (#1588): the
+  # plan step hashes both, and the guard checks that pair — and stops — before
+  # the call that reads the JSON. A check after the call, or one that does not
+  # exit, binds nothing.
+  matches "$code" 'sha256sum "\$PWD/tf\.plan" /workspace/\.tf-plan\.json > /workspace/\.tf-plan\.sha256' || return 1
+  local verify_n
+  verify_n=$(printf '%s\n' "$body" | grep -nE '! sha256sum -c /workspace/\.tf-plan\.sha256; then$' | head -1 | cut -d: -f1)
+  [ -n "$verify_n" ] && [ "$set_n" -lt "$verify_n" ] && [ "$verify_n" -lt "$call_n" ] || return 1
+  [ "$(printf '%s\n' "$body" | sed -n "$((verify_n + 2))p" | tr -d ' ')" = 'exit1' ] || return 1
   # The apply runs only the plan the guard hashed.
   matches "$code" 'sha256sum .*> /workspace/\.apply-guarded'  || return 1
   matches "$code" '! sha256sum -c /workspace/\.apply-guarded' || return 1
 }
 
 # 18. The allow-list is a list of exact type names, instance templates by
-#     default, and can never name an identity. A pattern or a broad default is
-#     the allow-list reading as one while allowing everything.
+#     default, and a consumer can only narrow it (#1588): every entry must be
+#     one of a fixed set of immutable types, which is exactly the two template
+#     types. A pattern, a broad default, or a deny-list in place of the fixed
+#     set is the allow-list reading as one while allowing a database, a bucket
+#     or an IAM policy to be replaced with nobody watching.
 allows_only_template_replacements_by_default() {
   local block; block=$(var_block unattended_destroy_allowed_types "$1")
   matches "$block" 'default *= *\["google_compute_instance_template", "google_compute_region_instance_template"\]' || return 1
   matches "$block" 'regex\("\^\[a-z\]\[a-z0-9_\]\*\$"' || return 1
-  matches "$block" '"google_service_account", "google_secret_manager_secret"' || return 1
+  # Default-deny: membership in the fixed set, for EVERY entry, and the set is
+  # the two templates and nothing else.
+  matches "$block" '^[[:space:]]*for t in var\.unattended_destroy_allowed_types :[[:space:]]*$' || return 1
+  matches "$block" '^[[:space:]]*contains\(\["google_compute_instance_template", "google_compute_region_instance_template"\], t\)[[:space:]]*$' || return 1
+}
+
+# 20. Every cloud-sdk step runs a digest-pinned image (#1588). The destroy
+#     guard reads the plan with that image's jq or python3, so a tag that moves
+#     changes the reader deciding what an unattended apply may destroy, with
+#     nothing merged here — the same reason the terraform image is pinned.
+pins_the_cloud_sdk_image() {
+  local code; code=$(code_of "$1")
+  matches "$code" '^[[:space:]]*cloud_sdk_image *= *"gcr\.io/google\.com/cloudsdktool/cloud-sdk@sha256:[0-9a-f]{64}"$' || return 1
+  # No step names the image any other way, and none uses a tag.
+  ! matches "$code" 'name *= *"[^"]*cloudsdktool' || return 1
+  ! matches "$code" 'cloud-sdk:'                  || return 1
+  # The three steps that need gcloud/jq/python — guard, report, alert policies.
+  [ "$(printf '%s\n' "$code" | grep -cE '^[[:space:]]*name *= *local\.cloud_sdk_image$')" -eq 3 ] || return 1
 }
 
 # 19. The alert-policy step is OPT-IN (#1594). The owner does not want CI alert
@@ -440,7 +469,8 @@ check names_no_inbox                              "$VARS" "an email address is d
 check constrains_the_value_it_shells_out          "$VARS" "alert_notification_email reaches a shell command unvalidated — a quote in it runs arbitrary commands as the project's build account"
 check declares_the_schedule_is_running            "$MAIN" "the scheduler job does not state paused = false — a job paused by hand stays paused through every later apply, with no diff in any plan and nothing red anywhere"
 check guards_destroys_before_apply                "$MAIN" "the destroy guard is missing, conditional, after the apply, or not bound to the applied plan — an unattended apply can destroy anything the account can (#1567)"
-check allows_only_template_replacements_by_default "$VARS" "unattended_destroy_allowed_types is broader than instance templates by default, accepts a pattern, or can name an identity (#1567)"
+check allows_only_template_replacements_by_default "$VARS" "unattended_destroy_allowed_types is broader than instance templates by default, accepts a pattern, or can name a type outside the fixed immutable set (#1567, #1588)"
+check pins_the_cloud_sdk_image                    "$MAIN" "a cloud-sdk step runs a floating tag — the reader that judges an unattended destroy can change with nothing merged (#1588)"
 check alert_policies_are_opt_in                   "$VARS" "manage_alert_policies is on by default — the next scheduled apply recreates every CI alert policy the owner deleted, and the emails start again (#1594)"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
@@ -571,6 +601,28 @@ mutate "'the controller template is recreated too' — default broadened to inst
   '/^variable "unattended_destroy_allowed_types"/,/^}/ s|"google_compute_region_instance_template"\]|"google_compute_region_instance_template", "google_compute_instance"]|' allows_only_template_replacements_by_default
 mutate "'let callers pass a pattern' — name validation removed" "$VARS" \
   '/^variable "unattended_destroy_allowed_types"/,/^}/ s|regex("^\[a-z\]\[a-z0-9_\]\*\$", t)|true|' allows_only_template_replacements_by_default
+
+# #1588 — the hardening of the same guard, each edit again a fix for a red build.
+mutate "'our Cloud SQL instance needs a new tier' — a database added to the fixed set" "$VARS" \
+  '/^variable "unattended_destroy_allowed_types"/,/^}/ s|"google_compute_region_instance_template"\], t)|"google_compute_region_instance_template", "google_sql_database_instance"], t)|' allows_only_template_replacements_by_default
+mutate "'just keep identities out' — the allow-list turned back into a deny-list" "$VARS" \
+  '/^variable "unattended_destroy_allowed_types"/,/^}/ s|contains(\["google_compute_instance_template", "google_compute_region_instance_template"\], t)|!contains(["google_service_account", "google_secret_manager_secret"], t)|' allows_only_template_replacements_by_default
+mutate "'the allow-list validation is redundant with the default' — fixed-set check deleted" "$VARS" \
+  '/^variable "unattended_destroy_allowed_types"/,/^}/ { /^    condition = alltrue(\[$/,/^    \])$/d; }' allows_only_template_replacements_by_default
+mutate "'the hash check fails on a re-run' — the plan/JSON pair check deleted" "$MAIN" \
+  '/^  guard_step_script *= <<-EOT/,/^  EOT$/ { /if \[ ! -f \/workspace\/\.tf-plan\.sha256 \]/,/^    fi$/d; }' guards_destroys_before_apply
+mutate "'a hash mismatch is only a warning' — the pair check no longer exits" "$MAIN" \
+  '/^  guard_step_script *= <<-EOT/,/^  EOT$/ { /tf-plan\.sha256; then$/,/^    fi$/ s|exit 1|true|; }' guards_destroys_before_apply
+mutate "'judge first, then check' — the pair check moved after the guard call" "$MAIN" \
+  '/^  guard_step_script *= <<-EOT/,/^  EOT$/ { /if \[ ! -f \/workspace\/\.tf-plan\.sha256 \]/,/^    fi$/d; s|^\(    sha256sum .*/workspace/\.apply-guarded\)$|    if [ ! -f /workspace/.tf-plan.sha256 ] \|\| ! sha256sum -c /workspace/.tf-plan.sha256; then\n      echo late\n      exit 1\n    fi\n\1|; }' guards_destroys_before_apply
+mutate "'the JSON is derived, hash the plan alone' — the JSON dropped from the pair" "$MAIN" \
+  's| /workspace/.tf-plan.json > /workspace/.tf-plan.sha256| > /workspace/.tf-plan.sha256|' guards_destroys_before_apply
+mutate "'digests are unreadable' — the cloud-sdk image back on its tag" "$MAIN" \
+  's|cloud-sdk@sha256:[0-9a-f]*"|cloud-sdk:slim"|' pins_the_cloud_sdk_image
+mutate "'the report step is harmless' — one step back on the literal tag" "$MAIN" \
+  '0,/name       = local.cloud_sdk_image/ s|name       = local.cloud_sdk_image|name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"|' pins_the_cloud_sdk_image
+mutate "'Docker Hub is faster' — a step moved to another, unpinned image" "$MAIN" \
+  '0,/name   = local.cloud_sdk_image/ s|name   = local.cloud_sdk_image|name   = "google/cloud-sdk:slim"|' pins_the_cloud_sdk_image
 
 # "Four projects had no alerts, so make them the default" — the edit #1594 undid.
 mutate "'a project that forgets needs it most' — alerts back on by default" "$VARS" \

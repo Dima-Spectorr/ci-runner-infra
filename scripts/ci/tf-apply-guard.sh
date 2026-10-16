@@ -116,14 +116,42 @@ pick_plan_reader() {
 }
 PLAN_READER="${PLAN_READER:-$(pick_plan_reader)}"
 
+# A change whose `actions` is not an array is an ERROR in both readers, never a
+# skip (#1588). jq's `null | index("delete")` is null, so a missing or null
+# `actions` used to be dropped by select() as "not a destroy", while python
+# raised on the same row — two readers disagreeing about whether a plan
+# destroys something, and the lenient one deciding. A plan terraform wrote
+# always has the array; a row without one is a plan this script cannot judge.
+JQ_RESOURCE_CHANGES='
+  (.resource_changes | if . == null then [] else . end)
+  | if type == "array" then .[] else error("resource_changes is not an array") end
+  | if (.change.actions | type) == "array" then .
+    else error("\(.address // "a resource change"): change.actions is not an array") end'
+# The same rule for the python reader, spliced into both of its programs.
+PY_RESOURCE_CHANGES='
+def resource_changes(plan):
+    rcs = plan.get("resource_changes") if isinstance(plan, dict) else None
+    if rcs is None:
+        return
+    if not isinstance(rcs, list):
+        sys.exit("resource_changes is not an array")
+    for rc in rcs:
+        change = rc.get("change") if isinstance(rc, dict) else None
+        actions = change.get("actions") if isinstance(change, dict) else None
+        if not isinstance(actions, list):
+            addr = rc.get("address") if isinstance(rc, dict) else None
+            sys.exit("%s: change.actions is not an array" % (addr or "a resource change"))
+        yield rc, actions
+'
+
 # read_plan <plan.json> <mode: all|protected> -> destroyed addresses, one per line
 read_plan() {
   if [ "$PLAN_READER" = jq ]; then
     if [ "$2" = protected ]; then
       jq -r --arg t "$PROTECTED_TYPES" \
-        '.resource_changes[]? | select(.change.actions | index("delete")) | select(.type | test($t)) | .address' "$1"
+        "$JQ_RESOURCE_CHANGES"' | select(.change.actions | index("delete")) | select(.type | test($t)) | .address' "$1"
     else
-      jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' "$1"
+      jq -r "$JQ_RESOURCE_CHANGES"' | select(.change.actions | index("delete")) | .address' "$1"
     fi
   else
     # shellcheck disable=SC2016  # the python source must NOT be shell-expanded:
@@ -140,8 +168,9 @@ mode = sys.argv[2]
 pat = re.compile(os.environ["PROTECTED_TYPES"])
 with open(sys.argv[1], encoding="utf-8") as fh:
     plan = json.load(fh)
-for rc in plan.get("resource_changes") or []:
-    if "delete" not in (rc.get("change") or {}).get("actions", []):
+'"$PY_RESOURCE_CHANGES"'
+for rc, actions in resource_changes(plan):
+    if "delete" not in actions:
         continue
     # `search`, matching jq test(): the pattern carries its own ^...$ anchors so
     # that neighbouring types like google_service_account_iam_member do not match.
@@ -178,7 +207,7 @@ unattended_refusals() {
       if (type != "object") or (has("format_version") | not)
       then error("not a terraform plan JSON (no format_version)") else . end
       | ($allow | split("\n") | map(select(length > 0))) as $a
-      | .resource_changes[]?
+      | '"$JQ_RESOURCE_CHANGES"'
       | select(.change.actions | index("delete"))
       | select(
           (.type as $t | any($a[]; . == $t))
@@ -196,8 +225,8 @@ with open(sys.argv[1], encoding="utf-8") as fh:
     plan = json.load(fh)
 if not isinstance(plan, dict) or "format_version" not in plan:
     sys.exit("not a terraform plan JSON (no format_version)")
-for rc in plan.get("resource_changes") or []:
-    actions = (rc.get("change") or {}).get("actions", [])
+'"$PY_RESOURCE_CHANGES"'
+for rc, actions in resource_changes(plan):
     if "delete" not in actions:
         continue
     deposed = rc.get("deposed") or ""

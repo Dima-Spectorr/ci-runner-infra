@@ -141,8 +141,22 @@ locals {
   # step refuses any tf.plan whose hash is not that one — so an apply cannot run
   # a plan the guard did not judge, whatever order a later edit puts steps in.
   #
+  # The other end is bound the same way (#1588): the plan step hashes tf.plan
+  # AND the JSON it rendered from it into .tf-plan.sha256, and the guard checks
+  # both before it reads a byte of the JSON. Without that, only step order says
+  # the JSON the guard judges describes the tf.plan it then blesses.
+  #
   # The allowed types reach a shell command, inside single quotes; the variable's
   # validation admits only `[a-z][a-z0-9_]*`, so no value can close them.
+  # The gcloud/jq/python image, pinned by DIGEST (#1588). The destroy guard runs
+  # in it, so a tag that moves can change the reader that decides what an
+  # unattended apply may destroy, with nothing merged here. Resolved 2026-10-16
+  # from `cloud-sdk:slim`; to bump it, re-resolve that tag
+  #   gcloud container images describe gcr.io/google.com/cloudsdktool/cloud-sdk:slim \
+  #     --project=<any> --format='value(image_summary.digest)'
+  # and replace the digest in one PR, so the self-test and a reviewer see it.
+  cloud_sdk_image = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:ffd36b9b80bb08b2dea60b58ca2b60dfa3a40a3c00f3e5732d6d113f4e7ffa45"
+
   guard_script_gz    = base64gzip(file("${path.module}/../../scripts/ci/tf-apply-guard.sh"))
   guard_allowed_args = join(" ", [for t in var.unattended_destroy_allowed_types : "'${t}'"])
   guard_plan_file    = "/workspace/${trim(var.terraform_root, "/")}/tf.plan"
@@ -154,6 +168,10 @@ locals {
     if [ ! -f /workspace/.apply-pending ]; then
       echo "plan reported no changes — nothing to guard"
       exit 0
+    fi
+    if [ ! -f /workspace/.tf-plan.sha256 ] || ! sha256sum -c /workspace/.tf-plan.sha256; then
+      echo "tf.plan or its JSON is not the pair the plan step rendered — refusing to judge it"
+      exit 1
     fi
     printf '%s' '${local.guard_script_gz}' | base64 -d | gzip -d > /workspace/tf-apply-guard.sh
     bash /workspace/tf-apply-guard.sh --unattended-plan /workspace/.tf-plan.json ${local.guard_allowed_args}
@@ -296,10 +314,12 @@ resource "google_cloudbuild_trigger" "apply" {
         terraform plan -input=false -lock-timeout=${var.lock_timeout} -detailed-exitcode -out=tf.plan
         rc=$?
         case "$rc" in
-          0) echo "no changes — nothing to apply"; rm -f /workspace/.apply-pending ;;
+          0) echo "no changes — nothing to apply"; rm -f /workspace/.apply-pending /workspace/.tf-plan.sha256 ;;
           2) echo "changes pending"; : > /workspace/.apply-pending
              terraform show -json tf.plan > /workspace/.tf-plan.json \
-               || { echo "could not render the saved plan as JSON for the destroy guard"; exit 1; } ;;
+               || { echo "could not render the saved plan as JSON for the destroy guard"; exit 1; }
+             sha256sum "$PWD/tf.plan" /workspace/.tf-plan.json > /workspace/.tf-plan.sha256 \
+               || { echo "could not hash the saved plan for the destroy guard"; exit 1; } ;;
           *) echo "terraform plan failed (exit $rc)"; exit "$rc" ;;
         esac
       EOT
@@ -320,7 +340,7 @@ resource "google_cloudbuild_trigger" "apply" {
     # with neither reader fails the guard — red, never a silent pass.
     step {
       id     = "destroy-guard"
-      name   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+      name   = local.cloud_sdk_image
       script = local.guard_step_script
     }
 
@@ -381,7 +401,7 @@ resource "google_cloudbuild_trigger" "apply" {
     # would report "the apply failed" over a missing summary.
     step {
       id         = "report"
-      name       = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+      name       = local.cloud_sdk_image
       entrypoint = "sh"
       args = ["-c", <<-EOT
         set -u
@@ -459,7 +479,7 @@ resource "google_cloudbuild_trigger" "apply" {
       for_each = var.manage_alert_policies ? [1] : []
       content {
         id     = "alert-policies"
-        name   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+        name   = local.cloud_sdk_image
         script = local.alert_step_script
       }
     }

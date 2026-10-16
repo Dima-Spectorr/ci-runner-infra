@@ -242,6 +242,8 @@ variable "unattended_destroy_allowed_types" {
     Resource types the UNATTENDED apply may destroy — and only as the second half of a create-before-destroy replacement (plan actions exactly create,delete), or as cleanup of a deposed object left by one. Any other destroy in the plan stops the build red before apply, naming each resource; a human then applies it through scripts/ci/tf-apply-guard.sh, which asks for a plan-derived token (#1567).
 
     Instance templates by default, because they are immutable: every change to a host's startup script or machine type IS a replacement, and refusing those would turn every release into a manual apply. Exact type names, compared by equality — not patterns. An empty list makes every destroy a manual one.
+
+    The list can only NARROW the default, never widen it: every entry must be one of the fixed set of immutable types below (#1588). A database instance, a bucket, a KMS key, a secret version or an IAM policy replaced unattended loses data or access that no later apply brings back, and a deny-list naming two of them left every other one a single root edit away.
   EOT
 
   validation {
@@ -249,13 +251,19 @@ variable "unattended_destroy_allowed_types" {
     error_message = "unattended_destroy_allowed_types takes exact terraform resource type names ([a-z][a-z0-9_]*), never a pattern: a pattern here would be one edit away from allowing every destroy."
   }
 
-  # Never an identity. A service account id is unusable for 30 days after
-  # deletion and a secret takes its versions with it; tf-apply-guard.sh treats
-  # both as protected even with a token, so the unattended path must not be
-  # able to do what the attended one guards hardest.
+  # DEFAULT-DENY (#1588). An allow-list of immutable types, not a deny-list of
+  # dangerous ones: the deny-list it replaces named a service account and a
+  # secret, and a root could still allow google_sql_database_instance,
+  # google_storage_bucket, google_kms_crypto_key or any *_iam_policy. A type
+  # earns a place here only if replacing it destroys nothing a re-apply cannot
+  # rebuild — no data, no identity, no grant. Widening this set is a module
+  # change, reviewed here, never a consumer input.
   validation {
-    condition     = length(setintersection(var.unattended_destroy_allowed_types, ["google_service_account", "google_secret_manager_secret"])) == 0
-    error_message = "unattended_destroy_allowed_types may not name google_service_account or google_secret_manager_secret: destroying an identity is never unattended."
+    condition = alltrue([
+      for t in var.unattended_destroy_allowed_types :
+      contains(["google_compute_instance_template", "google_compute_region_instance_template"], t)
+    ])
+    error_message = "unattended_destroy_allowed_types may name only immutable types the module allows to be replaced unattended: google_compute_instance_template, google_compute_region_instance_template. Anything else is destroyed by hand, through scripts/ci/tf-apply-guard.sh."
   }
 }
 
