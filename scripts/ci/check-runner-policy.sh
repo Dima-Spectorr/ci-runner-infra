@@ -26,7 +26,10 @@
 #              UNDECIDED, and declarable with a `remote-reusable-allowed` marker
 #              naming the callee (see `remote_call_declared`).
 #     RUNNER8  a job on a WINDOWS pool label declares `container:` or
-#              `services:`, neither of which that pool can run.
+#              `services:`, neither of which that pool can run — or an
+#              ACCEPTED dynamic runner declares them without proving the pool
+#              is Linux (`# linux-pool(<job-id>): <reason>`, or a pin to the
+#              anchor's `outputs.runs-on`; see `linux_pool_proven`).
 #
 #   And, behind `--shared-infra`, the three that make a pull request use ONE
 #   host and ONE copy of its infrastructure (docs/adr-pr-host-affinity.md):
@@ -377,11 +380,55 @@ LITERAL_FIRST = re.compile(r"\$\{\{\s*'([^']*)'")
 # `(?![0-9])` because without it `localhost:351000` matches on its first five
 # digits: a five-digit prefix of a six-digit port, reported as a band port the
 # job never named.
+#
+# The band is written ONCE, as BAND, and both readers below are built from it:
+# a second spelling of the range is a second place for it to drift.
+BAND = r"(35[1-9][0-9]{2}|3[6-9][0-9]{3}|4[0-3][0-9]{3}|440[0-9]{2})(?![0-9])"
 LOOPBACK_BAND = re.compile(
-    r"(?:localhost|127\.0\.0\.1)[:/]"
-    r"(35[1-9][0-9]{2}|3[6-9][0-9]{3}|4[0-3][0-9]{3}|440[0-9]{2})(?![0-9])",
+    r"(?:localhost|127\.0\.0\.1)[:/]" + BAND,
     re.IGNORECASE,
 )
+
+# …and the same mistake with the host and the port written APART (S2R#2153).
+# `PGHOST: localhost` beside `PGPORT: 35100` dials exactly what
+# `localhost:35100` dials, and the adjacent-only pattern above read it as
+# clean. So both halves are also collected as JOB-LEVEL facts: a scalar value
+# that IS a loopback host, and one that IS a band port — whole values only, or a
+# shell `NAME=value` assignment inside a string. Whole values, because a band
+# number embedded in some longer string (an image digest, a timestamp) is not a
+# port, and reading it as one would report a job for a mistake it did not make.
+LOOPBACK_VALUE = re.compile(r"^\s*(?:localhost|127\.0\.0\.1)\s*$", re.IGNORECASE)
+BAND_VALUE = re.compile(r"^\s*" + BAND + r"\s*$")
+LOOPBACK_ASSIGN = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:localhost|127\.0\.0\.1)(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
+BAND_ASSIGN = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*=[\"']?" + BAND)
+
+
+def loopback_band_split(node, found):
+    """Collect ('host', None) and ('port', <n>) facts from every scalar in `node`."""
+    if isinstance(node, dict):
+        for value in node.values():
+            loopback_band_split(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            loopback_band_split(value, found)
+    elif isinstance(node, bool) or node is None:
+        return
+    else:
+        text = str(node)
+        if LOOPBACK_VALUE.match(text) or LOOPBACK_ASSIGN.search(text):
+            found.setdefault("host", True)
+        hit = BAND_VALUE.match(text) or BAND_ASSIGN.search(text)
+        if hit and "port" not in found:
+            found["port"] = hit.group(1)
+
+
+# `needs.<job>.outputs.runs-on` — the anchor's published LINUX host, by the
+# contract (docs/ci-pr-shared-infra.md rule 1). Exactly that output name: the
+# RUNNER11 fixtures already carry a `win-runs-on`, which is the other OS.
+NEEDS_RUNS_ON = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.runs-on(?![A-Za-z0-9_-])")
 
 # --- fork guards, by DIRECTION and not by mention -----------------------------
 # The first version of this asked whether the text `head.repo.fork` appeared
@@ -697,8 +744,44 @@ for job_id, job in jobs.items():
         # string in the end, and a reader that walked only `run:` would miss
         # the `DATABASE_URL` in `env:`, which is where it is actually written.
         blob = yaml.safe_dump(job, default_flow_style=False, allow_unicode=True)
+        adjacent = False
         for m in LOOPBACK_BAND.finditer(blob):
+            adjacent = True
             out("#LOOPBACKBAND", vid, m.group(1))
+        if not adjacent:
+            split = {}
+            loopback_band_split(job, split)
+            if "host" in split and "port" in split:
+                out("#LOOPBACKBAND", vid, split["port"])
+
+        # What a `uses:` job hands its callee, for RUNNER9's caller-pinned case
+        # (S2R#2170 / #380). A REQUIRED input proves the caller passed SOMETHING;
+        # `runner: ''` and a hard-coded pool both satisfy `required: true`, and
+        # both put the callee on a second host. So each value is classified here
+        # and judged against the caller's own anchor in the shell:
+        #
+        #   needs  <job>   the value resolves from `needs.<job>.outputs.*`
+        #   input  <name>  the value passes through `inputs.<name>` (a wrapper)
+        #   other  -       anything else: a literal, an empty string, a mix
+        #
+        # A value carrying a self-hosted literal beside a reference is `other`,
+        # for the reason RUNSONLITERAL exists: the fallback is the second host.
+        with_block = job.get("with") if "uses" in job else None
+        if isinstance(with_block, dict):
+            for w_name, w_value in with_block.items():
+                text = w_value if isinstance(w_value, str) else ""
+                refs = [("needs", m.group(1)) for m in NEEDS_OUTPUT.finditer(text)]
+                refs += [("input", m.group(1)) for m in INPUTS_REF.finditer(text)]
+                lits = [
+                    lit.strip()
+                    for lit in LITERAL_ALT.findall(text) + LITERAL_FIRST.findall(text)
+                    if lit.strip() and not HOSTED_IMAGE.match(lit.strip())
+                ]
+                if "${{" not in text or not refs or lits:
+                    out("#WITH", vid, w_name, "other", "-")
+                    continue
+                for kind, ref in dict.fromkeys(refs):
+                    out("#WITH", vid, w_name, kind, ref)
 
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
@@ -733,6 +816,8 @@ for job_id, job in jobs.items():
             anchors = [m.group(1) for m in NEEDS_OUTPUT.finditer(text)]
             for anchor in anchors:
                 out("#RUNSONNEEDS", vid, anchor)
+            for host_anchor in NEEDS_RUNS_ON.finditer(text):
+                out("#RUNSONANCHORHOST", vid, host_anchor.group(1))
             for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(text)):
                 out("#RUNSONINPUT", vid, in_name)
             # Hoisted out of the loop above. The literals belong to the
@@ -836,6 +921,10 @@ SHARED_INFRA_OWNERS=""
 # workflow, which is the refactor this contract otherwise encourages.
 CALL_EDGES=""
 
+# The files a pull request starts directly — the roots RUNNER10 counts
+# invocation PATHS from (S2R#2150). Set by `compute_reachable`.
+PR_SEEDS=""
+
 # RUNNER9's escape hatch and RUNNER10's declaration, in the shape RUNNER7's
 # marker already established: beside the job, naming the job, with an issue.
 #
@@ -860,10 +949,57 @@ CALL_EDGES=""
 # rather than parsed, because PyYAML has discarded comments by the time it
 # yields anything — the reader that could parse this is the one that cannot see
 # it.
+#
+# A FLOW scalar can span lines too (S2R#2152). `run: "echo a` followed by a
+# line `# shared-infra-exempt(test, #1): x` and a closing `"` is ONE string, and
+# its middle line is shell text, not a comment — but no block indicator opened
+# it, so the indent tracking above never saw it. So the view also follows
+# single- and double-quoted scalars: `scan` walks a line from a known quote
+# state and returns the quote still open at its end. A quote opens a scalar
+# only where a scalar can START — after `key: `, a sequence `- `, or a flow
+# `[`/`{`/`,` — so the `"` in `run: echo "hi"` (a plain scalar) opens nothing.
+# Inside double quotes a backslash escapes the next character; inside single
+# quotes `''` is a literal quote. Every line that begins inside an open quote
+# is string content and is dropped, including the one that closes it.
 comment_view() {
   awk '
+    function scan(s, q,   i, n, c, nx, atstart, prev, depth) {
+      n = length(s); atstart = 1; prev = " "; depth = 0
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (q == "\"") {
+          if (c == "\\") { i++; continue }
+          if (c == "\"") { q = ""; atstart = 0; prev = c }
+          continue
+        }
+        if (q == "'"'"'") {
+          if (c == "'"'"'") {
+            if (substr(s, i + 1, 1) == "'"'"'") { i++; continue }
+            q = ""; atstart = 0; prev = c
+          }
+          continue
+        }
+        nx = substr(s, i + 1, 1)
+        if (c == " " || c == "\t") { prev = c; continue }
+        if (c == "#" && (prev == " " || prev == "\t")) return ""
+        if (atstart && (c == "\"" || c == "'"'"'")) { q = c; continue }
+        if (atstart && (c == "[" || c == "{")) { depth++; prev = c; continue }
+        if (depth > 0 && (c == "," || c == "]" || c == "}")) {
+          if (c != ",") depth--
+          atstart = (c == ","); prev = c; continue
+        }
+        if (atstart && c == "-" && (nx == "" || nx == " " || nx == "\t")) { prev = c; continue }
+        if (c == ":" && (nx == "" || nx == " " || nx == "\t")) { atstart = 1; prev = c; continue }
+        atstart = 0; prev = c
+      }
+      return q
+    }
     {
       match($0, /^[ \t]*/); ind = RLENGTH
+      if (openq != "") {
+        openq = scan($0, openq)
+        next
+      }
       if (inblock) {
         if ($0 ~ /^[ \t]*$/) next
         if (ind > blockind) next
@@ -885,6 +1021,8 @@ comment_view() {
           ($0 ~ /:[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/ ||
            $0 ~ /^[ \t]*-[ \t]*[|>][-+0-9]*[ \t]*(#.*)?$/)) {
         inblock = 1; blockind = ind
+      } else if ($0 !~ /^[ \t]*#/) {
+        openq = scan($0, "")
       }
     }
   ' "$1"
@@ -968,6 +1106,98 @@ remote_call_declared() {
   # negative. The trailing `[^[:space:]]` is the reason: `(...): ` with nothing
   # after it is a waiver wearing the shape of a declaration.
   grep -Eq "^[[:space:]]*#.*remote-reusable-allowed\([[:space:]]*${esc}[[:space:]]*,[[:space:]]*#[0-9]+[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file")
+}
+
+# Whether <job> in <file> brings the run's stack up: it declares `services:`
+# (on any matrix leg) or carries the owner marker. Pinning to a job's output is
+# a pin to the run's host only when that job is the one holding it (S2R#2149):
+# `needs.setup.outputs.pool` from a job that merely PUBLISHES a pool label
+# resolves to "any agent of that pool", which is the second host again.
+owner_job() {
+  local file="$1" records="$2" job="$3" job_re
+  job_re="$(re_quote "$job")"
+  [ "$(printf '%s\n' "$records" | grep -cE "^#SERVICES	${job_re}(~leg[0-9]+)?$")" -gt 0 ] && return 0
+  shared_infra_marker "$file" owner "$job"
+}
+
+# RUNNER8's undecidable half (S2R#2151). A job whose `runs-on` is an
+# expression or a group names no OS this gate can read, so a `container:` or
+# `services:` on it may be headed for the Windows pool, which has no container
+# runtime. It counts as Linux only when that is PROVEN:
+#
+#   # linux-pool(<job-id>): <why the pool is Linux>
+#
+# beside the job — or when every pool reference in the expression is
+# `needs.<owner>.outputs.runs-on`, the anchor's published LINUX host by the
+# contract, with no literal fallback and no `inputs.` pass-through.
+linux_pool_proven() {
+  local file="$1" records="$2" job="$3" job_base="$4" job_re esc n_needs n_host ref
+  esc="$(re_quote "$job_base")"
+  grep -Eq "^[[:space:]]*#.*linux-pool\([[:space:]]*${esc}[[:space:]]*\):[[:space:]]*[^[:space:]]" <(comment_view "$file") && return 0
+  job_re="$(re_quote "$job")"
+  [ "$(printf '%s\n' "$records" | grep -c "^#RUNSONLITERAL	${job_re}	")" -eq 0 ] || return 1
+  [ "$(printf '%s\n' "$records" | grep -c "^#RUNSONINPUT	${job_re}	")" -eq 0 ] || return 1
+  n_needs="$(printf '%s\n' "$records" | grep -c "^#RUNSONNEEDS	${job_re}	")"
+  n_host="$(printf '%s\n' "$records" | grep -c "^#RUNSONANCHORHOST	${job_re}	")"
+  [ "$n_needs" -gt 0 ] && [ "$n_needs" -eq "$n_host" ] || return 1
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    owner_job "$file" "$records" "$ref" </dev/null || return 1
+  done <<< "$(printf '%s\n' "$records" | sed -n "s/^#RUNSONANCHORHOST\t${job_re}\t//p")"
+  return 0
+}
+
+# How many times one run invokes <file>, counted over call PATHS from the
+# pull-request seeds (S2R#2150): inv(f) = [f is a seed] + Σ inv(caller) over
+# every edge into f. A wrapper called twice that calls the owner once is two
+# stacks, and a count of direct edges reads it as one. Depth-capped, so a call
+# cycle (which GitHub refuses anyway) cannot hang the gate.
+invocation_count() {
+  SI_SEEDS="$PR_SEEDS" SI_TARGET="$1" awk -F'\t' '
+    function inv(f, d,   t, i) {
+      if (d > 8) return 0
+      if (f in memo) return memo[f]
+      t = (f in seed) ? 1 : 0
+      for (i = 1; i <= ne; i++) if (ec[i] == f) t += inv(er[i], d + 1)
+      memo[f] = t
+      return t
+    }
+    BEGIN { n = split(ENVIRON["SI_SEEDS"], s, "\n"); for (i = 1; i <= n; i++) if (s[i] != "") seed[s[i]] = 1 }
+    NF >= 2 && $1 != "" { ne++; ec[ne] = $1; er[ne] = $2 }
+    END { print inv(ENVIRON["SI_TARGET"], 0) }
+  ' <<< "$CALL_EDGES"
+}
+
+# Whether every local caller of <callee> passes its `<input>` from the run's
+# anchor (S2R#2170 / #380). `required: true` proves only that the caller passed
+# SOMETHING — `runner: ''` and a hard-coded pool both satisfy it, and both land
+# the callee on a second host. So each caller's `with:` value is read: it must
+# resolve from `needs.<job>.outputs.*` of an owner job in the caller's file, or
+# pass through a REQUIRED input of a caller that is itself only ever called
+# (judged the same way, one level up). Anything else, or no caller at all, fails.
+caller_passes_anchor() {
+  local callee="$1" input="$2" depth="$3" edges cfile cjob crecords withs kind ref
+  [ "$depth" -lt 8 ] || return 1
+  edges="$(awk -v self="$callee" -F'\t' '$1 == self' <<< "$CALL_EDGES")"
+  [ -n "$edges" ] || return 1
+  while IFS=$'\t' read -r _ cfile cjob; do
+    [ -n "${cjob:-}" ] || continue
+    crecords="$(read_workflow "$cfile" </dev/null)" || return 1
+    withs="$(printf '%s\n' "$crecords" | sed -n "s/^#WITH\t$(re_quote "$cjob")\t$(re_quote "$input")\t//p")"
+    [ -n "$withs" ] || return 1
+    while IFS=$'\t' read -r kind ref; do
+      case "$kind" in
+        needs) owner_job "$cfile" "$crecords" "$ref" </dev/null || return 1 ;;
+        input)
+          [ "$(printf '%s\n' "$crecords" | grep -cE '^#PR(TARGET)?$')" -eq 0 ] || return 1
+          [ "$(printf '%s\n' "$crecords" | grep -c "^#CALLINPUTREQ	$(re_quote "$ref")$")" -gt 0 ] || return 1
+          caller_passes_anchor "$cfile" "$ref" "$((depth + 1))" </dev/null || return 1
+          ;;
+        *) return 1 ;;
+      esac
+    done <<< "$withs"
+  done <<< "$edges"
+  return 0
 }
 
 # `scope` empty means RUNNER2 is not asserted; `forks` is the declared posture.
@@ -1153,6 +1383,18 @@ EOF
         fi
         err RUNNER8 "$rel: job '$job' targets a Windows pool label and declares $rule8_keys — a Windows pool has NO container runtime (job isolation there is one local Windows account per slot, not a container), so this job fails at 'Initialize containers' before any step runs, with an error about docker on a host that has none"
       fi
+
+      # …and the half the label test cannot see (S2R#2151). An expression or a
+      # group names no OS, so `windows_pool` stays 0 and the rule above was
+      # skipped — for a job whose dynamic runner was ACCEPTED (by the flag or
+      # its marker), which is exactly the job that may land on Windows. Not
+      # asked of a job RUNNER5 already reports: that one is undecided already.
+      if [ "$windows_pool" -eq 0 ] && { [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ]; } &&
+         { [ "$has_container" -eq 1 ] || [ "$has_services" -eq 1 ]; } &&
+         { [ "$ALLOW_DYNAMIC" -eq 1 ] || dynamic_runner_declared "$file" "$job_base"; } &&
+         ! linux_pool_proven "$file" "$records" "$job" "$job_base" </dev/null; then
+        err RUNNER8 "$rel: job '$job' selects its runner dynamically and declares container: or services: — this gate cannot tell whether that pool is Windows, which has NO container runtime (prove it is Linux: resolve runs-on from the anchor's needs.<owner>.outputs.runs-on, or declare '# linux-pool($job_base): <why the pool is Linux>' beside the job)"
+      fi
     fi
 
       # --- RUNNER9/10/11: one host, one stack, per pull request ---------------
@@ -1186,9 +1428,20 @@ EOF
       if [ "$SHARED_INFRA" -eq 1 ] && [ "$has_pr_any" -eq 1 ] && [ "$hosted_only" -eq 0 ] &&
          { [ -n "$labels" ] || [ "$has_expr" -eq 1 ] || [ "$has_group" -eq 1 ] ||
            { [ "$reusable" -eq 1 ] && shared_infra_marker "$file" owner "$job_base"; }; }; then
-        local pins_to_anchor=0 is_owner=0 is_anchor=0
-        [ "$(printf '%s
-' "$records" | grep -c "^#RUNSONNEEDS	${job_re}	")" -gt 0 ] && pins_to_anchor=1
+        local pins_to_anchor=0 is_owner=0 is_anchor=0 pin_ref pin_refs pin_bad=0
+        # A pin, but only to the job that HOLDS the run's host (S2R#2149). Any
+        # `needs.X.outputs.*` used to count, so resolving the pool from a job
+        # that merely publishes a label — or from a job that does not exist —
+        # read as pinned. Every job the expression resolves from has to be an
+        # owner; one that is not is where the second host comes from.
+        pin_refs="$(printf '%s\n' "$records" | sed -n "s/^#RUNSONNEEDS\t${job_re}\t//p")"
+        if [ -n "$pin_refs" ]; then
+          while IFS= read -r pin_ref; do
+            [ -n "$pin_ref" ] || continue
+            owner_job "$file" "$records" "$pin_ref" </dev/null || pin_bad=1
+          done <<< "$pin_refs"
+          [ "$pin_bad" -eq 0 ] && pins_to_anchor=1
+        fi
         # ...unless the same expression can also resolve to a pool literal. A
         # `||` fallback is not a safety net here, it is the failure: the run
         # whose anchor did not publish is exactly the run that lands the job on
@@ -1246,12 +1499,17 @@ EOF
         #     than this gate could give by reading the caller's `with:` block.
         #     Optional, a caller that forgets one line gets the literal and a
         #     second host, silently, and the callee still reads clean here.
-        local pins_to_caller=0 in_name
+        #   - and every caller actually passes the ANCHOR (S2R#2170 / #380).
+        #     Required proves only that something was passed: `runner: ''` or
+        #     a hard-coded pool satisfies it and lands on a second host. So the
+        #     callers' `with:` values are read — see `caller_passes_anchor`.
+        local pins_to_caller=0 in_name abs_in
+        abs_in="$(abs_path "$file")"
         if [ "$has_own_pr" -eq 0 ]; then
           while IFS= read -r in_name; do
             [ -n "$in_name" ] || continue
             if [ "$(printf '%s\n' "$records" | grep -c "^#CALLINPUTREQ	$(re_quote "$in_name")$")" -gt 0 ]; then
-              pins_to_caller=1
+              caller_passes_anchor "$abs_in" "$in_name" 0 </dev/null && pins_to_caller=1
             fi
           done <<EOF
 $(printf '%s\n' "$records" | sed -n "s/^#RUNSONINPUT\t${job_re}\t//p")
@@ -1304,11 +1562,19 @@ EOF
 $CALL_EDGES
 EOF
 )"
+          # …and once per invocation PATH, not per direct edge (S2R#2150). An
+          # edge from a wrapper that a pull request calls twice is two stacks;
+          # a caller no seed reaches still counts once, as it did before.
+          local si_inv si_k
           if [ -n "$si_edges" ]; then
             while IFS=$'\t' read -r _ cfile cjob2; do
               [ -n "${cjob2:-}" ] || continue
-              SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}' (called from ${cfile#"$REPO_ROOT"/} job '${cjob2}')"$'
+              si_inv="$(invocation_count "$cfile" </dev/null)"
+              [ "${si_inv:-0}" -ge 1 ] 2>/dev/null || si_inv=1
+              for ((si_k = 1; si_k <= si_inv; si_k++)); do
+                SHARED_INFRA_OWNERS="${SHARED_INFRA_OWNERS}${rel}: job '${job}' (called from ${cfile#"$REPO_ROOT"/} job '${cjob2}', invocation ${si_k})"$'
 '
+              done
             done <<EOF
 $si_edges
 EOF
@@ -1404,6 +1670,7 @@ compute_reachable() {
   # once in a single process: edges left over from the previous fixture would be
   # counted against the next one's owners.
   CALL_EDGES=""
+  PR_SEEDS=""
   for f in "$@"; do
     # Both sides of every edge are canonicalised, because the two sides were
     # spelled differently: the caller was whatever the invocation passed —
@@ -1446,6 +1713,7 @@ EOF
 
   REACHABLE_PR="$seed"
   REACHABLE_PR_ANY="$seed"
+  PR_SEEDS="$seed"
   # Fixpoint rather than one hop: a caller may reach a callee that itself calls
   # another, and the pool at the end of that chain is as reachable as the first.
   while [ "$changed" -eq 1 ]; do
@@ -2685,8 +2953,8 @@ jobs:
     steps: [{id: pin, run: "true"}]' \
 'on: [pull_request]
 jobs:
-  test:
-    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
@@ -2727,7 +2995,16 @@ jobs:
   expect_si "the fork-routing fallback to a hosted image still pins" "" \
 'on: [pull_request]
 jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
   test:
+    needs: [anchor]
     runs-on: ${{ github.event.pull_request.head.repo.fork && '"'"'ubuntu-latest'"'"' || fromJSON(needs.anchor.outputs.runs-on) }}
     timeout-minutes: 30
     steps: [{run: "true"}]'
@@ -2740,7 +3017,16 @@ jobs:
   expect_si "a literal inside a condition is not a fallback" "" \
 'on: [pull_request]
 jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
   test:
+    needs: [anchor]
     runs-on: ${{ contains(github.ref, '"'"'main'"'"') && fromJSON(needs.anchor.outputs.runs-on) || fromJSON(needs.anchor.outputs.runs-on) }}
     timeout-minutes: 30
     steps: [{run: "true"}]'
@@ -2842,27 +3128,21 @@ jobs:
   # single file the callee looks like a job naming its pool; judged as a pair it
   # is a job whose pool the caller chose. The caller body is fixed, because what
   # varies between these three cases is the CALLEE.
+  # The optional fourth argument is what the caller passes as `runner:` — the
+  # anchor's output unless a case is about the caller passing something else.
   expect_si_callee() {
     local name="$1" want="$2" callee_body="$3"
+    local with_value="${4:-\${{ needs.anchor.outputs.runs-on \}\}}"
     local got out_text wf="$tmp/.github/workflows"
     mkdir -p "$wf"
-    cat > "$wf/caller.yml" <<'YAML'
-on: [pull_request]
-jobs:
-  anchor:
-    runs-on: [self-hosted, linux, gcp, ExampleRepo]
-    timeout-minutes: 30
-    outputs:
-      runs-on: ${{ steps.pin.outputs.runs-on }}
-    services:
-      db: {image: "postgres:16"}
-    steps: [{id: pin, run: "true"}]
-  scan:
-    needs: [anchor]
-    uses: ./.github/workflows/callee.yml
-    with:
-      runner: ${{ needs.anchor.outputs.runs-on }}
-YAML
+    printf '%s\n' 'on: [pull_request]' 'jobs:' '  anchor:' \
+      '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
+      '    outputs:' '      runs-on: ${{ steps.pin.outputs.runs-on }}' \
+      '    services:' '      db: {image: "postgres:16"}' '    steps: [{id: pin, run: "true"}]' \
+      '  setup:' '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
+      '    outputs:' '      pool: ${{ steps.p.outputs.pool }}' '    steps: [{id: p, run: "true"}]' \
+      '  scan:' '    needs: [anchor, setup]' '    uses: ./.github/workflows/callee.yml' \
+      '    with:' "      runner: $with_value" > "$wf/caller.yml"
     printf '%s\n' "$callee_body" > "$wf/callee.yml"
     out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA=1; SHARED_INFRA_OWNERS=""
       compute_reachable "$wf/caller.yml" "$wf/callee.yml" >/dev/null
@@ -2947,7 +3227,9 @@ jobs:
   # neither a label nor an expression both of these fell out of the rules
   # entirely -- two stacks in one run, reported clean.
   expect_si "two group-selected owners are still two stacks" "RUNNER10" \
-'on: [pull_request]
+'# linux-pool(a): the fleet group is the Linux pool
+# linux-pool(b): the fleet group is the Linux pool
+on: [pull_request]
 jobs:
   a:
     runs-on:
@@ -3065,6 +3347,239 @@ jobs:
     timeout-minutes: 30
     steps:
       - run: psql postgres://ci@localhost:35100/app'
+
+  # --- S2R#2149: a pin is a pin to the OWNER ---------------------------------
+  # `setup` publishes a pool label and starts nothing. Resolving from it is
+  # "any agent of that pool" — a second host, wearing the shape of the fix.
+  expect_si "a pin to a job that only publishes a pool is not a pin" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  setup:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [setup]
+    runs-on: ${{ fromJSON(needs.setup.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # --- S2R#2150: invocations counted over PATHS ------------------------------
+  # caller -> wrapper (twice) -> owner (once). Two direct edges into the owner
+  # would be needed for the old count to see it; there is one, and two stacks.
+  expect_si_wrapper() {
+    local name="$1" want="$2" caller_body="$3"
+    local got out_text wf="$tmp/.github/workflows"
+    mkdir -p "$wf"
+    printf '%s\n' "$caller_body" > "$wf/caller.yml"
+    printf '%s\n' 'on: [workflow_call]' 'jobs:' '  inner:' \
+      '    uses: ./.github/workflows/reusable.yml' > "$wf/wrapper.yml"
+    printf '%s\n' 'on: [workflow_call]' 'jobs:' '  up:' \
+      '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
+      '    services:' '      db: {image: "postgres:16"}' '    steps: [{run: "true"}]' > "$wf/reusable.yml"
+    out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA=1; SHARED_INFRA_OWNERS=""
+      compute_reachable "$wf/caller.yml" "$wf/wrapper.yml" "$wf/reusable.yml" >/dev/null
+      check_file "$wf/caller.yml" "" blocked
+      check_file "$wf/wrapper.yml" "" blocked
+      check_file "$wf/reusable.yml" "" blocked
+      shared_infra_owner_verdict 2>&1)"
+    got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
+    got="$(printf '%s' "$got" | sed 's/ *$//')"
+    rm -rf "$wf"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want ids [$want], got [$got]"
+      printf '%s\n' "$out_text" | sed 's/^/      /'
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+
+  expect_si_wrapper "a wrapper called twice starts the owner twice" "RUNNER10" \
+'on: [pull_request]
+jobs:
+  a:
+    uses: ./.github/workflows/wrapper.yml
+  b:
+    uses: ./.github/workflows/wrapper.yml'
+
+  expect_si_wrapper "a wrapper called once starts the owner once" "" \
+'on: [pull_request]
+jobs:
+  a:
+    uses: ./.github/workflows/wrapper.yml'
+
+  # --- S2R#2151: an accepted dynamic runner must PROVE it is Linux -----------
+  expect "an accepted dynamic runner with a container is undecidable" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: ${{ vars.POOL }}
+    container: node:20
+    timeout-minutes: 30
+    steps: [{run: "true"}]' 1
+
+  expect "a linux-pool declaration proves the dynamic pool" "" "" blocked \
+'# linux-pool(build): vars.POOL only ever names the Linux pool
+on: [push]
+jobs:
+  build:
+    runs-on: ${{ vars.POOL }}
+    container: node:20
+    timeout-minutes: 30
+    steps: [{run: "true"}]' 1
+
+  expect "a linux-pool declaration in a run string proves nothing" "RUNNER8" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: ${{ vars.POOL }}
+    container: node:20
+    timeout-minutes: 30
+    steps:
+      - run: |
+          # linux-pool(build): echoed, not declared
+          true' 1
+
+  expect_si "a pin to the anchor's runs-on proves a Linux pool" "" \
+'on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    container: node:20
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect_si "a pin to another anchor output proves no OS" "RUNNER8" \
+'on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.win-runs-on) }}
+    container: node:20
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # --- S2R#2152: a multi-line QUOTED scalar is string content ----------------
+  expect_si "an exemption inside a multi-line double-quoted run exempts nothing" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: "echo a
+          # shared-infra-exempt(test, #1): echoed, not declared
+          echo b"'
+
+  expect_si "an exemption inside a multi-line single-quoted run exempts nothing" "RUNNER9" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: '"'"'echo it'"'"''"'"'s
+          # shared-infra-exempt(test, #1): echoed, not declared
+          echo b'"'"''
+
+  expect "a dynamic-runner marker inside a quoted string accepts nothing" "RUNNER5" "" blocked \
+'on: [push]
+jobs:
+  build:
+    runs-on: ${{ vars.POOL }}
+    timeout-minutes: 30
+    steps:
+      - run: "echo
+          # dynamic-runner-allowed(build, #1): echoed, not declared
+          done"'
+
+  expect_si "a real comment after closed quoted values is still a declaration" "" \
+'on: [pull_request]
+jobs:
+  test:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    env:
+      MSG: "a # not a comment"
+      Q: '"'"'it'"'"''"'"'s'"'"'
+    steps:
+      - run: echo "an unbalanced quote in a plain scalar
+# shared-infra-exempt(test, #248): runs on the arm pool, touches no database'
+
+  # --- S2R#2153: host and band port in SEPARATE keys -------------------------
+  expect_si "a Windows job with the band port in a separate key" "RUNNER11" \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    env:
+      PGHOST: localhost
+      PGPORT: 35100
+    steps: [{run: "true"}]'
+
+  expect_si "a separate localhost and a non-band port is the job's own service" "" \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    env:
+      PGHOST: localhost
+      PGPORT: 8080
+    steps: [{run: "true"}]'
+
+  expect_si "a Windows step assigning host and band port separately" "RUNNER11" \
+'on: [pull_request]
+jobs:
+  win:
+    runs-on: [self-hosted, Windows, gcp, ExampleRepo]
+    timeout-minutes: 30
+    steps:
+      - run: PGHOST=localhost PGPORT=35100 psql -c "select 1"'
+
+  # --- S2R#2170 / #380: the caller has to pass the ANCHOR --------------------
+  local required_callee
+  required_callee='on:
+  workflow_call:
+    inputs:
+      runner: {required: true, type: string}
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner != '"'"''"'"' && fromJSON(inputs.runner) || fromJSON('"'"'["self-hosted","linux","gcp","ExampleRepo"]'"'"') }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  expect_si_callee "a required input passed as an empty string is not a pin" "RUNNER9" \
+    "$required_callee" "''"
+
+  expect_si_callee "a required input passed a hard-coded pool is not a pin" "RUNNER9" \
+    "$required_callee" "'[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]'"
+
+  expect_si_callee "a required input passed a non-owner's output is not a pin" "RUNNER9" \
+    "$required_callee" '${{ needs.setup.outputs.pool }}'
 
   rm -rf "$tmp"
   return "$status"
