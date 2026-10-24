@@ -161,6 +161,10 @@ has_container_runtime() { # <file>
   matches "$code" '^  ensure_user_manager \|\| rc=1$' || return 1
   matches "$code" 'systemctl start "user@\\\$uid\.service"' || return 1
   matches "$code" 'did not come back' || return 1
+  #    Not into the runtime dir the last job could write -- it is on the user
+  #    unit path -- and whatever starts with the manager is stopped again.
+  matches "$code" 'systemctl stop "user-runtime-dir@\\\$uid\.service"' || return 1
+  matches "$code" '^  stop_user_units "\\\$uid" \|\| return 1$' || return 1
   matches "$code" '! -d "/sys/fs/cgroup/user\.slice/user-\$uid\.slice/user@\$uid\.service"'
 }
 
@@ -2274,6 +2278,8 @@ mutate "DNS probe runs outside the netns" 's/ip netns exec "\$ns" getent ahostsv
 mutate "lingering slot not recorded"     's/: >"\$SLOT_STATE\/\$idx\/lingers"/:/'                       has_container_runtime
 mutate "reset no longer revives the manager" 's/^  ensure_user_manager || rc=1$/  :/'                     has_container_runtime
 mutate "a dead manager is left dead"     's/systemctl start "user@\\\$uid\.service"/true/'              has_container_runtime
+mutate "revived over the job's runtime dir" 's/systemctl stop "user-runtime-dir@\\\$uid\.service"/true/' has_container_runtime
+mutate "revived manager's units left running" 's/^  stop_user_units "\\\$uid" || return 1$/  :/'      has_container_runtime
 mutate "boot probe trusts the bus alone" 's/! -d "\/sys\/fs\/cgroup\/user\.slice/-z "\/sys\/fs\/cgroup\/user.slice/' has_container_runtime
 mutate "resolver left as the stub symlink" 's|mv -f /etc/resolv.conf.ci-new /etc/resolv.conf|rm -f /etc/resolv.conf.ci-new|'   has_host_resolver
 mutate "resolver pinning made non-fatal"   's|^  normalize_host_resolver \\$|  normalize_host_resolver \|\| true \\|'          has_host_resolver
