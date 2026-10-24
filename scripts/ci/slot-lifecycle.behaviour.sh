@@ -1114,7 +1114,12 @@ plant_and_stop() {
   # else still holding it leaves. The reset's stop of user-runtime-dir@ takes
   # the holder with it, as it would take that anything.
   timeout -k 5 30 systemctl stop hold-rtd-1622.service >/dev/null 2>&1
-  timeout -k 5 30 systemd-run --quiet --unit=hold-rtd-1622     -p Requires="user-runtime-dir@$SUID.service" -p After="user-runtime-dir@$SUID.service"     /bin/sleep infinity >>"$HOOKLOG" 2>&1
+  # Retried: the slice's own stop job, queued by the manager's stop, refuses a
+  # start ("transaction is destructive") until it has run.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    timeout -k 5 30 systemd-run --quiet --unit=hold-rtd-1622       -p Requires="user-runtime-dir@$SUID.service" -p After="user-runtime-dir@$SUID.service"       /bin/sleep infinity >>"$HOOKLOG" 2>&1 && break
+    sleep 1
+  done
   as_slot mkdir -p "$RTU/default.target.wants"
   as_slot sh -c "printf '[Service]\nExecStart=/bin/sleep 601\n[Install]\nWantedBy=default.target\n' >'$RTU/probe-1622.service'"
   as_slot ln -sf ../probe-1622.service "$RTU/default.target.wants/probe-1622.service"
