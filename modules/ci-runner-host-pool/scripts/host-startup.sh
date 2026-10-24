@@ -1272,6 +1272,16 @@ ensure_user_manager() {
   say "slot \$idx: \$u's user manager is not usable (\$(safe "\$seen")) -- no container could start; restarting it"
   loginctl enable-linger "\$u" >/dev/null 2>&1 ||
     say "slot \$idx: could not re-enable linger for \$u"
+  # NOT INTO THE RUNTIME DIRECTORY THE LAST JOB LEFT. /run/user/<uid> outlives a
+  # stopped manager and is the slot's to write, and \$XDG_RUNTIME_DIR/systemd/user
+  # is on the user unit path: a job that plants an enabled unit there and then
+  # kills its own manager would have this restart run it into the next job.
+  # Stopping user-runtime-dir@ removes the directory; the start recreates it empty.
+  timeout -k 5 60 systemctl stop "user-runtime-dir@\$uid.service" >/dev/null 2>&1
+  if [ -e "/run/user/\$uid" ]; then
+    say "slot \$idx: /run/user/\$uid survived stopping its unit -- refusing to start the manager over it"
+    return 1
+  fi
   timeout -k 5 60 systemctl start "user@\$uid.service" >/dev/null 2>&1
   until user_manager_usable "\$uid"; do
     n=\$((n + 1))
@@ -1282,6 +1292,9 @@ ensure_user_manager() {
     sleep 1.5
   done
   say "slot \$idx: restarted \$u's user manager"
+  # And whatever started WITH it is stopped, or the slot fails closed -- the
+  # same rule the quiesce applies, for a manager that came up after it ran.
+  stop_user_units "\$uid" || return 1
 }
 
 # WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
