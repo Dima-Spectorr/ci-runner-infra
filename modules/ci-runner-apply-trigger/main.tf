@@ -318,7 +318,7 @@ resource "google_cloudbuild_trigger" "apply" {
           2) echo "changes pending"; : > /workspace/.apply-pending
              terraform show -json tf.plan > /workspace/.tf-plan.json \
                || { echo "could not render the saved plan as JSON for the destroy guard"; exit 1; }
-             sha256sum "$PWD/tf.plan" /workspace/.tf-plan.json > /workspace/.tf-plan.sha256 \
+             sha256sum '${local.guard_plan_file}' /workspace/.tf-plan.json > /workspace/.tf-plan.sha256 \
                || { echo "could not hash the saved plan for the destroy guard"; exit 1; } ;;
           *) echo "terraform plan failed (exit $rc)"; exit "$rc" ;;
         esac

@@ -379,9 +379,10 @@ guards_destroys_before_apply() {
   # plan step hashes both, and the guard checks that pair — and stops — before
   # the call that reads the JSON. A check after the call, or one that does not
   # exit, binds nothing.
-  # A literal $PWD in a regex, not an expansion.
+  # The same absolute path the apply's hash names, so both bind one file. HCL
+  # interpolation, matched literally.
   # shellcheck disable=SC2016
-  matches "$code" 'sha256sum "\$PWD/tf\.plan" /workspace/\.tf-plan\.json > /workspace/\.tf-plan\.sha256' || return 1
+  matches "$code" "sha256sum '\\\$\{local\.guard_plan_file\}' /workspace/\.tf-plan\.json > /workspace/\.tf-plan\.sha256" || return 1
   local verify_n
   verify_n=$(printf '%s\n' "$body" | grep -nE '! sha256sum -c /workspace/\.tf-plan\.sha256; then$' | head -1 | cut -d: -f1)
   [ -n "$verify_n" ] && [ "$set_n" -lt "$verify_n" ] && [ "$verify_n" -lt "$call_n" ] || return 1
@@ -432,6 +433,24 @@ alert_policies_are_opt_in() {
   ! matches "$block" 'default[[:space:]]*=[[:space:]]*true' || return 1
 }
 
+# 21. No shell variable Cloud Build reads as a substitution. Cloud Build
+#     templates the build config before any step runs: `$PWD` or `${HOME}` in a
+#     step is a substitution key, and a key that is not a built-in refuses the
+#     WHOLE build at submit — no step, no log, an empty TRIGGER_NAME in
+#     `builds list`. The trigger is written by the apply it runs, so the first
+#     apply that ships one is the last apply that runs (2026-10-24: 'key in the
+#     template "PWD" is not a valid built-in substitution'). Lower-case shell
+#     variables are not substitution syntax, `$$` is Cloud Build's escape, and a
+#     built-in or a `_USER` key is meant.
+names_no_substitution_cloud_build_rejects() {
+  local refs
+  refs=$(code_of "$1" \
+    | grep -oE '(^|[^$])\$\{?[A-Z_][A-Z0-9_]*' \
+    | sed -E 's/^[^$]?\$\{?//' \
+    | grep -vxE '_[A-Z0-9_]+|PROJECT_ID|PROJECT_NUMBER|BUILD_ID|LOCATION|TRIGGER_NAME|TRIGGER_BUILD_CONFIG_PATH|COMMIT_SHA|SHORT_SHA|REVISION_ID|BRANCH_NAME|TAG_NAME|REF_NAME|REPO_NAME|REPO_FULL_NAME|SERVICE_ACCOUNT_EMAIL|SERVICE_ACCOUNT')
+  [ -z "$refs" ]
+}
+
 echo "apply-trigger self-test:"
 
 # The helpers carry the traps they were written to avoid, so they are checked
@@ -474,6 +493,7 @@ check guards_destroys_before_apply                "$MAIN" "the destroy guard is 
 check allows_only_template_replacements_by_default "$VARS" "unattended_destroy_allowed_types is broader than instance templates by default, accepts a pattern, or can name a type outside the fixed immutable set (#1567, #1588)"
 check pins_the_cloud_sdk_image                    "$MAIN" "a cloud-sdk step runs a floating tag — the reader that judges an unattended destroy can change with nothing merged (#1588)"
 check alert_policies_are_opt_in                   "$VARS" "manage_alert_policies is on by default — the next scheduled apply recreates every CI alert policy the owner deleted, and the emails start again (#1594)"
+check names_no_substitution_cloud_build_rejects "$MAIN" "a step names a shell variable Cloud Build reads as a substitution — every build of the trigger is refused at submit, and the trigger can never apply its own fix"
 
 mutate() { # <description> <file> <sed-program> <predicate> — predicate must go false
   local desc="$1" f="$2" prog="$3" pred="$4" tmp
@@ -629,6 +649,13 @@ mutate "'Docker Hub is faster' — a step moved to another, unpinned image" "$MA
 # "Four projects had no alerts, so make them the default" — the edit #1594 undid.
 mutate "'a project that forgets needs it most' — alerts back on by default" "$VARS" \
   '/^variable "manage_alert_policies"/,/^}/ s|default     = false|default     = true|' alert_policies_are_opt_in
+
+# The edit that shipped it: the plan's own directory, spelled the shell way.
+# shellcheck disable=SC2016
+mutate "'hash it where it sits' — the plan path taken from \$PWD" "$MAIN" \
+  "s|sha256sum '\${local.guard_plan_file}' /workspace/.tf-plan.json|sha256sum \"\$PWD/tf.plan\" /workspace/.tf-plan.json|" names_no_substitution_cloud_build_rejects
+mutate "'braces are safer' — the same variable in its braced form" "$MAIN" \
+  "s|sha256sum '\${local.guard_plan_file}' /workspace/.tf-plan.json|sha256sum \"\${HOME}/tf.plan\" /workspace/.tf-plan.json|" names_no_substitution_cloud_build_rejects
 
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
