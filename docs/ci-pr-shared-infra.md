@@ -553,9 +553,10 @@ label.
   host's slots drop `ci-unheld`. The run's other jobs reach the host through the
   `runs-on` the anchor publishes, which never contains `ci-unheld`.
 - **The wait is bounded.** If the pool can scale out, the anchor waits for a new
-  host. At `max_hosts`, it waits for a hold to end; the longest hold a host
-  grants is 2h (`PIN_MAX_TTL`). The anchor job's own `timeout-minutes` does not
-  count queue time.
+  host. At `max_hosts`, it waits for a hold to end. A hold ends about 10-12
+  minutes after its run completes (the host's pin sweep asks GitHub), and in any
+  case at its TTL; the longest TTL a host grants is 2h (`PIN_MAX_TTL`). The
+  anchor job's own `timeout-minutes` does not count queue time.
 - **"Re-run all jobs" moves the anchor to another host** (#1605). The re-run
   keeps its run id, and `ci-pin-hold` would admit it back on the host its first
   attempt still holds. But that host is held, so its slots do not carry
@@ -566,7 +567,10 @@ label.
   now follow the new host's label, so it lapses within its TTL (at most 2h); a
   reservation is cleared by the next pin sweep after that. Until then, that host
   serves only this run.
-  "Re-run failed jobs" does not re-run a successful anchor and is unaffected.
+  "Re-run failed jobs" does not re-run a successful anchor: the re-queued jobs
+  keep the old `host-*` label. Within 10 minutes of the run completing the hold
+  still stands and they find the stack. After that the hold has been released
+  and the stack torn down, so re-run all jobs instead.
 - **Forks** run on the hosted runner, as before; the input is ignored.
 
 **Rollout.** The label is registered by host bytes, not by the workflow. Until a

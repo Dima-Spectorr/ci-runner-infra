@@ -876,10 +876,17 @@ bounded by `min_hosts` — and the MIG brings up a clean one. Bounded: one sweep
 interval to detect, one recycle to replace. Visible: the failure is a reason
 string on the same series as the holds, not a slot that silently stopped
 existing. A host that cannot clean a slot is a host, and hosts here are
-disposable; a slot is not. It fires when the controller observes
-the run finished — it already lists that run's jobs — or when the TTL lapses,
-whichever comes first. The TTL is the backstop that keeps a controller outage
-from stranding a slot, and a band sweep catches a stack whose hold record was
+disposable; a slot is not. It fires when the host's pin sweep learns that
+the run finished, or when the TTL lapses, whichever comes first. The sweep asks
+GitHub (`pin-run-status.sh`, on a token scoped to Actions: read on the one
+repository) at most every 2 minutes, and releases only once the run has been
+reported completed for 10 minutes, so a full re-run started straight after
+still finds its stack. Nothing on the host can shorten a hold — the answer comes
+from the API, not from a file a job could write. Until this shipped the TTL was
+the only release: a 15-minute run under a 2-hour hold kept one slot of four out
+of service for the other 105 minutes. The TTL stays the backstop for every
+failure to ask — a refused mint, an API error, an answer that does not parse
+all keep the hold — and a band sweep catches a stack whose hold record was
 lost.
 
 ---

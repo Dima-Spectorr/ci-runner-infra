@@ -1331,7 +1331,18 @@ has_pin_hold() { # <file>
   # ...and the sweep never stops or starts an agent itself (#1481): a reserved
   # slot is kept out of service by its loop not registering it.
   ! matches "$code" 'systemctl (start|stop|disable)[^|]*"ci-runner@\\\$slot\.service"' || return 1
-  matches "$code" 'the slot loop re-registers it'
+  matches "$code" 'the slot loop re-registers it' || return 1
+
+  # A HOLD WHOSE RUN HAS COMPLETED IS RELEASED, not kept to its TTL: one run
+  # finished in 15 minutes and held its slot for 107 more. The sweep asks GitHub
+  # (never a file a job could write), on a token scoped to Actions: read, acts
+  # only after a grace, and ends the hold by expiring it, so the teardown and the
+  # reset run exactly as they do at expiry.
+  matches "$code" 'install_pin_run_status \|\| return 1' || return 1
+  matches "$code" 'tok=\$\(gh_token run-status\) \|\| exit 1' || return 1
+  matches "$code" "run-status\) perms='\{\"actions\":\"read\"\}' ;;" || return 1
+  matches "$code" '-ge "\\\$PIN_DONE_GRACE" \] && finished=1' || return 1
+  matches "$code" 'expiry=\\\$\(\(now - 1\)\)/" "\\\$RECORD"'
 }
 
 # --- the idle slot sweep ------------------------------------------------------
@@ -1626,6 +1637,18 @@ generated_scripts_parse() { # <file>
   # body is extracted verbatim (no unescaping) and parsed the same way.
   body=$(awk '
     /^install_slot_loop\(\) \{/ { f = 1 }
+    f && $0 == "    cat <<'"'"'EOF'"'"'" { on = 1; next }
+    on && $0 == "EOF" { exit }
+    on { print }
+  ' "$1")
+  [ -n "$body" ] || rc=1
+  tmp=$(mktemp)
+  printf '%s\n' "$body" >"$tmp"
+  bash -n "$tmp" >/dev/null 2>&1 || rc=1
+  rm -f "$tmp"
+  # pin-run-status is assembled the same way.
+  body=$(awk '
+    /^install_pin_run_status\(\) \{/ { f = 1 }
     f && $0 == "    cat <<'"'"'EOF'"'"'" { on = 1; next }
     on && $0 == "EOF" { exit }
     on { print }
@@ -2537,6 +2560,10 @@ mutate "the sweep stops the agent again"  's|^if \[ "\\\$expiry" -gt "\\\$now" \
 mutate "a returned slot never re-registered" 's@the slot loop re-registers it@done@'           has_pin_hold
 mutate "the stack survives expiry"          's@docker rm --force@docker ps --filter@'                                      has_pin_hold
 mutate "no reset after the hold"            's@/opt/ci/job-hooks/slot-reset.sh completed "\\\$slot"@true@'                  has_pin_hold
+mutate "a completed run is never asked about" 's@install_pin_run_status || return 1@:@'                                   has_pin_hold
+mutate "a completed run released at once"   's@-ge "\\\$PIN_DONE_GRACE" \] && finished=1@-ge 0 ] \&\& finished=1@'         has_pin_hold
+mutate "the run-status token widened"       's@run-status) perms=.{"actions":"read"}.@run-status) perms={"actions":"write"}@' has_pin_hold
+mutate "a finished hold kept live"          's@expiry=\\\$((now - 1))/" "\\\$RECORD"@expiry=\\\$((now + 1))/" "\\\$RECORD"@' has_pin_hold
 
 mutate "audit installed but not armed"       's@systemctl enable --now ci-baked-image-audit.timer@systemctl enable ci-baked-image-audit.timer@' has_baked_image_audit
 mutate "audit runs once and never again"     's@^OnUnitActiveSec=900$@@'                                              has_baked_image_audit

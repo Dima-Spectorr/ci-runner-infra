@@ -143,6 +143,7 @@ Terraform `github_repo` sets) and exactly the permissions its call path uses
 | Token | Minted by | `repositories` | `permissions` | Calls made with it |
 |---|---|---|---|---|
 | host registration | `host-startup.sh` `gh_token`, at boot | `[<pool repo>]` | `administration: write` | `POST .../actions/runners/registration-token` — nothing else |
+| host run status | `host-startup.sh` `gh_token run-status`, from `pin-run-status.sh` (root, called by the pin sweep while a hold is live, at most every 2 min) | `[<pool repo>]` | `actions: read` | `GET .../actions/runs/{run_id}` — whether the run holding a slot has completed; refused or failed keeps the hold to its TTL |
 | controller general | `controller-startup.sh` `gh_token` | `[<pool repo>]` | `actions: read`, `administration: write`, `checks: read`, `pull_requests: read` | runs, run jobs, runner list + `DELETE`, registration-token, `pulls`, `check-runs` |
 | controller general, narrowed | same, after a 422 on the set above | `[<pool repo>]` | `actions: read`, `administration: write` | the same, minus the parked sweep (which reports `DENIED`) |
 | controller general, admin only | same, after a 422 on the pair above | `[<pool repo>]` | `administration: write` | runner list + `DELETE` (drain, cordon, orphan reap), registration-token; demand is blind |
