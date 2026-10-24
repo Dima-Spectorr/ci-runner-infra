@@ -1319,6 +1319,25 @@ expand_into "$PINSWEEP" "$(body_of 'cat >/opt/ci/job-hooks/pin-sweep\.sh <<EOF')
 }
 chmod 0755 "$PINHOLD" "$PINSWEEP"
 
+# The sweep must never ask the real GitHub from here: this suite runs on a pool
+# host, where /opt/ci/job-hooks/pin-run-status.sh is the installed one. Its
+# path is swapped for a stub that answers from $STUB_RUN (absent = the helper
+# failed, i.e. unknown) and records every run id it is asked about.
+export STUB_RUN="$SB/run-status" STUB_RUN_CALLS="$SB/run-status-calls"
+RUNSTUB="$SB/run-status-stub"
+cat >"$RUNSTUB" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$STUB_RUN_CALLS"
+[ -f "$STUB_RUN" ] || exit 1
+cat "$STUB_RUN"
+STUB
+chmod 0755 "$RUNSTUB"
+sed -i "s@^PIN_RUN_STATUS=.*@PIN_RUN_STATUS=\"$RUNSTUB\"@" "$PINSWEEP"
+grep -qx "PIN_RUN_STATUS=\"$RUNSTUB\"" "$PINSWEEP" || {
+  echo "FAIL: the sweep's run-status helper could not be stubbed"
+  exit 1
+}
+
 HOLD="$PIN_DIR/host"
 SWEEPOUT="$SB/pin-sweep-output"
 BOOT=$(cat /proc/sys/kernel/random/boot_id)
@@ -1382,6 +1401,54 @@ run_pin_sweep
 check "nothing is published once it is released" test "$(puts)" = 1
 
 echo
+echo "pin hold: a hold whose run has completed is released, not kept to its expiry"
+# One run held its slot for 107 minutes after it finished: the hold lasts its
+# TTL, and nothing ended it sooner. The sweep now asks GitHub, and acts only
+# after the run has been seen completed for PIN_DONE_GRACE.
+done_reset() { rm -f -- "$PIN_DIR/.done-checked" "$PIN_DIR/.done-seen" "$STUB_RUN" "$STUB_RUN_CALLS"; }
+asks() { if [ -f "$STUB_RUN_CALLS" ]; then wc -l <"$STUB_RUN_CALLS" | tr -d ' '; else echo 0; fi; }
+
+done_reset; rm -f -- "$STUB_REFUSE"
+write_hold "$(( $(date +%s) + 600 ))"
+printf completed >"$STUB_RUN"
+run_pin_sweep
+check "the sweep asks about the run the record names" grep -qx 4242 "$STUB_RUN_CALLS"
+check "a run first seen completed keeps its hold"     test -f "$HOLD"
+check "and is stamped as seen"                        grep -q '^4242 ' "$PIN_DIR/.done-seen"
+check "and stays published"                           attr_is "4242 $(hold_expiry)"
+
+n=$(asks); run_pin_sweep
+check "the next tick does not ask again inside the interval" test "$(asks)" = "$n"
+
+printf '4242 %s\n' "$(( $(date +%s) - 700 ))" >"$PIN_DIR/.done-seen"; rm -f -- "$PIN_DIR/.done-checked"
+run_pin_sweep
+check "completed past the grace releases the hold"    test ! -e "$HOLD"
+check "and clears its attribute"                      attr_is ""
+check "and says the run completed"                    grep -q 'run 4242 completed' "$SWEEPOUT"
+check "and forgets the stamp"                         test ! -e "$PIN_DIR/.done-seen"
+
+done_reset; write_hold "$(( $(date +%s) + 600 ))"
+printf '4242 %s\n' "$(( $(date +%s) - 700 ))" >"$PIN_DIR/.done-seen"
+printf active >"$STUB_RUN"
+run_pin_sweep
+check "a run that is active again keeps its hold"     test -f "$HOLD"
+check "and loses its completed stamp"                 test ! -e "$PIN_DIR/.done-seen"
+
+done_reset; write_hold "$(( $(date +%s) + 600 ))"
+printf '4242 %s\n' "$(( $(date +%s) - 700 ))" >"$PIN_DIR/.done-seen"
+run_pin_sweep
+check "an unknown answer keeps the hold"              test -f "$HOLD"
+check "and keeps the stamp"                           test -e "$PIN_DIR/.done-seen"
+check "and the helper was asked"                      test "$(asks)" = 1
+
+done_reset; write_hold "$(( $(date +%s) + 600 ))"
+printf '9999 %s\n' "$(( $(date +%s) - 700 ))" >"$PIN_DIR/.done-seen"
+printf completed >"$STUB_RUN"
+run_pin_sweep
+check "another run's stamp does not count"            test -f "$HOLD"
+done_reset
+
+echo
 echo "pin hold: each assertion above fails against the bug it names"
 #
 # The same discipline as the structural suite's mutate(): break the sweep the
@@ -1419,6 +1486,16 @@ if mutant "$M" 's@>/dev/null 2>&1 || { say "could not publish@>/dev/null 2>\&1 |
   run_pin_sweep "$M"
   check_not "a swallowed refusal says nothing -- so the check is live" grep -q 'could not publish' "$SWEEPOUT"
 else bad "mutation did not apply: the refusal message"; fi
+
+# The sed pattern matches the literal $vars in the script under test.
+# shellcheck disable=SC2016
+if mutant "$M" 's@-ge "\$PIN_DONE_GRACE" \] && finished=1@-ge 0 ] \&\& finished=1@'; then
+  done_reset; rm -f -- "$STUB_REFUSE"; write_hold "$(( $(date +%s) + 600 ))"
+  printf completed >"$STUB_RUN"
+  run_pin_sweep "$M"
+  check_not "without the grace, a run is released on first sight -- so the check is live" test -f "$HOLD"
+  done_reset
+else bad "mutation did not apply: the completion grace"; fi
 
 rm -f -- "$HOLD" "$STUB_REFUSE"
 

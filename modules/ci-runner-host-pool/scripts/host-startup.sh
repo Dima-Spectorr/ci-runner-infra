@@ -271,8 +271,19 @@ host_admissible() { # <record> <now> <boot-id>
 # App private key rather than baked anywhere. The key itself is read from Secret
 # Manager at boot and never written to disk unencrypted for longer than the
 # signing call.
+#
+# gh_token [register|run-status] -- the scope is NAMED, from the fixed table
+# below, never passed as JSON: a caller cannot widen what this host may mint.
 gh_token() {
-  local key jwt header payload now
+  local key jwt header payload now perms
+  case "${1:-register}" in
+    register) perms='{"administration":"write"}' ;;
+    # The pin sweep asking whether the run that holds this host has finished
+    # (install_pin_run_status). Read-only, and a separate token: the
+    # registration token gains nothing.
+    run-status) perms='{"actions":"read"}' ;;
+    *) log "refusing to mint: '$(safe_for_log "$1")' is not a named scope"; return 1 ;;
+  esac
   key=$(gcloud secrets versions access latest --secret="$KEY_SECRET" 2>/dev/null)
   [ -n "$key" ] || { log "could not read App key from secret $KEY_SECRET"; return 1; }
 
@@ -302,9 +313,10 @@ gh_token() {
   #
   # DOWN-SCOPED (#1419): ONE repository, ONE permission. An unscoped mint carries
   # every permission the App holds on every repository of the installation, and
-  # this host runs untrusted job code. The only call made with this token is
+  # this host runs untrusted job code. The `register` token serves
   # generate-jitconfig and the runner DELETE below, which need Administration:
-  # write and nothing else
+  # write and nothing else; the `run-status` token serves one GET of one run,
+  # which needs Actions: read and nothing else
   # (metadata: read is implicit on every token). A refused scoped mint is FATAL
   # to this boot and never retried unscoped: widening the token to get past a
   # 422 is exactly the exposure the scope removes.
@@ -315,7 +327,7 @@ gh_token() {
     "" | *[!A-Za-z0-9_.-]*) log "refusing to mint: '$REPO' is not a bare repository name"; return 1 ;;
   esac
   local body resp code
-  body=$(printf '{"repositories":["%s"],"permissions":{"administration":"write"}}' "$REPO")
+  body=$(printf '{"repositories":["%s"],"permissions":%s}' "$REPO" "$perms")
   # Body and status in one capture, never a file: the body IS the token.
   resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
@@ -325,9 +337,9 @@ gh_token() {
   code=${resp##*$'\n'}
   if [ "$code" != 201 ]; then
     local hint=""
-    [ "$code" = 422 ] && hint=" -- the installation lacks Administration: write or does not select this repository; NOT retried unscoped"
+    [ "$code" = 422 ] && hint=" -- the installation lacks that permission or does not select this repository; NOT retried unscoped"
     # The message only, never the body: a 2xx body is a token.
-    log "installation token mint (repositories=[$REPO] administration=write) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
+    log "installation token mint (repo $REPO, scope $perms) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
     return 1
   fi
   printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
@@ -415,7 +427,7 @@ mint_jit() { # <idx> <envfile> [unheld:0|1]
   local idx="$1" envfile="$2" tok group labels name body resp code out id try
   group=$(runner_group_id) || return 1
   labels=$(jit_labels_json "$idx" "${3:-0}") || return 1
-  tok=$(gh_token) || return 1
+  tok=$(gh_token register) || return 1
   [ -n "$tok" ] || return 1
   for try in 1 2; do
     name="$HOSTNAME_SHORT-s$idx-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -471,7 +483,7 @@ sys.stdout.write("%d\n%s" % (rid, base64.b64encode(json.dumps(cfg).encode()).dec
 # job is never taken away from here.
 delete_runner() { # <id>
   local tok code
-  tok=$(gh_token) || return 1
+  tok=$(gh_token register) || return 1
   code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
     -H "Accept: application/vnd.github+json" \
@@ -2308,8 +2320,10 @@ install_slot_reset_sudoers() {
 #   MONOTONIC.  There is no verb that shortens or removes a hold. `renew`
 #   extends by the TTL RECORDED IN THE HOLD, never by one the caller supplies,
 #   and any slot on the host may call it — a co-tenant must be able to keep a
-#   host alive and must not be able to release someone else's. Expiry is the
-#   only way a hold ends, and the sweeper is the only thing that acts on it.
+#   host alive and must not be able to release someone else's. The sweeper is
+#   the only thing that ends a hold: at its expiry, or once GITHUB says the run
+#   that holds it has completed (install_pin_run_status) — a fact no job on the
+#   host can forge.
 #
 #   THE INDEX IS NEVER AN ARGUMENT.  Same rule slot-reset.sh states: which slot
 #   is speaking comes from SUDO_UID, which sudo sets itself and env_reset
@@ -2630,6 +2644,7 @@ EOF
   chmod 0755 /usr/local/bin/ci-pin-hold || return 1
 
   install_pin_hold_sudoers || return 1
+  install_pin_run_status || return 1
   install_pin_sweep || return 1
 }
 
@@ -2640,8 +2655,8 @@ install_pin_hold_sudoers() {
     echo "# Written by host-startup.sh. Lets a slot take, extend and read the"
     echo "# host's pin hold. There is no verb here that shortens or removes one:"
     echo "# a co-tenant must be able to keep a host alive and must not be able to"
-    echo "# release somebody else's run. Expiry is the only end, and the sweeper"
-    echo "# is the only thing that acts on it."
+    echo "# release somebody else's run. The sweeper is the only thing that ends"
+    echo "# one: at its expiry, or once GitHub says its run has completed."
     echo "#"
     echo "# The reserve form takes a wildcard because its arguments are a run id"
     echo "# and a duration nobody can enumerate here. What bounds it is the first"
@@ -2660,6 +2675,77 @@ install_pin_hold_sudoers() {
     return 1
   fi
   install -o root -g root -m 0440 "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
+# --- has the holding run finished? --------------------------------------------
+#
+# A hold used to end only at its expiry, and an anchor asks for a TTL that
+# covers its slowest run: IntegrateIT asks for the 2-hour clamp, its runs take
+# about 15 minutes, and a reserving hold keeps one slot unregistered the whole
+# time. Measured 2026-10-22: run 39802304582 completed at 15:24Z and its slot
+# came back at 17:11Z, and every sweep in six hours was an expiry -- one slot in
+# four missing on every held host, on a pool already at max_hosts.
+#
+# So the sweep asks GitHub. `pin-run-status.sh <run id>` prints `completed` or
+# `active`, and exits non-zero when it could not tell -- which the sweep reads as
+# "keep the hold": the TTL stays the backstop for every failure here. The answer
+# comes from the API and not from the host because nothing a job can write on
+# this host may shorten a hold (MONOTONIC, above).
+#
+# Its token is minted with the `run-status` scope: Actions read on this one
+# repository, nothing else. Assembled from this file's own functions (declare
+# -f), as the slot loop is, so the mint it runs is the one reviewed here.
+install_pin_run_status() {
+  local f=/opt/ci/job-hooks/pin-run-status.sh tmp
+  tmp=$(mktemp) || return 1
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Installed by host-startup.sh. Runs as root, called by pin-sweep.sh. See install_pin_run_status().\n'
+    printf 'set -uo pipefail\n'
+    printf 'PATH=%q\n' "$PATH"
+    printf 'LOG_TAG=ci-pin-sweep\n'
+    declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET CURL_TIMEOUTS
+    declare -f log safe_for_log gh_token
+    cat <<'EOF'
+
+# GITHUB_RUN_ID is a number. The hold accepts a wider shape, and anything that
+# is not a number here is a run this host cannot ask about: unknown, so kept.
+run="${1:-}"
+case "$run" in
+  '' | *[!0-9]*) log "pin-run-status: '$(safe_for_log "$run")' is not a run id -- cannot tell"; exit 2 ;;
+esac
+[ "${#run}" -le 20 ] || exit 2
+
+tok=$(gh_token run-status) || exit 1
+[ -n "$tok" ] || { log "pin-run-status: the token mint returned nothing"; exit 1; }
+
+# The token is not an argument, for the reason gh_token's JWT is not one.
+resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -w '\n%{http_code}' \
+  -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/$OWNER/$REPO/actions/runs/$run") || resp=$'\n000'
+code=${resp##*$'\n'}
+if [ "$code" != 200 ]; then
+  log "pin-run-status: run $run: HTTP $code -- cannot tell, the hold is kept"
+  exit 1
+fi
+body=${resp%$'\n'*}
+
+# No jq on the host. The run object's own `id` and `status` come before every
+# nested object in GitHub's rendering, so the FIRST of each is the run's -- and
+# the id is checked against the one asked for, so an answer about anything else
+# reads as unknown rather than as a verdict.
+id=$(printf '%s' "$body" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -n 1 | grep -o '[0-9]*$')
+status=$(printf '%s' "$body" | grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z_]*"' | head -n 1 | sed 's/.*"\([a-z_]*\)"$/\1/')
+if [ "$id" != "$run" ] || [ -z "$status" ]; then
+  log "pin-run-status: run $run: the answer did not parse -- cannot tell, the hold is kept"
+  exit 1
+fi
+if [ "$status" = completed ]; then echo completed; else echo active; fi
+EOF
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  install -o root -g root -m 0700 "$tmp" "$f" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
@@ -2688,6 +2774,17 @@ PIN_DIR="$PIN_DIR"
 RECORD="\$PIN_DIR/host"
 LOCK="\$PIN_DIR/.lock"
 
+# Releasing a live hold whose run has completed (install_pin_run_status). Asked
+# at most every PIN_DONE_EVERY seconds -- one token mint and one GET -- and
+# acted on only once the run has been seen completed for PIN_DONE_GRACE: a full
+# re-run started within that window takes the host again rather than finding
+# its stack gone. "Seen" is this host's own clock, written by the sweep alone.
+PIN_RUN_STATUS="/opt/ci/job-hooks/pin-run-status.sh"
+PIN_DONE_EVERY=120
+PIN_DONE_GRACE=600
+CHECKED="\$PIN_DIR/.done-checked"
+SEEN="\$PIN_DIR/.done-seen"
+
 say() { logger -t ci-pin-sweep -- "\$*" 2>/dev/null || true; echo "pin sweep: \$*" >&2; }
 
 # The same PUT as ci-pin-hold's publish, and the same failure handling: a write
@@ -2712,6 +2809,27 @@ published() {
 }
 
 [ -f "\$RECORD" ] || exit 0
+
+# Has the holding run completed? Asked BEFORE the lock, because the question is
+# two calls to GitHub of up to 30s each, and ci-pin-hold gives up on the lock
+# after 15 -- an anchor refused because the sweep was on the network. The answer
+# is only a hint until the locked read below finds the SAME run in the record.
+done_run=""; done_answer=""
+pre_run=\$(sed -n 's/^run=//p' "\$RECORD" 2>/dev/null | head -n 1)
+pre_expiry=\$(sed -n 's/^expiry=//p' "\$RECORD" 2>/dev/null | head -n 1)
+case "\$pre_run:\$pre_expiry" in
+  *[!0-9:]* | :* | *:) ;;
+  *)
+    now=\$(date +%s)
+    last=\$(cat "\$CHECKED" 2>/dev/null) || last=0
+    case "\$last" in '' | *[!0-9]*) last=0 ;; esac
+    if [ "\$pre_expiry" -gt "\$now" ] && [ \$((now - last)) -ge "\$PIN_DONE_EVERY" ] && [ -x "\$PIN_RUN_STATUS" ]; then
+      printf '%s' "\$now" >"\$CHECKED" 2>/dev/null || true
+      done_run=\$pre_run
+      done_answer=\$("\$PIN_RUN_STATUS" "\$pre_run" 2>/dev/null) || done_answer=""
+    fi
+    ;;
+esac
 
 # The SAME lock ci-pin-hold takes to admit a run. Without it a sweep releasing
 # an expired reservation and an anchor deciding the host is free ran against
@@ -2754,39 +2872,77 @@ if [ "\$boot" != "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
   # ends the veto, and it goes BEFORE the local record -- once that is deleted
   # nothing on this host knows which run to clear.
   publish ""
-  rm -f -- "\$RECORD"
+  rm -f -- "\$RECORD" "\$SEEN"
   exit 0
 fi
 
 if [ "\$expiry" -gt "\$now" ]; then
-  # Live. REPUBLISHED UNTIL CONFIRMED (#1393). The controller reads the
-  # attribute, not this file, and the PUT that took the hold is best effort. On a
-  # host that never wrote ci/ before, one lost PUT is a host the controller
-  # reads as FREE (#1384), and the next job's renew -- the only other writer --
-  # may never come. So every tick reads the attribute back and writes it
-  # whenever it is not the record on disk: absent, different and unreadable all
-  # mean write. A confirmed value costs one local GET and no write. An expired
-  # hold never reaches this line; the release paths below clear it instead.
-  want="\$run \$expiry"
-  have=\$(published) || have=""
-  [ "\$have" = "\$want" ] || publish "\$want"
+  # Live -- unless GitHub has said, this tick, that the run holding it has
+  # completed, and said so for at least PIN_DONE_GRACE. The answer was taken
+  # before the lock, so it counts only for the run the record still names.
+  finished=0
+  if [ -n "\$done_run" ] && [ "\$done_run" = "\$run" ]; then
+    case "\$done_answer" in
+      completed)
+        seen=\$(sed -n "s/^\$run //p" "\$SEEN" 2>/dev/null | head -n 1)
+        case "\$seen" in '' | *[!0-9]*) seen=\$now; printf '%s %s\n' "\$run" "\$now" >"\$SEEN" ;; esac
+        # Released only on a tick that has JUST been told completed, so the
+        # newest answer decides -- never a stale one a re-run has since made
+        # wrong.
+        [ \$((now - seen)) -ge "\$PIN_DONE_GRACE" ] && finished=1
+        ;;
+      active) rm -f -- "\$SEEN" ;;
+      # Anything else is unknown -- the mint, the call or the parse failed.
+      # Nothing changes: the hold stands, and its expiry still ends it.
+    esac
+  fi
 
-  # Nothing is stopped here (#1481). A RESERVED slot is kept out of service by
-  # NOT being registered again: its slot loop reads this record before every
-  # registration and waits while it reserves the slot. The agent that ran the
-  # reserving job took that one job and exited, so between jobs there is no
-  # runner to hand the run's stack to.
-  exit 0
+  if [ "\$finished" = 0 ]; then
+    # REPUBLISHED UNTIL CONFIRMED (#1393). The controller reads the
+    # attribute, not this file, and the PUT that took the hold is best effort.
+    # On a host that never wrote ci/ before, one lost PUT is a host the
+    # controller reads as FREE (#1384), and the next job's renew -- the only
+    # other writer -- may never come. So every tick reads the attribute back and
+    # writes it whenever it is not the record on disk: absent, different and
+    # unreadable all mean write. A confirmed value costs one local GET and no
+    # write. An expired or finished hold never reaches this line; the release
+    # paths below clear it instead.
+    want="\$run \$expiry"
+    have=\$(published) || have=""
+    [ "\$have" = "\$want" ] || publish "\$want"
+
+    # Nothing is stopped here (#1481). A RESERVED slot is kept out of service by
+    # NOT being registered again: its slot loop reads this record before every
+    # registration and waits while it reserves the slot. The agent that ran the
+    # reserving job took that one job and exited, so between jobs there is no
+    # runner to hand the run's stack to.
+    exit 0
+  fi
+  say "run \$run completed \$((now - seen))s ago -- ending its hold on slot \$slot now, not at its expiry in \$((expiry - now))s"
+  # ENDED BY EXPIRING IT, so everything below runs exactly as it does at
+  # expiry. The reset this sweep calls spares a reserved slot whose hold is
+  # still live -- it would keep the run's containers and image tags -- and a
+  # teardown that fails leaves an EXPIRED record, which the next tick retries
+  # and ci-pin-hold already refuses to hand out. Replaced by rename, as
+  # ci-pin-hold writes it.
+  tmp=\$(mktemp "\$PIN_DIR/.host.XXXXXX") || { say "could not rewrite the hold -- it stands until its expiry"; exit 0; }
+  if sed "s/^expiry=.*/expiry=\$((now - 1))/" "\$RECORD" >"\$tmp" && chmod 0644 "\$tmp" && mv -f -- "\$tmp" "\$RECORD"; then
+    expiry=\$((now - 1))
+  else
+    rm -f -- "\$tmp"
+    say "could not rewrite the hold -- it stands until its expiry"
+    exit 0
+  fi
+else
+  # --- expired ----------------------------------------------------------------
+  say "run \$run's hold on slot \$slot expired \$((now - expiry))s ago"
 fi
-
-# --- expired ------------------------------------------------------------------
-say "run \$run's hold on slot \$slot expired \$((now - expiry))s ago"
 
 # A hold that reserved nothing owns no stack and no slot: the slot loop's
 # end-of-job reset already cleaned it, and it never left service. Releasing
 # is the whole of the work.
 if [ "\$reserve" != 1 ]; then
-  rm -f -- "\$RECORD"
+  rm -f -- "\$RECORD" "\$SEEN"
   publish ""
   say "released — the host is available to the next run"
   exit 0
@@ -2854,7 +3010,7 @@ fi
 # Removing the record is what returns the slot: its loop sees the reservation
 # gone, resets the slot once more and registers it for its next job. A cordoned
 # or draining host is the loop's to refuse, not this sweep's.
-rm -f -- "\$RECORD"
+rm -f -- "\$RECORD" "\$SEEN"
 publish ""
 say "slot \$slot: torn down and reset -- the slot loop re-registers it"
 exit 0

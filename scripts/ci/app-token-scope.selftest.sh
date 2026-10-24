@@ -158,20 +158,21 @@ gh_rate_note() { :; }
 '
 
 # run_mint <file> <codes...> — runs gh_token from <file>, prints "rc=<n>".
+# T_SCOPE names the scope argument; unset calls gh_token with none.
 run_mint() {
   local file="$1"; shift
   W="$WORK/run"; rm -rf "$W"; mkdir -p "$W/state"
   printf '%s\n' "$@" >"$W/codes"
   : >"$W/calls"; : >"$W/events"
-  W="$W" T_REPO="${T_REPO:-}" bash -c "
+  W="$W" T_REPO="${T_REPO:-}" T_SCOPE="${T_SCOPE:-}" bash -c "
     set -uo pipefail
     STATE_DIR=\"\$W/state\"; LOG=/dev/null; REPO=\"\${T_REPO:-svc-repo}\"; REPO_FULL=\"own/\$REPO\"
     INSTALL_ID=11; APP_ID=22; KEY_SECRET=k; CURL_TIMEOUTS=(); GH_TOKEN=''; GH_TOKEN_EXPIRY=0
-    log() { :; }
+    log() { :; }; safe_for_log() { printf %s \"\$1\"; }
     $STUBS
     $(fn gh_token "$file")
     ${T_PRE:-}
-    out=\$(gh_token); rc=\$?
+    out=\$(gh_token \${T_SCOPE:+\"\$T_SCOPE\"}); rc=\$?
     printf 'rc=%s out=%s' \"\$rc\" \"\$out\"
   " 2>&1
 }
@@ -244,6 +245,17 @@ check "host: mint body" "$HOSTB" "$(calls)"
 # Host: refused is fatal to the boot, never retried unscoped.
 r=$(run_mint "$HOST" 422)
 check "host: 422 is refused, one call only" "rc=1 out= $HOSTB" "$r $(calls)"
+
+# Host: the run-status scope (pin-run-status.sh asking whether the run that
+# holds a slot has completed) is Actions: read and nothing else — not even
+# the registration scope.
+r=$(T_SCOPE=run-status run_mint "$HOST" 201)
+check "host: run-status mint succeeds" "rc=0 out=tok-1" "$r"
+check "host: run-status mint body" '{"repositories":["svc-repo"],"permissions":{"actions":"read"}}' "$(calls)"
+
+# Host: a scope nobody named mints nothing at all, rather than a default.
+r=$(T_SCOPE=everything run_mint "$HOST" 201)
+check "host: unnamed scope mints nothing" "rc=1 out= " "$r $(calls)"
 
 # Host: a repository name that could break the JSON body mints nothing.
 r=$(T_REPO='x","y' run_mint "$HOST" 201)
