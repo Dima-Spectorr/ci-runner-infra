@@ -551,11 +551,17 @@ that image a real answer is separate work, not a line in this one.
   manager, which refuses an unprivileged caller with *Interactive authentication
   required*. Image builds keep working — buildkit needs no scope — and starting
   a container does not. `loginctl enable-linger` plus a per-slot
-  `DBUS_SESSION_BUS_ADDRESS` is what makes the two agree.
+  `DBUS_SESSION_BUS_ADDRESS` is what makes the two agree. Linger starts the
+  manager only at setup and at boot, so if it stops later, every `docker run`
+  fails on `user-<uid>.slice/cgroup.controllers` while `docker info` stays
+  healthy. The slot reset therefore re-asserts linger and restarts the manager
+  before it marks a slot clean, and fails the slot closed if the manager will
+  not come back.
 * **The boot probe asserts the capability, not the daemon.** Both faults above
   left `docker info` answering, so a probe that only asked the daemon whether it
   was up passed on hosts where no job could run a container. It now also
-  requires the slot's user bus to exist and the slot user to resolve a name. It
+  requires the slot's user bus and its `user@<uid>.service` cgroup to exist, and
+  the slot user to resolve a name. It
   deliberately does not start a container: that would need an image, and would
   turn a registry outage into a fleet that refuses to register.
 * **`/tmp` is per slot, and the slot's daemon shares it.** Slots are separate

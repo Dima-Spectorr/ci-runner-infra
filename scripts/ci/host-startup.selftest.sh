@@ -152,7 +152,16 @@ has_container_runtime() { # <file>
   # Resolution is proved from INSIDE the slot's network namespace, which is
   # where a job runs: the host's systemd-resolved stub does not exist there, so
   # a probe run in the host namespace answers a question nobody asked.
-  matches "$code" 'ip netns exec "\$ns" getent ahostsv4'
+  matches "$code" 'ip netns exec "\$ns" getent ahostsv4' || return 1
+  # 4. The manager can STOP after boot, and linger never starts it again (#1622):
+  #    the reset brings it back for a slot provisioning marked as lingering, and
+  #    fails closed when it cannot; the boot probe asserts its cgroup, not only
+  #    its bus socket.
+  matches "$code" ': >"\$SLOT_STATE/\$idx/lingers"' || return 1
+  matches "$code" '^  ensure_user_manager \|\| rc=1$' || return 1
+  matches "$code" 'systemctl start "user@\\\$uid\.service"' || return 1
+  matches "$code" 'did not come back' || return 1
+  matches "$code" '! -d "/sys/fs/cgroup/user\.slice/user-\$uid\.slice/user@\$uid\.service"'
 }
 
 # A slot whose DAEMON cannot resolve, on a host where every other probe passes.
@@ -2262,6 +2271,10 @@ mutate "slot no longer lingers"          's/loginctl enable-linger/# loginctl en
 mutate "daemon left on the system bus"   's|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus|DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket|' has_container_runtime
 mutate "probe back to daemon-only"       's/slot_runtime_usable "\$idx" "\$u" || return 1/: /'         has_container_runtime
 mutate "DNS probe runs outside the netns" 's/ip netns exec "\$ns" getent ahostsv4/getent ahostsv4/'      has_container_runtime
+mutate "lingering slot not recorded"     's/: >"\$SLOT_STATE\/\$idx\/lingers"/:/'                       has_container_runtime
+mutate "reset no longer revives the manager" 's/^  ensure_user_manager || rc=1$/  :/'                     has_container_runtime
+mutate "a dead manager is left dead"     's/systemctl start "user@\\\$uid\.service"/true/'              has_container_runtime
+mutate "boot probe trusts the bus alone" 's/! -d "\/sys\/fs\/cgroup\/user\.slice/-z "\/sys\/fs\/cgroup\/user.slice/' has_container_runtime
 mutate "resolver left as the stub symlink" 's|mv -f /etc/resolv.conf.ci-new /etc/resolv.conf|rm -f /etc/resolv.conf.ci-new|'   has_host_resolver
 mutate "resolver pinning made non-fatal"   's|^  normalize_host_resolver \\$|  normalize_host_resolver \|\| true \\|'          has_host_resolver
 mutate "probe back to a name in /etc/hosts" 's|^DNS_PROBE_NAME=.*|DNS_PROBE_NAME="metadata.google.internal"|'                  has_host_resolver

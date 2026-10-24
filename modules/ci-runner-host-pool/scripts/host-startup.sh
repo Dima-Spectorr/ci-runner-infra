@@ -1233,6 +1233,57 @@ user_manager_pids() { # <uid> -- one pid per line
   case "\$d" in '' | 0 | *[!0-9]*) ;; *) printf '%s\n' "\$d" ;; esac
 }
 
+# THE SLOT'S USER MANAGER, RE-ESTABLISHED AND THEN ASSERTED (#1622).
+#
+# stop_user_units reads "no manager" as "nothing to stop", which is true, and
+# then the marker went on a slot no job can use: runc creates every container's
+# scope in \`user-<uid>.slice/user@<uid>.service\`, and with that slice gone each
+# \`docker run\` dies with
+#
+#   open /sys/fs/cgroup/user.slice/user-<uid>.slice/cgroup.controllers: no such file or directory
+#
+# while \`docker info\` stays healthy. Seen 2026-10-24 on slot 4 of three
+# IntegrateIT hosts, every job failing at its first container and the slot
+# taking the next one. Linger starts the manager when the account is set up and
+# at boot; nothing starts it again if it stops, so the reset does.
+#
+# Only for a slot provisioning set up to linger -- the root-owned marker it
+# writes beside \`loginctl enable-linger\`, which outlives a lost linger flag.
+# Linger is re-asserted, the manager started, and the slice and the bus waited
+# for. A manager that will not come back FAILS CLOSED: no marker, a burn, and
+# the slot is condemned rather than handed jobs that cannot start a container.
+user_manager_usable() { # <uid>
+  timeout -k 5 10 systemctl -q is-active "user@\$1.service" 2>/dev/null || return 1
+  [ -S "/run/user/\$1/bus" ] || return 1
+  # cgroup v2 only: that is the hierarchy the fault is in, and v1 has no slice dir.
+  [ ! -f /sys/fs/cgroup/cgroup.controllers ] || [ -d "/sys/fs/cgroup/user.slice/user-\$1.slice/user@\$1.service" ]
+}
+ensure_user_manager() {
+  local uid n=0 seen
+  [ -f "\$SLOT_STATE/\$idx/lingers" ] || return 0
+  uid=\$(id -u "\$u" 2>/dev/null) ||
+    { say "slot \$idx: could not resolve the uid of \$u -- refusing to call this slot clean"; return 1; }
+  user_manager_usable "\$uid" && return 0
+  # What it looked like, so the next occurrence names who stopped it.
+  seen=\$(timeout -k 5 10 systemctl show -p ActiveState,Result,ExecMainStatus,InactiveEnterTimestamp "user@\$uid.service" 2>/dev/null | tr '\n' ' ')
+  [ -e "/var/lib/systemd/linger/\$u" ] && seen="\$seen linger=yes" || seen="\$seen linger=NO"
+  [ -S "/run/user/\$uid/bus" ] && seen="\$seen bus=yes" || seen="\$seen bus=NO"
+  [ -d "/sys/fs/cgroup/user.slice/user-\$uid.slice" ] && seen="\$seen slice=yes" || seen="\$seen slice=NO"
+  say "slot \$idx: \$u's user manager is not usable (\$(safe "\$seen")) -- no container could start; restarting it"
+  loginctl enable-linger "\$u" >/dev/null 2>&1 ||
+    say "slot \$idx: could not re-enable linger for \$u"
+  timeout -k 5 60 systemctl start "user@\$uid.service" >/dev/null 2>&1
+  until user_manager_usable "\$uid"; do
+    n=\$((n + 1))
+    if [ "\$n" -ge 20 ]; then
+      say "slot \$idx: \$u's user manager did not come back -- no container could start, refusing to call this slot clean"
+      return 1
+    fi
+    sleep 1.5
+  done
+  say "slot \$idx: restarted \$u's user manager"
+}
+
 # WHAT A JOB LEFT RUNNING OUTSIDE A CONTAINER.
 #
 # \`docker rm --force\` covers what a job left inside one. It does not cover
@@ -2109,6 +2160,13 @@ fi
 # marker asserts only the template state of the home and the workspace. The
 # sweeper's teardown at expiry runs this same reset with the hold gone, and
 # nothing a run left behind outlives the run.
+#
+# AND THAT A CONTAINER CAN START HERE AT ALL (#1622): after the quiesce, so
+# nothing above can take the manager it brings back. Held slots too -- a run's
+# later jobs need it as much as a fresh one does.
+if [ "\$stage" != started ]; then
+  ensure_user_manager || rc=1
+fi
 if [ "\$rc" = 0 ] && [ "\$stage" != started ]; then
   : >"\$marker" || rc=1
   # AND THEN LOOKED FOR, BY ITS OWN PATH (#1499). The write above goes through a
@@ -5337,6 +5395,10 @@ provision_slot_user() {
   # the `clean` marker that decides whether its next job is allowed to run.
   install -d -o root -g root -m 0755 "$SLOT_STATE" || return 1
   install -d -o root -g root -m 0755 "$SLOT_STATE/$idx" || return 1
+  # The slot lingers, recorded where the slot cannot reach it: every reset from
+  # here on brings the user manager back if it has stopped (#1622). Not the
+  # linger flag itself -- losing that is one of the ways the manager goes.
+  : >"$SLOT_STATE/$idx/lingers" || return 1
   # Where slot-reset.sh holds _work while it empties it. Root-owned and 0700 on
   # both levels, because the whole point is a directory the slot cannot create a
   # name in while root is walking one.
@@ -5822,6 +5884,13 @@ slot_runtime_usable() { # <idx> <user>
   # The user manager, so runc can create its scope.
   if [ ! -S "/run/user/$uid/bus" ]; then
     log "slot $idx: no user D-Bus at /run/user/$uid/bus — no container could create its cgroup scope"
+    return 1
+  fi
+  # …and the slice that scope goes in. A bus socket can outlive the manager
+  # that served it; runc then fails on the missing directory (#1622).
+  if [ -f /sys/fs/cgroup/cgroup.controllers ] &&
+    [ ! -d "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service" ]; then
+    log "slot $idx: no user-$uid.slice/user@$uid.service cgroup — no container could create its cgroup scope"
     return 1
   fi
 

@@ -1057,6 +1057,60 @@ rm -f -- "$MARKER"
 reset_once "$MUTANT"
 check "without the final return 1 the unstoppable unit earns the marker -- so the check is live" test -f "$MARKER"
 
+echo
+echo "the slot's user manager: one that stopped comes back (#1622)"
+#
+# Linger starts the manager at boot and never again. Seen 2026-10-24: a slot
+# whose user-<uid>.slice was gone took job after job, each failing at its first
+# `docker run` on .../user-<uid>.slice/cgroup.controllers, because the reset read
+# "no manager" as "nothing to stop" and marked the slot clean. Stopping the
+# manager here also drops the unstoppable transient timer the case above left.
+LINGERS="$SLOT_STATE/$IDX/lingers"
+manager_active() { systemctl is-active --quiet "user@$SUID.service"; }
+# The bus answering, not only the unit: dbus.service is socket-activated, so a
+# freshly started manager has a listening socket and no daemon until it is used.
+manager_back() {
+  manager_active && as_slot timeout 5 dbus-send --session --print-reply \
+    --dest=org.freedesktop.DBus / org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+}
+systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
+check_not "the slot's user manager is stopped"           manager_active
+
+# An account provisioning never set up to linger is not this reset's to change.
+rm -f -- "$LINGERS" "$MARKER"
+reset_once "$RESET"
+check_not "a slot not recorded as lingering is left as it is" manager_active
+
+: >"$LINGERS"
+rm -f -- "$MARKER"
+reset_once "$RESET"
+check "the reset succeeds with the manager to bring back" test "$rc" = 0
+check "and says what it found and did"                 grep -q "user manager is not usable" "$RUNLOG"
+check "and that it restarted it"                       grep -q "restarted $U's user manager" "$RUNLOG"
+check "the user manager and its bus are back"          manager_back
+check "and the marker means it"                        test -f "$MARKER"
+
+sed 's/^  ensure_user_manager || rc=1$/  :/' "$RESET" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the revival mutation applied" cmp -s "$RESET" "$MUTANT"
+systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
+rm -f -- "$MARKER"
+reset_once "$MUTANT"
+check_not "without the revival the manager stays down -- so the check is live" manager_active
+check "and that slot is marked clean anyway -- the fault itself" test -f "$MARKER"
+
+# A manager that will not come back fails the slot closed.
+systemctl mask --runtime "user@$SUID.service" >>"$HOOKLOG" 2>&1
+rm -f -- "$MARKER"
+reset_once "$RESET"
+check "a manager that will not come back fails the reset" test "$rc" != 0
+check "and says so"                                    grep -q 'did not come back' "$RUNLOG"
+check "and the slot is not marked clean"               test ! -f "$MARKER"
+systemctl unmask --runtime "user@$SUID.service" >>"$HOOKLOG" 2>&1
+reset_once "$RESET"
+check "unmasked, the next reset brings it back"        manager_back
+rm -f -- "$LINGERS"
+
 loginctl disable-linger "$U" >>"$HOOKLOG" 2>&1
 systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
 made_linger=0
