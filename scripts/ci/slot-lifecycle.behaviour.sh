@@ -1098,6 +1098,51 @@ rm -f -- "$MARKER"
 reset_once "$MUTANT"
 check_not "without the revival the manager stays down -- so the check is live" manager_active
 check "and that slot is marked clean anyway -- the fault itself" test -f "$MARKER"
+reset_once "$RESET"
+
+# A UNIT THE JOB PLANTED WHERE THE RESTART WOULD LOAD IT (#1622 review).
+# /run/user/<uid> outlives a stopped manager, is the slot's to write, and its
+# systemd/user is on the user unit path: plant an enabled unit, kill the
+# manager, and a naive restart runs the job's code into the next job.
+RTU="/run/user/$SUID/systemd/user"
+planted_alive() { pgrep -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1; }
+plant_and_stop() {
+  systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
+  pkill -KILL -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1
+  as_slot mkdir -p "$RTU/default.target.wants"
+  as_slot sh -c "printf '[Service]\nExecStart=/bin/sleep 601\n[Install]\nWantedBy=default.target\n' >'$RTU/probe-1622.service'"
+  as_slot ln -sf ../probe-1622.service "$RTU/default.target.wants/probe-1622.service"
+}
+plant_and_stop
+check "the planted unit is in place with the manager down" test -f "$RTU/probe-1622.service"
+rm -f -- "$MARKER"
+reset_once "$RESET"
+check "the reset succeeds over a planted runtime dir"  test "$rc" = 0
+check_not "the planted unit does not run"              planted_alive
+check_not "and is gone with the runtime dir"           test -e "$RTU/probe-1622.service"
+check "the user manager and its bus are back"          manager_back
+
+# Each half broken back. Without the runtime-dir wipe the restart loads and
+# starts the unit, and the post-start unit stop is what takes it down...
+sed '/^  timeout -k 5 60 systemctl stop "user-runtime-dir@/,/^  fi$/d' "$RESET" >"$MUTANT"
+chmod 0755 "$MUTANT"
+check_not "the runtime-dir mutation applied" cmp -s "$RESET" "$MUTANT"
+plant_and_stop
+reset_once "$MUTANT"
+settle
+check_not "without the wipe the post-start stop still takes the unit" planted_alive
+check "and says it stopped it"                         grep -q 'unit(s) the last job left in its service manager' "$RUNLOG"
+# ...and with neither, the job's code runs on -- so both checks are live.
+sed '/^  timeout -k 5 60 systemctl stop "user-runtime-dir@/,/^  fi$/d; /^  stop_user_units "\$uid" || return 1$/d' "$RESET" >"$MUTANT"
+check_not "the double mutation applied" cmp -s "$RESET" "$MUTANT"
+plant_and_stop
+reset_once "$MUTANT"
+settle
+check "with neither the planted unit runs into the next job -- so the checks are live" planted_alive
+plant_and_stop
+rm -rf -- "$RTU/probe-1622.service" "$RTU/default.target.wants"
+reset_once "$RESET"
+check_not "and the real reset leaves nothing of it"    planted_alive
 
 # A manager that will not come back fails the slot closed.
 systemctl mask --runtime "user@$SUID.service" >>"$HOOKLOG" 2>&1
