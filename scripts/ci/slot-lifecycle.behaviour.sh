@@ -1109,6 +1109,9 @@ planted_alive() { pgrep -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1; }
 plant_and_stop() {
   systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
   pkill -KILL -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1
+  # Some systemd builds take the runtime dir down with the manager; bring just
+  # the dir back (no manager), the state a killed manager leaves behind.
+  timeout -k 5 30 systemctl start "user-runtime-dir@$SUID.service" >>"$HOOKLOG" 2>&1
   as_slot mkdir -p "$RTU/default.target.wants"
   as_slot sh -c "printf '[Service]\nExecStart=/bin/sleep 601\n[Install]\nWantedBy=default.target\n' >'$RTU/probe-1622.service'"
   as_slot ln -sf ../probe-1622.service "$RTU/default.target.wants/probe-1622.service"
@@ -1133,6 +1136,7 @@ settle
 check_not "without the wipe the post-start stop still takes the unit" planted_alive
 check "and says it stopped it"                         grep -q 'unit(s) the last job left in its service manager' "$RUNLOG"
 # ...and with neither, the job's code runs on -- so both checks are live.
+# shellcheck disable=SC2016 # the $uid is the reset's, matched literally
 sed '/^  timeout -k 5 60 systemctl stop "user-runtime-dir@/,/^  fi$/d; /^  stop_user_units "\$uid" || return 1$/d' "$RESET" >"$MUTANT"
 check_not "the double mutation applied" cmp -s "$RESET" "$MUTANT"
 plant_and_stop
