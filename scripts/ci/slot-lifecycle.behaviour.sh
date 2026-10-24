@@ -1109,9 +1109,12 @@ planted_alive() { pgrep -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1; }
 plant_and_stop() {
   systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
   pkill -KILL -u "$U" -f '^/bin/sleep 601$' >/dev/null 2>&1
-  # Some systemd builds take the runtime dir down with the manager; bring just
-  # the dir back (no manager), the state a killed manager leaves behind.
-  timeout -k 5 30 systemctl start "user-runtime-dir@$SUID.service" >>"$HOOKLOG" 2>&1
+  # user-runtime-dir@ is StopWhenUnneeded: it goes down with the manager. Hold
+  # just the dir up (no manager) with a unit that needs it -- the state anything
+  # else still holding it leaves. The reset's stop of user-runtime-dir@ takes
+  # the holder with it, as it would take that anything.
+  timeout -k 5 30 systemctl stop hold-rtd-1622.service >/dev/null 2>&1
+  timeout -k 5 30 systemd-run --quiet --unit=hold-rtd-1622     -p Requires="user-runtime-dir@$SUID.service" -p After="user-runtime-dir@$SUID.service"     /bin/sleep infinity >>"$HOOKLOG" 2>&1
   as_slot mkdir -p "$RTU/default.target.wants"
   as_slot sh -c "printf '[Service]\nExecStart=/bin/sleep 601\n[Install]\nWantedBy=default.target\n' >'$RTU/probe-1622.service'"
   as_slot ln -sf ../probe-1622.service "$RTU/default.target.wants/probe-1622.service"
@@ -1147,6 +1150,7 @@ plant_and_stop
 rm -rf -- "$RTU/probe-1622.service" "$RTU/default.target.wants"
 reset_once "$RESET"
 check_not "and the real reset leaves nothing of it"    planted_alive
+timeout -k 5 30 systemctl stop hold-rtd-1622.service >/dev/null 2>&1
 
 # A manager that will not come back fails the slot closed.
 systemctl mask --runtime "user@$SUID.service" >>"$HOOKLOG" 2>&1
