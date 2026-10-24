@@ -427,7 +427,7 @@ mint_jit() { # <idx> <envfile> [unheld:0|1]
   local idx="$1" envfile="$2" tok group labels name body resp code out id try
   group=$(runner_group_id) || return 1
   labels=$(jit_labels_json "$idx" "${3:-0}") || return 1
-  tok=$(gh_token) || return 1
+  tok=$(gh_token register) || return 1
   [ -n "$tok" ] || return 1
   for try in 1 2; do
     name="$HOSTNAME_SHORT-s$idx-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -483,7 +483,7 @@ sys.stdout.write("%d\n%s" % (rid, base64.b64encode(json.dumps(cfg).encode()).dec
 # job is never taken away from here.
 delete_runner() { # <id>
   local tok code
-  tok=$(gh_token) || return 1
+  tok=$(gh_token register) || return 1
   code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
     -H "Accept: application/vnd.github+json" \
