@@ -2662,6 +2662,7 @@ slot_repo_binding_behaves() { # <file>
   case "$fns" in *'mint_jit() {'*'delete_runner() {'*'slot_repo() {'*) : ;; *) return 1 ;; esac
   root=$(mktemp -d) || return 1
   # run <cmd...> -- in a subshell, with every network call recorded, never made
+  # shellcheck disable=SC2329  # stubs are called by the eval'd bodies
   run() (
     # shellcheck disable=SC2034  # read by the eval'd mint_jit/delete_runner/slot_* bodies
     OWNER=own REPO=global-repo LABELS=self-hosted-pool BACKGROUND_SLOTS=0 HOSTNAME_SHORT=h
@@ -2736,6 +2737,7 @@ bind_slot_behaves() { # <file>
   body=$(extract_fn "$1" bind_slot)
   case "$body" in *SLOT_BINDING_DIR*) : ;; *) return 1 ;; esac
   root=$(mktemp -d) || return 1
+  # shellcheck disable=SC2034,SC2329  # variables and stubs are read by the eval'd bind_slot body
   b() ( # <idx> <repo> [delete-rc]
     SLOT_ROOT="$root/slots" SLOT_STATE="$root/state" CACHE_SLOTS="$root/cache"
     SLOT_HOME_BASE="$root/home" SLOT_BINDING_DIR="$root/binding"
