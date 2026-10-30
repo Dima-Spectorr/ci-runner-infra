@@ -45,7 +45,9 @@ not how long they run.
      broken.
    - `merge-lane-events` and `merge-lane-review-relay`: they carry the merge App key
      with contents-write.
-   - Anything triggered by `pull_request_target`, or that runs fork code.
+   - Anything triggered by `pull_request_target`, or that runs fork code. That
+     includes IntegrateIT's `review-findings-to-issues`.
+   - `branch-reaper-self`, because it receives `MERGE_APP_PRIVATE_KEY`.
 
 ## Required changes
 
@@ -63,15 +65,30 @@ not how long they run.
 
 ## Security
 
-Cross-repo co-tenancy is new: today one host serves one repo. Before any consumer
-moves:
+Cross-repo co-tenancy is new: today one host serves one repo. The security review on
+2026-10-30 found four blocking items. All are fixed in PR A and gated on
+`ci-utility=true`.
 
-- **#249 must be fixed.** FORWARD accepts are not qualified per slot, so one slot can
-  reach another slot's network namespace.
-- **`hidepid=2` on `/proc`**, so a slot cannot read another slot's command lines or
-  environment.
-- **Every opted-in repo has fork PR workflows disabled.** A gatekeeper job runs trusted
-  code from the default branch, or from same-repo PRs only.
+- **B1, `/proc`:**
+  - The pool sets `hidepid=0`, and reusable workflows put repo tokens in `curl` argv.
+  - On the utility host: `hidepid=2`, `ProtectProc=invisible`, and `container:` /
+    `services:` jobs are refused.
+  - The token-in-argv cleanup itself is #1640.
+- **B2, #249:** `FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP` sits above the
+  per-slot accepts.
+- **B3, shared port band:** the utility host has none, because the cross-slot band
+  accept would bypass B2.
+- **B4, rebind leftovers:** a slot moving to another repo wipes its home, `_work`,
+  Docker data root, cache slot and old JIT registration.
+
+Also required:
+
+- **Every opted-in repo has fork PR workflows disabled.** As of 2026-10-30 this holds
+  for all 7 candidate repos. A gatekeeper job runs trusted code from the default
+  branch, or from same-repo PRs only.
+- **Jobs given the merge App key stay hosted.** This includes `branch-reaper-self`.
+
+Hardening backlog: #1637 (`/dev/shm`), #1638 (no turbo cache bucket), #1639 (pin-hold).
 
 Unchanged guarantees:
 
