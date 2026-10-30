@@ -2119,9 +2119,9 @@ withdraw_backs_off() { # <file>
     eval "$body"
     # shellcheck disable=SC2034  # retry_at is read by the eval'd body
     t=1000 calls=0 answer=1 retry_at=0
-    # shellcheck disable=SC2317  # the stubs are called by the eval'd body
+    # shellcheck disable=SC2317,SC2329  # the stubs are called by the eval'd body
     date() { echo "$t"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     delete_runner() { calls=$((calls + 1)); return "$answer"; }
     withdraw_idle 7 && exit 1                        # GitHub refuses
     [ "$calls" = 1 ] || exit 1

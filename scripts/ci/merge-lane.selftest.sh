@@ -1288,26 +1288,28 @@ STUB
   # can be as wrong as `/rate_limit` was — and the dispatch goes the moment a
   # probe answers.
   probes "403 $((now + 3600))" "403 $((now + 3600))" 200; rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 60 60 ' ] && [ "$(dispatched)" = 1 ]
-  res recover-reprobes-until-answered $?
+  # The verdict is captured before `res` reads it: a bare `$?` after a test is
+  # one stray command away from naming something else (SC2319).
+  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 60 60 ' ] && [ "$(dispatched)" = 1 ]; v=$?
+  res recover-reprobes-until-answered "$v"
 
   # A refusal whose own reset is sooner than the interval is waited out to it.
   probes "403 $((now + 10))" 200; rrun; rc=$?
   w=$(sed -n 2p "$d/slept" 2>/dev/null)
-  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 1 ] && [ "${w:-0}" -le 15 ] && [ "$(dispatched)" = 1 ]
-  res recover-follows-the-refusals-reset $?
+  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 1 ] && [ "${w:-0}" -le 15 ] && [ "$(dispatched)" = 1 ]; v=$?
+  res recover-follows-the-refusals-reset "$v"
 
   # Refused throughout: 900s in all, then the dispatch is made anyway.
   : >"$d/probes"
   for _ in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
   rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]
-  res recover-wait-is-capped $?
+  [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]; v=$?
+  res recover-wait-is-capped "$v"
 
   # A refusal that is not a rate limit ends the wait: waiting would not change it.
   probes 403plain; rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ]
-  res recover-other-refusal-ends-the-wait $?
+  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ]; v=$?
+  res recover-other-refusal-ends-the-wait "$v"
 
   # An unset default branch is read: from the probe's own answer when it had
   # one, else with the repository's token after a wait that never got one.
@@ -3133,7 +3135,7 @@ behavioural_check_counts_cases() {
   # the three surfaces `check_counts` reads and refuses anything else loudly,
   # so a new call added to the function shows up as a failure rather than as
   # silently empty data.
-  # shellcheck disable=SC2317  # Every line here is reached through the evalled
+  # shellcheck disable=SC2317,SC2329  # Every line here is reached through the evalled
   # `check_counts`, which shellcheck cannot see calling it.
   gh() {
     local url="" prog=""
@@ -3650,7 +3652,7 @@ behavioural_refusal_cases() {
   # shellcheck disable=SC2034  # read by the evalled driver functions.
   local R="owner/repo"
   : >"$fix/posted"
-  # shellcheck disable=SC2317  # reached through the evalled functions.
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled functions.
   gh() {
     case "$*" in
       *'/comments?per_page=100'*) cat "$fix/posted" ;;
@@ -3693,7 +3695,7 @@ Waiting on code owner review from some-owner. (HTTP 405)'
   else printf 'FAIL the code-owner skip was commented %s time(s) for one sha, want 1\n' "$n"; fi
 
   # A comment that cannot be posted must not take the pass down.
-  # shellcheck disable=SC2317  # reached through the evalled functions.
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled functions.
   gh() { return 1; }
   _rc_case "an unpostable comment still returns the skip" 2 "$codeowner" eeee5555
 
@@ -3993,7 +3995,7 @@ behavioural_premerge_cases() {
       return
     fi
   done
-  # shellcheck disable=SC2317  # reached through the evalled functions.
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled functions.
   gh() {
     case "$*" in
       *'-X PUT'*'/merge'*) printf '%s\n' "$*" >>"$fix/merged" ;;
@@ -4054,9 +4056,9 @@ behavioural_base_read_cases() {
     return
   fi
   local GOOD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  # shellcheck disable=SC2317  # reached through the evalled function.
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled function.
   sleep() { :; }
-  # shellcheck disable=SC2317
+  # shellcheck disable=SC2317,SC2329
   gh() { # fails the first $FAILS calls, then answers $GOOD (or $ANSWER)
     local n
     n=$(($(cat "$fix/n" 2>/dev/null || echo 0) + 1))
@@ -4102,7 +4104,7 @@ behavioural_base_rerun_cases() {
     rm -rf "$fix"
     return
   fi
-  # shellcheck disable=SC2317  # reached through the evalled function.
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled function.
   gh() {
     printf '%s %s\n' "$GH_TOKEN" "$*" >>"$fix/calls"
     case "$*" in

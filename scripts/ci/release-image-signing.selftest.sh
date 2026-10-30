@@ -169,11 +169,11 @@ run() {
 has() { printf '%s' "$1" | grep -cF -- "$2" >/dev/null; }
 # The three below are only ever called through `check "$label" <fn> ...`,
 # which shellcheck cannot follow, so it reads them as unreachable (SC2317).
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 lacks() { ! has "$@"; }
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 count_is() { [ "$(printf '%s\n' "$1" | grep -cF -- "$2")" -eq "$3" ]; }
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 is_empty() { [ -z "$1" ]; }
 # check <label> <command...> — ok when the command succeeds.
 check() { local label="$1"; shift; if "$@"; then ok "$label"; else bad "$label"; fi; }

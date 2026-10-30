@@ -467,13 +467,13 @@ gate_run() {
     PIN_HOLD_MAX=7200
     # shellcheck disable=SC2034
     GA_DENIED_FILE=""
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     log() { :; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     event() { :; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     timeout() { shift; "$@"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     gcloud() {
       [ "$garc" -eq 0 ] || { printf '%s\n' "$gerr" >&2; return "$garc"; }
       printf '%s' "$rows"
@@ -599,11 +599,11 @@ veto_seq() {
     # shellcheck disable=SC2034
     EVENT_HEARTBEAT=600
     NOW=1000000
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     date() { echo "$NOW"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     log() { :; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     event() {
       local sev="$1" kv cls="" er=""
       shift 4

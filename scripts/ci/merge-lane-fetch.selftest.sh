@@ -441,7 +441,7 @@ cases_spawn() { # <fetch-file>
     # never the first to complete, however the scheduler behaves.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     job() {
       local i n
       : >"$d/started.$1"
@@ -568,7 +568,7 @@ cases_shell() { # <fetch-file>
     # not the condition of anything. The job must reach the line after it.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     failing_job() {
       false
       : >"$d/after-failure.$1"
@@ -588,7 +588,7 @@ cases_shell() { # <fetch-file>
     # the job's `trap - EXIT` changes nothing and would prove nothing. The
     # mutation re-arms the parent's trap inside the job instead, which is what
     # that line is there to make impossible.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     quiet_job() { : >"$d/quiet.$1"; }
     (
       trap 'printf . >>"$d/trap-ran"' EXIT
@@ -835,7 +835,7 @@ cases_wait() {
 # SC2034: the LANE_* globals are read by the sourced fetch file. SC2317: the
 # sleep stub is called by lane_gh_retry. SC2181: each case asserts on the exit
 # code of a call whose output and stderr it also inspects.
-# shellcheck disable=SC2034,SC2317,SC2181
+# shellcheck disable=SC2034,SC2317,SC2329,SC2181
 cases_retry() { # <fetch-file>
   (
     # shellcheck source=/dev/null
@@ -1087,7 +1087,7 @@ cases_snap() { # <fetch-file>
     mkdir "$d/fix" "$d/snap"
     build_snap_fixture "$d/fix"
     # The page retry's wait is written down, never slept (#1581).
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     lane_snap_retry_sleep() { echo "$1" >>"$d/slept"; }
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota" R="$REPO" LANE_BASE=main
     unset GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
