@@ -40,6 +40,9 @@ SLOT_TEMPLATE="/opt/ci/slot-template"
 # clean. Root-owned all the way down except the daemon's own subdirectory, so a
 # slot cannot forge its own clean bill of health.
 SLOT_STATE="/var/lib/ci-slot"
+# Which repository each slot of a utility host was last built for (bind_slot).
+SLOT_BINDING_DIR="/var/lib/ci-slot-binding"
+SLOT_HOME_BASE="/home"
 
 # Each slot runs as its OWN Linux user, `ci-s<idx>`, with its OWN rootless
 # Docker daemon. Slots used to share the `runner` account and the one system
@@ -108,6 +111,20 @@ TURBO_PORT=$(md "instance/attributes/ci-turbo-port")
 TURBO_DISK_BUDGET=$(md "instance/attributes/ci-turbo-disk-budget-bytes")
 TURBO_MAX_ARTIFACT=$(md "instance/attributes/ci-turbo-max-artifact-bytes")
 HOSTNAME_SHORT=$(md "instance/name")
+# A UTILITY host (#1635, docs/adr-utility-host.md): one always-on host whose
+# slots serve DIFFERENT repositories, one repository per slot. All four keys are
+# absent on a pool host, and every path below then reads exactly as it did
+# before they existed: every slot serves $REPO with the pool's labels.
+#   ci-utility       `true` on a utility host; absent (or `false`) on a pool host
+#   ci-slot-repos    comma list, one bare repository name per slot index
+#   ci-slot-labels   semicolon list, one per slot index, each a comma list of
+#                    labels that slot adds to the host's own
+#   ci-cache-seed    `off` skips the image's dependency and tool caches, which
+#                    belong to a pool's repository and to nobody on this host
+UTILITY=$(md "instance/attributes/ci-utility")
+SLOT_REPOS=$(md "instance/attributes/ci-slot-repos")
+SLOT_LABEL_SETS=$(md "instance/attributes/ci-slot-labels")
+CACHE_SEED=$(md "instance/attributes/ci-cache-seed")
 # Registry hosts the job identity authenticates to. Comma-separated, set by the
 # module; see write_docker_cred_helpers for why the list is explicit.
 REGISTRY_HOSTS=$(md "instance/attributes/ci-registry-hosts")
@@ -182,6 +199,75 @@ if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   die "missing ci-github-owner/ci-github-repo metadata"
 fi
 
+# --- one repository per slot (#1635) -------------------------------------------
+#
+# slot_field <list> <separator> <idx> -- the idx-th (1-based) field of <list>,
+# empty past its end. Pure, so the self-test runs it rather than reads it.
+slot_field() { # <list> <separator> <idx>
+  local rest="$1$2" n=1 f
+  while [ -n "$rest" ]; do
+    f=${rest%%"$2"*}
+    rest=${rest#*"$2"}
+    [ "$n" = "$3" ] && { printf '%s' "$f"; return 0; }
+    n=$((n + 1))
+  done
+  return 0
+}
+
+# slot_field_count <list> <separator> -- how many fields, 0 for an empty list.
+slot_field_count() { # <list> <separator>
+  local rest="$1$2" n=0
+  [ -n "$1" ] || { printf '0'; return 0; }
+  while [ -n "$rest" ]; do rest=${rest#*"$2"}; n=$((n + 1)); done
+  printf '%s' "$n"
+}
+
+# slot_repo <idx> -- the repository slot <idx> registers with and mints for.
+# $REPO on a pool host, where ci-slot-repos is absent.
+slot_repo() { # <idx>
+  if [ -n "${SLOT_REPOS:-}" ]; then
+    slot_field "$SLOT_REPOS" , "$1"
+  else
+    printf '%s' "$REPO"
+  fi
+}
+
+# Fails CLOSED, both ways round. A pool host carrying per-slot repositories
+# would register runners for repositories its controller does not size and its
+# job identity was never granted to; a utility host without them would register
+# every slot for ci-github-repo and leave the others' jobs queued for a day.
+case "${UTILITY:-}" in
+  '' | false) UTILITY=false ;;
+  true) ;;
+  *) die "ci-utility metadata is '$(safe_for_log "$UTILITY")', not true or false" ;;
+esac
+case "${CACHE_SEED:-}" in
+  '' | on) CACHE_SEED=on ;;
+  off) ;;
+  *) die "ci-cache-seed metadata is '$(safe_for_log "$CACHE_SEED")', not on or off" ;;
+esac
+if [ "$UTILITY" = true ]; then
+  [ -n "$SLOT_REPOS" ] || die "ci-utility=true but ci-slot-repos is empty -- refusing to guess which repository each slot serves"
+  [ "$(slot_field_count "$SLOT_REPOS" ,)" = "$((10#$SLOTS))" ] ||
+    die "ci-slot-repos names $(slot_field_count "$SLOT_REPOS" ,) repositories for $SLOTS slot(s) -- one per slot"
+  for _i in $(seq 1 "$SLOTS"); do
+    _r=$(slot_field "$SLOT_REPOS" , "$_i")
+    case "$_r" in
+      "" | *[!A-Za-z0-9_.-]*) die "ci-slot-repos field $_i is '$(safe_for_log "$_r")', not a bare repository name" ;;
+    esac
+  done
+  if [ -n "$SLOT_LABEL_SETS" ]; then
+    [ "$(slot_field_count "$SLOT_LABEL_SETS" ';')" = "$((10#$SLOTS))" ] ||
+      die "ci-slot-labels has $(slot_field_count "$SLOT_LABEL_SETS" ';') entries for $SLOTS slot(s) -- one per slot, separated by ';'"
+    case "$SLOT_LABEL_SETS" in
+      *[!A-Za-z0-9_.:,\;-]*) die "ci-slot-labels carries a character this host will not put in a JSON body" ;;
+    esac
+  fi
+  unset _i _r
+elif [ -n "$SLOT_REPOS$SLOT_LABEL_SETS" ]; then
+  die "ci-slot-repos/ci-slot-labels are set but ci-utility is not true -- a pool host serves ci-github-repo on every slot"
+fi
+
 # --- host affinity label ------------------------------------------------------
 #
 # Every agent on this host also answers to `host-<instance-name>`, which is what
@@ -207,8 +293,16 @@ LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
 # the host admissible to a new run at mint time (#1600, host_admissible). A pure
 # function of its arguments so the self-test can run it for every slot of a host
 # rather than trust its text.
+#
+# On a utility host (#1635) a slot also carries its own entry of ci-slot-labels
+# -- `<Repo>-util`, which is what that repository's jobs ask for. Absent on a
+# pool host, where nothing is added.
 slot_labels() { # <idx> [unheld:0|1]
-  local out="$LABELS"
+  local out="$LABELS" extra=""
+  [ -z "${SLOT_LABEL_SETS:-}" ] || extra=$(slot_field "$SLOT_LABEL_SETS" ';' "$1")
+  if [ -n "$extra" ]; then
+    out="$out,$extra"
+  fi
   if [ "$1" -le "$BACKGROUND_SLOTS" ]; then
     out="$out,background"
   fi
@@ -272,10 +366,13 @@ host_admissible() { # <record> <now> <boot-id>
 # Manager at boot and never written to disk unencrypted for longer than the
 # signing call.
 #
-# gh_token [register|run-status] -- the scope is NAMED, from the fixed table
-# below, never passed as JSON: a caller cannot widen what this host may mint.
+# gh_token [register|run-status] [repo] -- the scope is NAMED, from the fixed
+# table below, never passed as JSON: a caller cannot widen what this host may
+# mint. The repository is the one the token is scoped to, ONE bare name; it
+# defaults to ci-github-repo, and a utility host's slot loop names its slot's
+# own (#1635), so a slot never holds a token for a sibling slot's repository.
 gh_token() {
-  local key jwt header payload now perms
+  local key jwt header payload now perms repo="${2:-$REPO}"
   case "${1:-register}" in
     register) perms='{"administration":"write"}' ;;
     # The pin sweep asking whether the run that holds this host has finished
@@ -321,13 +418,14 @@ gh_token() {
   # to this boot and never retried unscoped: widening the token to get past a
   # 422 is exactly the exposure the scope removes.
   #
-  # REPO is interpolated into the body, so it must be a bare repository name —
-  # the same shape variables.tf validates. Built with printf: the host has no jq.
-  case "$REPO" in
-    "" | *[!A-Za-z0-9_.-]*) log "refusing to mint: '$REPO' is not a bare repository name"; return 1 ;;
+  # The repository is interpolated into the body, so it must be a bare repository
+  # name — the same shape variables.tf validates. Built with printf: the host has
+  # no jq.
+  case "$repo" in
+    "" | *[!A-Za-z0-9_.-]*) log "refusing to mint: '$(safe_for_log "$repo")' is not a bare repository name"; return 1 ;;
   esac
   local body resp code
-  body=$(printf '{"repositories":["%s"],"permissions":%s}' "$REPO" "$perms")
+  body=$(printf '{"repositories":["%s"],"permissions":%s}' "$repo" "$perms")
   # Body and status in one capture, never a file: the body IS the token.
   resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
@@ -339,7 +437,7 @@ gh_token() {
     local hint=""
     [ "$code" = 422 ] && hint=" -- the installation lacks that permission or does not select this repository; NOT retried unscoped"
     # The message only, never the body: a 2xx body is a token.
-    log "installation token mint (repo $REPO, scope $perms) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
+    log "installation token mint (repo $repo, scope $perms) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
     return 1
   fi
   printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
@@ -423,11 +521,16 @@ jit_labels_json() { # <idx> [unheld:0|1]
 # The name is UNIQUE per registration: an ephemeral runner's deletion propagates
 # asynchronously, and reusing a name inside that window is a 409. One retry under
 # a fresh name on a 409; anything else fails the pass and the loop retries.
-mint_jit() { # <idx> <envfile> [unheld:0|1]
-  local idx="$1" envfile="$2" tok group labels name body resp code out id try
+#
+# <repo> is REQUIRED (#1635): the runner is registered in it and the token that
+# registers it is scoped to it alone. A caller that forgot it gets nothing, not
+# a runner in ci-github-repo that the slot's own repository's jobs never reach.
+mint_jit() { # <idx> <envfile> <unheld:0|1> <repo>
+  local idx="$1" envfile="$2" repo="${4:-}" tok group labels name body resp code out id try
+  [ -n "$repo" ] || { log "slot $idx: mint_jit was not told which repository -- not registering"; return 1; }
   group=$(runner_group_id) || return 1
   labels=$(jit_labels_json "$idx" "${3:-0}") || return 1
-  tok=$(gh_token register) || return 1
+  tok=$(gh_token register "$repo") || return 1
   [ -n "$tok" ] || return 1
   for try in 1 2; do
     name="$HOSTNAME_SHORT-s$idx-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
@@ -437,7 +540,7 @@ mint_jit() { # <idx> <envfile> [unheld:0|1]
       -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
       -H "Accept: application/vnd.github+json" \
       -d "$body" \
-      "https://api.github.com/repos/$OWNER/$REPO/actions/runners/generate-jitconfig") || resp=$'\n000'
+      "https://api.github.com/repos/$OWNER/$repo/actions/runners/generate-jitconfig") || resp=$'\n000'
     code=${resp##*$'\n'}
     if [ "$code" = 409 ] && [ "$try" = 1 ]; then
       log "slot $idx: runner name $name is still being released (HTTP 409) -- retrying once under a fresh name"
@@ -471,7 +574,7 @@ sys.stdout.write("%d\n%s" % (rid, base64.b64encode(json.dumps(cfg).encode()).dec
          mv -f "$envfile.tmp" "$envfile" ); then
     rm -f "$envfile.tmp" "$envfile"
     log "slot $idx: could not write the just-in-time config -- withdrawing runner $id"
-    delete_runner "$id" || true
+    delete_runner "$id" "$repo" || true
     return 1
   fi
   printf '%s' "$id"
@@ -481,13 +584,18 @@ sys.stdout.write("%d\n%s" % (rid, base64.b64encode(json.dumps(cfg).encode()).dec
 # mean gone. 422 means GitHub has a job on it, and that refusal is the whole
 # safety of calling this on an agent that might just have been assigned one: the
 # job is never taken away from here.
-delete_runner() { # <id>
-  local tok code
-  tok=$(gh_token register) || return 1
+#
+# <repo> is REQUIRED (#1635), for mint_jit's reason: the runner lives in the
+# repository it was minted in, and a delete sent to another one answers 404 --
+# which reads as "gone" and leaves the runner registered for ever.
+delete_runner() { # <id> <repo>
+  local tok code repo="${2:-}"
+  [ -n "$repo" ] || { log "runner $1: delete_runner was not told which repository -- not deleting"; return 1; }
+  tok=$(gh_token register "$repo") || return 1
   code=$(curl "${CURL_TIMEOUTS[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/$OWNER/$REPO/actions/runners/$1")
+    "https://api.github.com/repos/$OWNER/$repo/actions/runners/$1")
   case "$code" in 204 | 404) return 0 ;; esac
   log "runner $1: delete answered HTTP ${code:-none}"
   return 1
@@ -3103,13 +3211,18 @@ install_slot_loop() {
     printf 'PATH=%q\n' "$PATH"
     printf 'LOG_TAG=ci-slot-loop\n'
     declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET RUNNER_GROUP HOSTNAME_SHORT \
-      LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS
-    declare -f log safe_for_log md gh_token slot_labels runner_group_id \
+      LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS \
+      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR
+    declare -f log safe_for_log md gh_token slot_field slot_repo slot_labels runner_group_id \
       jit_labels_json mint_jit delete_runner host_admissible
     cat <<'EOF'
 
 idx="${1:-}"
 case "$idx" in '' | *[!0-9]*) log "slot-loop: '$(safe_for_log "$idx")' is not a slot index"; exit 2 ;; esac
+# The ONE repository this slot registers in, mints for and deletes from (#1635):
+# ci-github-repo on a pool host, its own ci-slot-repos entry on a utility host.
+SLOT_REPO=$(slot_repo "$idx")
+[ -n "$SLOT_REPO" ] || { log "slot-loop: slot $idx has no repository"; exit 2; }
 UNIT="ci-runner@$idx.service"
 ENVFILE="$JIT_DIR/$idx.env"
 u="$SLOT_USER_PREFIX$idx"
@@ -3200,7 +3313,7 @@ unheld_now() {
 # -- that runner is busy until the agent exits.
 withdraw_idle() { # <id>
   [ "$(date +%s)" -ge "$retry_at" ] || return 1
-  delete_runner "$1" && return 0
+  delete_runner "$1" "$SLOT_REPO" && return 0
   retry_at=$(($(date +%s) + 60))
   return 1
 }
@@ -3261,16 +3374,23 @@ while :; do
 
   rm -f -- "$ENVFILE"
   unheld=$(unheld_now)
-  if ! id=$(mint_jit "$idx" "$ENVFILE" "$unheld"); then
+  if ! id=$(mint_jit "$idx" "$ENVFILE" "$unheld" "$SLOT_REPO"); then
     sleep 30
     continue
+  fi
+  # A utility host records which runner this slot holds, so a rebind to another
+  # repository can withdraw it from the OLD one (bind_slot, #1635).
+  if [ "$UTILITY" = true ]; then
+    printf '%s\n' "$id" >"$SLOT_BINDING_DIR/$idx.runner.tmp" &&
+      mv -f "$SLOT_BINDING_DIR/$idx.runner.tmp" "$SLOT_BINDING_DIR/$idx.runner" ||
+      log "slot $idx: could not record runner $id -- a later rebind cannot withdraw it"
   fi
 
   # ci-drain may have been set while the runner was being minted; the
   # controller's roster read may already have missed it. Withdrawn, never run.
   if why=$(gate); then
     rm -f -- "$ENVFILE"
-    delete_runner "$id" || log "slot $idx: could not withdraw runner $id"
+    delete_runner "$id" "$SLOT_REPO" || log "slot $idx: could not withdraw runner $id"
     log "slot $idx: runner $id withdrawn before it started -- $why"
     continue
   fi
@@ -3278,7 +3398,7 @@ while :; do
   if ! systemctl start "$UNIT" >/dev/null 2>&1; then
     rm -f -- "$ENVFILE"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
-    delete_runner "$id" || true
+    delete_runner "$id" "$SLOT_REPO" || true
     log "slot $idx: $UNIT did not start -- runner $id withdrawn; retrying in 30s"
     need_reset=1
     sleep 30
@@ -3328,7 +3448,7 @@ while :; do
   done
   systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
   rm -f -- "$ENVFILE"
-  delete_runner "$id" || true
+  delete_runner "$id" "$SLOT_REPO" || true
   # A runner withdrawn ONLY to change its label never had a job (GitHub refused
   # no delete), so its slot is exactly as clean as its last reset left it;
   # another full reset would add the reset's time to every hold change. A
@@ -5503,6 +5623,62 @@ EOF
 # — that sharing is the speed-up — which is exactly why a pool serves one
 # repository only (see README.md, isolation rules).
 
+# bind_slot <idx> <repo> -- a UTILITY host's slot belongs to one repository
+# (#1635), and the next one must find NOTHING the last one left. The binding
+# file records which repository the slot's home, _work, daemon data root and
+# cache were built for; when the metadata names another one -- or the file is
+# absent, because nothing proves what the slot last served -- everything that
+# repository could have written is destroyed before the slot provisions again:
+# the home, _work and its reset hold, the per-slot state (the daemon data root
+# among it, with every image and volume), the slot's cache copy, and the runner
+# it registered, withdrawn from the OLD repository so it cannot be handed a job
+# there by a slot now serving another. Only then is the new binding written, so
+# a wipe that dies half way is redone on the next boot rather than trusted.
+#
+# Root-only state (0700), out of every slot's reach: a slot that could rewrite
+# its own binding could keep its predecessor's tree. Pool hosts never call this.
+bind_slot() { # <idx> <repo>
+  local idx="$1" repo="$2" f old="" oldid="" u uid d
+  [ -n "$repo" ] || { log "slot $idx: bind_slot was not told which repository"; return 1; }
+  f="$SLOT_BINDING_DIR/$idx"
+  install -d -o root -g root -m 0700 "$SLOT_BINDING_DIR" || return 1
+  [ -f "$f" ] && old=$(head -n1 "$f")
+  [ "$old" = "$repo" ] && return 0
+  u=$(slot_user "$idx")
+  log "slot $idx: bound to '$(safe_for_log "${old:-nothing recorded}")', now '$repo' -- wiping the slot before it registers"
+  # Nothing of the slot may run while its tree is removed.
+  systemctl stop "ci-slot-loop@$idx.service" "ci-runner@$idx.service" "ci-dockerd@$idx.service" \
+    >>/var/log/ci-host.log 2>&1 || true
+  if uid=$(id -u "$u" 2>/dev/null); then
+    systemctl stop "user@$uid.service" >>/var/log/ci-host.log 2>&1 || true
+    pkill -KILL -u "$u" 2>/dev/null || true
+  fi
+  # The runner the slot held, withdrawn from the repository that registered it.
+  # A 404 is success (delete_runner): an ephemeral runner may already be gone.
+  if [ -n "$old" ] && [ -f "$f.runner" ]; then
+    oldid=$(head -n1 "$f.runner")
+    case "$old" in *[!A-Za-z0-9_.-]*) log "slot $idx: recorded repository is malformed -- not trusting it"; return 1 ;; esac
+    case "$oldid" in
+      '' | *[!0-9]*) log "slot $idx: recorded runner id is malformed -- not trusting it"; return 1 ;;
+    esac
+    delete_runner "$oldid" "$old" || {
+      log "slot $idx: could not withdraw runner $oldid from $old -- not rebinding"
+      return 1
+    }
+  fi
+  for d in "$SLOT_ROOT/$idx" "$SLOT_ROOT/.reset/$idx" "$SLOT_STATE/$idx" "$CACHE_SLOTS/$idx" "$SLOT_HOME_BASE/$u"; do
+    rm -rf --one-file-system -- "$d" || { log "slot $idx: could not remove $d -- not rebinding"; return 1; }
+  done
+  # provision_slot_user chowns the home rather than creating it (useradd -m
+  # only runs for a new account), so an existing account gets an empty one back.
+  if id "$u" >/dev/null 2>&1; then
+    install -d -o "$u" -g "$u" -m 0750 "$SLOT_HOME_BASE/$u" || return 1
+  fi
+  rm -f -- "$f.runner"
+  printf '%s\n' "$repo" >"$f.tmp" && mv -f "$f.tmp" "$f" || return 1
+  log "slot $idx: wiped and bound to $repo"
+}
+
 # The Linux account and the subordinate uid/gid range its rootless daemon needs.
 # Without a subuid/subgid range `dockerd-rootless.sh` cannot create a user
 # namespace and refuses to start, which is the whole isolation.
@@ -5770,11 +5946,17 @@ setup_slot_networking() {
   # A failure here is logged and not fatal. The band still works; it is the rare
   # collision that comes back, and refusing to bring the host up over it would
   # trade an occasional flake for a pool that does not start.
+  #
+  # A UTILITY host (#1635) publishes no band at all: its slots belong to
+  # different repositories, and the band exists so that sibling slots of ONE
+  # repository can share a service. No reservation, no forward accept here, and
+  # no DNAT or hairpin in setup_slot_netns -- one repository's slot has nothing
+  # to reach on another's.
   local band_lo band_hi reserved want
   band_lo=$(slot_band_min 1); band_hi=$(slot_band_max "$SLOTS")
   want="$band_lo-$band_hi"
   reserved=$(tr -d ' ' < /proc/sys/net/ipv4/ip_local_reserved_ports 2>/dev/null)
-  case ",$reserved," in
+  [ "$UTILITY" = true ] || case ",$reserved," in
     *",$want,"*) : ;;
     *)
       sysctl -qw "net.ipv4.ip_local_reserved_ports=${reserved:+$reserved,}$want" ||
@@ -5808,7 +5990,9 @@ setup_slot_networking() {
   local baddr bspan_min bspan_max
   baddr=$(primary_addr)
   bspan_min=$(slot_band_min 1); bspan_max=$(slot_band_max "$SLOTS")
-  if [ -n "$baddr" ]; then
+  if [ "$UTILITY" = true ]; then
+    log "utility host -- no shared-infrastructure band"
+  elif [ -n "$baddr" ]; then
     iptables -w -C FORWARD -p tcp -m conntrack --ctstate DNAT --ctorigdst "$baddr" \
       --ctorigdstport "$bspan_min:$bspan_max" -j ACCEPT 2>/dev/null \
       || iptables -w -A FORWARD -p tcp -m conntrack --ctstate DNAT --ctorigdst "$baddr" \
@@ -5817,6 +6001,26 @@ setup_slot_networking() {
       || iptables -w -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
   else
     log "no primary address -- shared-infrastructure band not forwarded"
+  fi
+
+  # #249: no slot reaches a sibling slot's address directly. On EVERY host, pool
+  # included: the band accept and ESTABLISHED,RELATED above are matched first,
+  # so a band DNAT (hairpin included) and every reply still pass; a slot's own
+  # gateway (10.99.<n>.1) is INPUT, not FORWARD, so the broker, the cache and
+  # DNS are untouched. What this drops is exactly one slot opening a connection
+  # to another's 10.99.<m>.2 -- on a utility host, one repository's job reaching
+  # another's. It must sit ABOVE the per-veth accepts (setup_slot_netns), which
+  # would otherwise admit it: inserted before the first one when they already
+  # exist (a re-run), appended when they do not yet (they are appended after).
+  local below
+  if ! iptables -w -C FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP 2>/dev/null; then
+    below=$(iptables -w -S FORWARD 2>/dev/null |
+      awk '/^-A FORWARD / {n++} /^-A FORWARD -[io] cis[0-9]+ -j ACCEPT$/ {print n; exit}')
+    if [ -n "$below" ]; then
+      iptables -w -I FORWARD "$below" -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP || return 1
+    else
+      iptables -w -A FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP || return 1
+    fi
   fi
 
   iptables -w -t nat -C POSTROUTING -s 10.99.0.0/16 -o "$ifc" -j MASQUERADE 2>/dev/null \
@@ -5913,7 +6117,11 @@ setup_slot_netns() { # <idx>
   # A host with no primary address is not a host that can serve a band, but it
   # is also not a reason to fail the slot: everything else about the slot works,
   # and a job that needs the band asserts CI_SHARED_INFRA_ADDR itself.
-  if [ -n "$addr" ]; then
+  #
+  # A utility host (#1635) publishes no band -- see setup_slot_networking.
+  if [ "$UTILITY" = true ]; then
+    :
+  elif [ -n "$addr" ]; then
     iptables -w -t nat -C PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
       -j DNAT --to-destination "$nsip" 2>/dev/null \
       || iptables -w -t nat -A PREROUTING -d "$addr" -p tcp --dport "$bmin:$bmax" \
@@ -6136,6 +6344,7 @@ EOF
 NetworkNamespacePath=/run/netns/$(slot_netns "$idx")
 BindReadOnlyPaths=/etc/netns/$(slot_netns "$idx")/resolv.conf:/etc/resolv.conf
 EOF
+  utility_unit_dropin "/etc/systemd/system/ci-dockerd@$idx.service.d" dockerd || return 1
   systemctl daemon-reload
 
   systemctl enable --now "ci-dockerd@$idx.service" >>/var/log/ci-host.log 2>&1 || return 1
@@ -6701,6 +6910,7 @@ KillSignal=SIGTERM
 # and the slot loop only stops an agent GitHub has already agreed has no job.
 TimeoutStopSec=3600
 EOF
+  utility_unit_dropin "/etc/systemd/system/ci-runner@$idx.service.d" runner || return 1
   # No [Install] section and no enable: an agent must never start at boot on its
   # own, before this script has fenced the metadata server and reset the slot.
 
@@ -6719,6 +6929,10 @@ EOF
 # the tokens are not in argv at all" — and said it fails open rather than take a
 # pool offline over a defence in depth. It was taking the pool offline.
 harden_proc() {
+  if [ "$UTILITY" = true ]; then
+    harden_proc_utility
+    return
+  fi
   # Explicit, not merely absent: an image can be relaunched onto a host whose
   # /proc a previous boot of THIS script hardened, and a remount is the only
   # thing that puts it back. hidepid=0 is the kernel default.
@@ -6727,6 +6941,44 @@ harden_proc() {
   else
     log "WARNING: could not remount /proc; if a previous boot set hidepid, jobs using service containers will fail in 'Initialize containers'"
   fi
+}
+
+# A UTILITY host (#1635) is the other trade, and only there. Its slots serve
+# DIFFERENT repositories, so a slot reading a sibling's command lines and
+# environment is one repository reading another's -- the co-tenancy a pool host
+# never had. What the pool gave /proc back for is container and service jobs;
+# a utility host is not for those, and one that runs there fails in 'Initialize
+# containers' -- the trade is taken knowingly. (A container hook cannot refuse
+# them reliably: the runner calls ACTIONS_RUNNER_CONTAINER_HOOKS only when the
+# server sends DistributedTask.AllowRunnerContainerHooks, which we do not
+# control, and ACTIONS_RUNNER_HOOK_JOB_STARTED never sees the job's container.)
+# Fails CLOSED: a utility host with an open /proc must not register a slot.
+harden_proc_utility() {
+  mount -o remount,nosuid,nodev,noexec,hidepid=2 /proc ||
+    die "could not remount /proc with hidepid=2 -- a utility host must not let one repository's slot read another's processes"
+  log "/proc hidden from the slot users (hidepid=2) -- utility host; container and service jobs are not supported here"
+}
+
+# utility_unit_dropin <dropin-dir> <runner|dockerd> -- on a utility host (#1635),
+# hide /proc in the unit as well (each unit has its own mount namespace, so the
+# setting must be on both sides; see install_dockerd_unit). The agent also loses
+# the shared-infrastructure band, which a utility host does not publish
+# (setup_slot_networking). On a pool host the drop-in is REMOVED, so a pool unit
+# reads exactly as its own text says.
+utility_unit_dropin() { # <dropin-dir> <runner|dockerd>
+  local f="$1/30-utility.conf"
+  if [ "$UTILITY" != true ]; then
+    rm -f -- "$f"
+    return 0
+  fi
+  mkdir -p "$1" || return 1
+  {
+    printf '[Service]\n'
+    printf 'ProtectProc=invisible\n'
+    if [ "$2" = runner ]; then
+      printf 'UnsetEnvironment=CI_SHARED_INFRA_ADDR CI_SHARED_INFRA_PORT_MIN CI_SHARED_INFRA_PORT_MAX\n'
+    fi
+  } >"$f.tmp" && mv -f "$f.tmp" "$f"
 }
 
 # Ubuntu's own unattended patching, off for the life of the host (#1480). Left
@@ -6863,9 +7115,23 @@ main() {
   install_pin_hold || die "could not install the pin hold — refusing to register agents"
 
   local i
+  # A utility host (#1635): each slot is wiped before anything is provisioned in
+  # it whenever the repository it serves has changed. Fails CLOSED: a slot that
+  # could not be wiped must not be handed to another repository.
+  if [ "$UTILITY" = true ]; then
+    for i in $(seq 1 "$SLOTS"); do
+      bind_slot "$i" "$(slot_repo "$i")" || die "could not bind slot $i to its repository"
+    done
+  fi
   for i in $(seq 1 "$SLOTS"); do
     provision_slot_user "$i" || die "could not provision the user for slot $i"
   done
+  if [ "$CACHE_SEED" = off ]; then
+    # ci-cache-seed=off (#1635): no shared dependency or tool cache. The master
+    # is built from ONE repository's lockfiles, and a utility host's slots serve
+    # several -- seeding them would hand one repository's tree to the others.
+    log "ci-cache-seed=off -- no shared dependency or tool cache on this host"
+  else
   # Before provision_shared_cache, and the order is the security argument rather
   # than a preference: everything a snapshot brings has to be in the master while
   # the master is still being scanned and locked. Hydrating afterwards would land
@@ -6884,6 +7150,7 @@ main() {
   # ignored, and a host without a baked runtime is the host every pool had until
   # this existed.
   provision_tool_cache || true
+  fi
 
   install_dockerd_unit
   # The template must be on disk AND known to systemd before the first
