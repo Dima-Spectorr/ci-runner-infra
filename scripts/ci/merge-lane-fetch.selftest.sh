@@ -478,7 +478,19 @@ cases_spawn() { # <fetch-file>
     [ "${peak:-0}" -gt 1 ]
     say more-than-one-in-flight $?
     [ "$(cat "$d"/claims.* | sort -n | tr '\n' ' ')" = '0 1 2 3 4 5 6 ' ]
-    say every-head-claimed-once $?
+    dbg_rc=$?
+    if [ "$dbg_rc" -ne 0 ]; then # DEBUG(#1644): remove once the 26.04 cause is fixed
+      {
+        echo "DBG spawn_rc=$spawn_rc left=$left peak=${peak:-}"
+        for f in "$d"/claims.* "$d"/started.*; do echo "DBG file $f: $(tr '\n' ' ' <"$f" 2>&1)"; done
+        echo "DBG order: $(tr '\n' ' ' <"$d/order" 2>&1)"
+        echo "DBG tally: $(lane_fetch_tally "$d/rec" "$total" 2>&1)"
+        ls -la "$d/rec" "$d"/rec/* 2>&1 | sed 's/^/DBG ls /'
+        for f in "$d"/rec/*/*; do [ -f "$f" ] && echo "DBG cat $f: $(head -c 300 "$f" | tr '\n' '|')"; done
+        echo "DBG bash=$BASH_VERSION mkdir=$(mkdir --version 2>&1 | head -1) find=$(find --version 2>&1 | head -1)"
+      } >&2
+    fi
+    say every-head-claimed-once "$dbg_rc"
     [ "$(head -1 "$d/order")" != 0 ] && [ "$(grep -cx 0 "$d/order")" -eq 1 ] \
       && [ "$(lane_fetch_state "$d/rec/0")" = ready ]
     say out-of-order-completion $?
