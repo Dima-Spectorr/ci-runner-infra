@@ -2121,11 +2121,11 @@ withdraw_backs_off() { # <file>
   esac
   (
     eval "$body"
-    # shellcheck disable=SC2034  # retry_at is read by the eval'd body
-    t=1000 calls=0 answer=1 retry_at=0
-    # shellcheck disable=SC2317  # the stubs are called by the eval'd body
+    # shellcheck disable=SC2034  # retry_at and SLOT_REPO are read by the eval'd body
+    t=1000 calls=0 answer=1 retry_at=0 SLOT_REPO=slot-repo
+    # shellcheck disable=SC2317,SC2329  # the stubs are called by the eval'd body
     date() { echo "$t"; }
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329  # called by the eval'd withdraw_idle
     delete_runner() { calls=$((calls + 1)); return "$answer"; }
     withdraw_idle 7 && exit 1                        # GitHub refuses
     [ "$calls" = 1 ] || exit 1
@@ -2663,9 +2663,13 @@ slot_repo_binding_behaves() { # <file>
   root=$(mktemp -d) || return 1
   # run <cmd...> -- in a subshell, with every network call recorded, never made
   run() (
+    # shellcheck disable=SC2034  # read by the eval'd mint_jit/delete_runner/slot_* bodies
     OWNER=own REPO=global-repo LABELS=self-hosted-pool BACKGROUND_SLOTS=0 HOSTNAME_SHORT=h
+    # shellcheck disable=SC2034  # read by the eval'd mint_jit body
     CURL_TIMEOUTS=() JIT_DIR="$root/jit"
+    # shellcheck disable=SC2034  # read by the eval'd slot_repo/slot_labels bodies
     SLOT_REPOS="${T_REPOS:-}" SLOT_LABEL_SETS="${T_LABELS:-}"
+    # shellcheck disable=SC2329  # stub called by the eval'd bodies
     log() { :; }
     runner_group_id() { printf 1; }
     jit_labels_json() { printf '[]'; }
@@ -2841,7 +2845,7 @@ mutate "a delete falls back to the host repo" 's@local tok code repo="\${2:-}"@l
 mutate "the token ignores the slot repo"     's@tok=\$(gh_token register "\$repo") || return 1@tok=$(gh_token register) || return 1@' slot_repo_binding_behaves
 mutate "the JIT url ignores the slot repo"   's@repos/\$OWNER/\$repo/actions/runners/generate-jitconfig@repos/$OWNER/$REPO/actions/runners/generate-jitconfig@' slot_repo_binding_behaves
 mutate "the loop withdraws in the host repo" 's@delete_runner "\$id" "\$SLOT_REPO" || true$@delete_runner "$id" "$REPO" || true@' slot_repo_binding_behaves
-mutate "every slot one repo"                 's@if \[ -n "\${SLOT_REPOS:-}" \]; then slot_field "\$SLOT_REPOS" , "\$1"@if false; then :@' slot_repo_binding_behaves
+mutate "every slot one repo"                 '/^slot_repo() {/,/^}/s@^  if \[ -n "\${SLOT_REPOS:-}" \]; then$@  if false; then@' slot_repo_binding_behaves
 mutate "slot labels go on every slot"        's@extra=\$(slot_field "\$SLOT_LABEL_SETS" .;. "\$1")@extra=$(printf %s "$SLOT_LABEL_SETS" | tr ";" ",")@' slot_repo_binding_behaves
 mutate "a rebind keeps the cache"            's@ "\$CACHE_SLOTS/\$idx" "\$SLOT_HOME_BASE/\$u"; do@ "$SLOT_HOME_BASE/$u"; do@' bind_slot_behaves
 mutate "a rebind keeps the daemon data"      's@ "\$SLOT_STATE/\$idx" "\$CACHE_SLOTS@ "$CACHE_SLOTS@' bind_slot_behaves
