@@ -1288,27 +1288,28 @@ STUB
   # can be as wrong as `/rate_limit` was — and the dispatch goes the moment a
   # probe answers.
   probes "403 $((now + 3600))" "403 $((now + 3600))" 200; rrun; rc=$?
-  # The verdict is captured before `res` reads it: a bare `$?` after a test is
-  # one stray command away from naming something else (SC2319).
-  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 60 60 ' ] && [ "$(dispatched)" = 1 ]; v=$?
+  # The verdict is set by an `if`, never read back from `$?` after a test:
+  # that `$?` is one stray command away from naming something else (SC2319,
+  # which flags `v=$?` after a condition too).
+  if [ "$rc" -eq 0 ] && [ "$(slept)" = '30 60 60 ' ] && [ "$(dispatched)" = 1 ]; then v=0; else v=1; fi
   res recover-reprobes-until-answered "$v"
 
   # A refusal whose own reset is sooner than the interval is waited out to it.
   probes "403 $((now + 10))" 200; rrun; rc=$?
   w=$(sed -n 2p "$d/slept" 2>/dev/null)
-  [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 1 ] && [ "${w:-0}" -le 15 ] && [ "$(dispatched)" = 1 ]; v=$?
+  if [ "$rc" -eq 0 ] && [ "${w:-0}" -ge 1 ] && [ "${w:-0}" -le 15 ] && [ "$(dispatched)" = 1 ]; then v=0; else v=1; fi
   res recover-follows-the-refusals-reset "$v"
 
   # Refused throughout: 900s in all, then the dispatch is made anyway.
   : >"$d/probes"
   for _ in $(seq 1 30); do echo "403 $((now + 3600))" >>"$d/probes"; done
   rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]; v=$?
+  if [ "$rc" -eq 0 ] && [ "$(awk '{t += $1} END {print t}' "$d/slept" 2>/dev/null)" = 900 ] && [ "$(dispatched)" = 1 ]; then v=0; else v=1; fi
   res recover-wait-is-capped "$v"
 
   # A refusal that is not a rate limit ends the wait: waiting would not change it.
   probes 403plain; rrun; rc=$?
-  [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ]; v=$?
+  if [ "$rc" -eq 0 ] && [ "$(slept)" = '30 ' ] && [ "$(dispatched)" = 1 ]; then v=0; else v=1; fi
   res recover-other-refusal-ends-the-wait "$v"
 
   # An unset default branch is read: from the probe's own answer when it had

@@ -119,8 +119,12 @@ jobs:
           echo "${SHELLCHECK_SHA256}  ${tarball}" | sha256sum -c -
           tar -xJf "$tarball" -C "$RUNNER_TEMP"
           sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
-          shellcheck --version
-          shellcheck --version | grep -qx "version: ${SHELLCHECK_VERSION#v}"
+          got="$(shellcheck --version)"
+          printf '%s\n' "$got"
+          case "$got" in
+            *"version: ${SHELLCHECK_VERSION#v}"*) ;;
+            *) echo "::error::shellcheck on PATH is not ${SHELLCHECK_VERSION}"; exit 1 ;;
+          esac
 
       - name: shellcheck
         run: |
