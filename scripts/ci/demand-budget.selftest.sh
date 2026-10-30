@@ -531,7 +531,7 @@ check "an unreadable ledger does not fail the summary, and publishes nothing" "0
 # The stubs in this subshell are called only from the tick() it evals out of the
 # controller, so the reachability pass sees no caller for any of them — the same
 # reason heartbeat-progress.selftest.sh carries this directive.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cycle_out=$(
   CLOCK=1000
   date() { printf '%s\n' "$CLOCK"; }

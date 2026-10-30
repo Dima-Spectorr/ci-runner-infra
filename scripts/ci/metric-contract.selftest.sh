@@ -167,7 +167,7 @@ batching_holds() {
     # shellcheck disable=SC2034
     METRIC_PREFIX=custom.googleapis.com/ci
     # Called only from the sourced file, so SC2317 again.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     log() { :; }
 
     # Shadows the binary for the whole subshell. The token call and the POST are
@@ -176,7 +176,7 @@ batching_holds() {
     #
     # SC2317 for the same reason as the SC2034s above: the only caller is inside
     # the sourced file, so every line of this body reads as unreachable.
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     curl() {
       local a prev="" body=""
       case "$*" in

@@ -290,7 +290,7 @@ legacy=$(
   # oldest of them, which is the case that matters: an absent attribute reads as
   # the empty string, and in jq an empty string is TRUTHY, so `// 900` would
   # hand the row a "" it then rejects as non-numeric.
-  # shellcheck disable=SC2317  # every arm is reached via the eval'd code.
+  # shellcheck disable=SC2317,SC2329  # every arm is reached via the eval'd code.
   md() {
     case "$1" in
       *ci-pools) echo "" ;;

@@ -32,7 +32,7 @@
 # Same reason as multi-pool.selftest.sh and metric-contract.selftest.sh.
 # (A comment line may not BEGIN with the linter's own name — it is read as a
 # malformed directive, SC1073.)
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 
 set -uo pipefail
 
