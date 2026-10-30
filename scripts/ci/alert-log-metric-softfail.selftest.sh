@@ -66,7 +66,7 @@ run_case() { # <ok|denied|already_exists|transient>  -> stdout; rc is the subshe
     DRY=0
     # shellcheck disable=SC2034
     tmp="$tmpd"
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     g() {
       # Each arm emits the real API's wording, because the function now
       # SELECTS its remediation by matching this text. A single generic

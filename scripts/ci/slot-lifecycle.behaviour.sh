@@ -1157,8 +1157,14 @@ reset_once "$RESET"
 check_not "and the real reset leaves nothing of it"    planted_alive
 timeout -k 5 30 systemctl stop hold-rtd-1622.service >/dev/null 2>&1
 
-# A manager that will not come back fails the slot closed.
+# A manager that will not come back fails the slot closed. STOPPED, then
+# masked: a mask does not stop a running unit, and the real reset just above
+# brought this one back -- masked alone, the reset finds a usable manager and
+# never tries the restart this case is about (red since the planted-unit block
+# above landed between the revival mutant and here, #1624).
+systemctl stop "user@$SUID.service" >>"$HOOKLOG" 2>&1
 systemctl mask --runtime "user@$SUID.service" >>"$HOOKLOG" 2>&1
+check_not "the masked manager is down before the reset"  manager_active
 rm -f -- "$MARKER"
 reset_once "$RESET"
 check "a manager that will not come back fails the reset" test "$rc" != 0

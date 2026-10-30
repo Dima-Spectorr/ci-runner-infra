@@ -100,12 +100,31 @@ jobs:
       # reaching an unreachable mirror and shellcheck looping look identical when
       # neither says anything. Two steps with an explicit `timeout` each cost
       # nothing and turn that into a named failure.
+      #
+      # PINNED, NOT APT. The runner image's apt shellcheck moved 0.10 -> 0.11 on
+      # the 2026-10-25 image roll and 0.11's new checks (SC2329, SC2319) turned
+      # main red with no change in this repo. A new version is a deliberate
+      # bump here -- version and digest together, findings fixed in the same
+      # PR -- never something the image does to us. The digest is the release
+      # asset's own (GitHub release API `digest`), checked before extraction.
       - name: install shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
         run: |
           set -euo pipefail
-          timeout 300 sudo apt-get update -qq
-          timeout 300 sudo apt-get install -y -qq shellcheck
-          shellcheck --version
+          tarball="$RUNNER_TEMP/shellcheck.tar.xz"
+          timeout 300 curl -sSfL --retry 3 -o "$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xJf "$tarball" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          got="$(shellcheck --version)"
+          printf '%s\n' "$got"
+          case "$got" in
+            *"version: ${SHELLCHECK_VERSION#v}"*) ;;
+            *) echo "::error::shellcheck on PATH is not ${SHELLCHECK_VERSION}"; exit 1 ;;
+          esac
 
       - name: shellcheck
         run: |
@@ -780,6 +799,8 @@ jobs:
       # only place the kill-the-jobs-on-exit case runs — it needs `pgrep`,
       # which a Linux runner has and a developer's Windows shell does not.
       - name: merge-lane fetch-phase self-test
+        env:
+          SPAWN_REPEAT: '8' # DEBUG(#1644): remove with the fix
         run: bash scripts/ci/merge-lane-fetch.selftest.sh
 
       # THE OTHER HALF OF THE LANE'S REVIEW GATE, AND THE HALF THAT SPENDS

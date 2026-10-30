@@ -4,7 +4,7 @@
 # run against the real file and against a mutated copy, and a caller that named
 # it directly could not do both. shellcheck's reachability pass sees no direct
 # call and reports the entire file as dead code.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 # Self-test for the Windows snapshot BUILD phase's structural invariants.
 #
 # Its companions are the Pester suite over the pure functions

@@ -441,7 +441,7 @@ cases_spawn() { # <fetch-file>
     # never the first to complete, however the scheduler behaves.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     job() {
       local i n
       : >"$d/started.$1"
@@ -469,6 +469,8 @@ cases_spawn() { # <fetch-file>
     lane_fetch_spawn "$jobs" job
     spawn_rc=$?
     left="${#LANE_FETCH_PIDS[@]}"
+    # DEBUG(#1644): what is still running right after the phase returned.
+    dbg_kids="$(ps -o pid,ppid,stat,cmd --ppid "$BASHPID" 2>&1 | tr '\n' ';'; jobs -l 2>&1 | tr '\n' ';')"
     # Only a broken copy leaves anything running here; it is not left behind.
     wait 2>/dev/null
 
@@ -491,6 +493,35 @@ cases_spawn() { # <fetch-file>
     say calls-summed-across-jobs $?
     [ "$left" -eq 0 ]
     say nothing-left-to-kill-after-the-wait $?
+
+    # DEBUG(#1644): the whole state, every run; the caller prints it on a FAIL.
+    {
+      echo "bash=$BASH_VERSION mkdir=$(mkdir --version 2>&1 | head -1)"
+      echo "spawn_rc=$spawn_rc left=$left peak=${peak:-} kids=$dbg_kids"
+      for f in "$d"/claims.* "$d"/started.* "$d/order"; do
+        if [ -e "$f" ]; then echo "${f##*/}: $(tr '\n' ' ' <"$f")"; fi
+      done
+      echo "tally: $(lane_fetch_tally "$d/rec" "$total")"
+      for ((k = 0; k < total; k++)); do
+        echo "rec/$k: state=$(lane_fetch_state "$d/rec/$k") seq=$(lane_fetch_count "$d/rec/$k/seq") files=$(find "$d/rec/$k" -mindepth 1 -printf '%f ' 2>&1)"
+        if [ -e "$d/rec/$k/result" ]; then echo "  result: $(tr '\n' ' ' <"$d/rec/$k/result")"; fi
+      done
+      # Is a racing `mkdir` of one path exclusive on this image? 40 rounds of 4.
+      p="$d/probe"
+      mkdir "$p"
+      for ((r = 0; r < 40; r++)); do
+        for ((w = 0; w < 4; w++)); do
+          (mkdir "$p/r$r" 2>/dev/null && : >"$p/won.$r.$w") &
+        done
+        wait
+      done
+      multi=0
+      for ((r = 0; r < 40; r++)); do
+        won=("$p"/won."$r".*)
+        if [ "${#won[@]}" -gt 1 ]; then multi=$((multi + 1)); fi
+      done
+      echo "probe: mkdir rounds with more than one winner: $multi of 40"
+    } >"$WORK/spawn-dump" 2>&1
   )
 }
 
@@ -568,7 +599,7 @@ cases_shell() { # <fetch-file>
     # not the condition of anything. The job must reach the line after it.
     #
     # Called by name, from `lane_fetch_spawn`, so it is not unreachable.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     failing_job() {
       false
       : >"$d/after-failure.$1"
@@ -588,7 +619,7 @@ cases_shell() { # <fetch-file>
     # the job's `trap - EXIT` changes nothing and would prove nothing. The
     # mutation re-arms the parent's trap inside the job instead, which is what
     # that line is there to make impossible.
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     quiet_job() { : >"$d/quiet.$1"; }
     (
       trap 'printf . >>"$d/trap-ran"' EXIT
@@ -835,7 +866,7 @@ cases_wait() {
 # SC2034: the LANE_* globals are read by the sourced fetch file. SC2317: the
 # sleep stub is called by lane_gh_retry. SC2181: each case asserts on the exit
 # code of a call whose output and stderr it also inspects.
-# shellcheck disable=SC2034,SC2317,SC2181
+# shellcheck disable=SC2034,SC2317,SC2329,SC2181
 cases_retry() { # <fetch-file>
   (
     # shellcheck source=/dev/null
@@ -1087,7 +1118,7 @@ cases_snap() { # <fetch-file>
     mkdir "$d/fix" "$d/snap"
     build_snap_fixture "$d/fix"
     # The page retry's wait is written down, never slept (#1581).
-    # shellcheck disable=SC2317  # called indirectly, by lane_snap_page via the sourced fetch file
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_page via the sourced fetch file
     lane_snap_retry_sleep() { echo "$1" >>"$d/slept"; }
     LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota" R="$REPO" LANE_BASE=main
     unset GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
@@ -1271,7 +1302,15 @@ mutant() {
 # the driver; CI runs the file with no argument, which is everything.
 if [ "${1:-}" != e2e ]; then
 tally_lines "$(cases_core "$FETCH" 2>&1)" 22 core
-tally_lines "$(cases_spawn "$FETCH" 2>&1)" 7 spawn
+# DEBUG(#1644): SPAWN_REPEAT runs the timing-sensitive group more than once.
+for ((spawn_rep = 0; spawn_rep < ${SPAWN_REPEAT:-1}; spawn_rep++)); do
+  spawn_out="$(cases_spawn "$FETCH" 2>&1)"
+  tally_lines "$spawn_out" 7 spawn
+  case "$spawn_out" in
+    *'FAIL '*) printf -- '--- spawn dump, repeat %s ---\n%s\n%s\n' "$spawn_rep" "$spawn_out" "$(cat "$WORK/spawn-dump")" >&2 ;;
+    *) printf 'spawn repeat %s: %s\n' "$spawn_rep" "$(tail -1 "$WORK/spawn-dump")" >&2 ;;
+  esac
+done
 tally_lines "$(cases_kill "$FETCH" 2>&1)" 2 kill
 tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 tally_lines "$(cases_retry "$FETCH" 2>&1)" 12 retry

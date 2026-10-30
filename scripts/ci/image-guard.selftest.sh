@@ -29,7 +29,7 @@
 # The probes are invoked through their NAME, held in a variable, by mutate() —
 # which is the design: each has to run against the real config and against a
 # mutated copy, and a caller that named one directly could not do both.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 
 set -uo pipefail
 

@@ -35,7 +35,7 @@
 # the shipped script and eval'd, which no static reader can follow (SC2034,
 # SC2317), and the single-quoted text is shell written out for another process
 # or matched literally (SC2016).
-# shellcheck disable=SC2034,SC2317,SC2016
+# shellcheck disable=SC2034,SC2317,SC2329,SC2016
 
 set -uo pipefail
 

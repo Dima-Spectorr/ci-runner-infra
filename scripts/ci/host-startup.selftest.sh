@@ -2670,7 +2670,6 @@ slot_repo_binding_behaves() { # <file>
     CURL_TIMEOUTS=() JIT_DIR="$root/jit"
     # shellcheck disable=SC2034  # read by the eval'd slot_repo/slot_labels bodies
     SLOT_REPOS="${T_REPOS:-}" SLOT_LABEL_SETS="${T_LABELS:-}"
-    # shellcheck disable=SC2329  # stub called by the eval'd bodies
     log() { :; }
     runner_group_id() { printf 1; }
     jit_labels_json() { printf '[]'; }
