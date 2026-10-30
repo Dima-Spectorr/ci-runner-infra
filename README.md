@@ -1198,6 +1198,8 @@ modules/ci-runner-cache-warmer/  the only identity that WRITES either cache:
                                  a nightly build of the default branch
 modules/ci-runner-apply-trigger/ the unattended apply, as the project's OWN Cloud Build
 modules/ci-host-image-trigger/   the golden image, rebuilt by a merge instead of by hand
+modules/ci-runner-utility-host/  one always-on host, one repository per slot,
+                                 for short gatekeeper jobs (docs/adr-utility-host.md)
 modules/ci-runner-host-pool/     the module consumers reference
   scripts/drain-decision.sh      pure scale-in rule (unit-tested)
   scripts/orphan-decision.sh     pure registration-reap rule (unit-tested)
