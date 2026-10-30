@@ -31,7 +31,8 @@
 #
 # NOT `wait -n`, AND NOT GNU parallel. The lane runs on hosted and on
 # self-hosted Linux runners and nothing guarantees either tool there. Jobs claim
-# heads with `mkdir`, which is atomic everywhere, so a slow head never holds up
+# heads with an O_EXCL file the shell creates itself (not `mkdir`, which is not
+# exclusive on every image — see `lane_fetch_claim`), so a slow head never holds up
 # the others, the cap is simply the number of jobs, and one plain `wait` ends
 # the phase.
 
@@ -390,10 +391,19 @@ lane_fetch_seal() {
 # Takes the head whose recording directory is <dir>, or returns 1 when another
 # job already has it. Called once per head, in list order, by every job: the
 # previous head's recording is closed first, whoever wins this one.
+#
+# THE CLAIM IS A FILE THE SHELL ITSELF CREATES WITH O_EXCL, NOT A `mkdir`.
+# `mkdir` is an external program, and the uutils one on ubuntu-26.04 reported
+# success to two racing callers for one path (measured, #1644: 2 rounds of 40
+# with two winners). Two jobs then fetched one head into one recording and the
+# lane's tally double-counted it. `set -C` makes bash open the file with
+# O_CREAT|O_EXCL itself, so the kernel picks exactly one winner on any image.
 lane_fetch_claim() {
   lane_fetch_seal
-  [ ! -d "$1" ] || return 1
-  mkdir "$1" 2>/dev/null || return 1
+  [ -n "$1" ] || return 1
+  [ ! -e "$1.claim" ] || return 1
+  (set -C && : >"$1.claim") 2>/dev/null || return 1
+  mkdir -p "$1" || return 1
   LANE_RECORD="$1"
   : >"$LANE_RECORD/seq"
   return 0
