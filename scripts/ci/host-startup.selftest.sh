@@ -2659,7 +2659,7 @@ mutate "the loop cleans its own way"      's@timeout 900 /opt/ci/job-hooks/slot-
 slot_repo_binding_behaves() { # <file>
   local f="$1" fns code root got lbl
   fns=$(for n in slot_field slot_field_count slot_repo slot_labels mint_jit delete_runner; do extract_fn "$f" "$n"; done)
-  case "$fns" in *'mint_jit() {'*'delete_runner() {'*'slot_repo() {'*) : ;; *) return 1 ;; esac
+  case "$fns" in *'slot_repo() {'*'mint_jit() {'*'delete_runner() {'*) : ;; *) return 1 ;; esac
   root=$(mktemp -d) || return 1
   # run <cmd...> -- in a subshell, with every network call recorded, never made
   # shellcheck disable=SC2329  # stubs are called by the eval'd bodies
@@ -2799,6 +2799,7 @@ has_utility_isolation() { # <file>
   grep -q '^UnsetEnvironment=CI_SHARED_INFRA_ADDR ' "$root/r/30-utility.conf" 2>/dev/null || okk=1
   ! grep -q UnsetEnvironment "$root/d/30-utility.conf" 2>/dev/null || okk=1
   # a pool host carries no drop-in, even one a previous utility boot left
+  # shellcheck disable=SC2034  # read by the eval'd utility_unit_dropin body
   ( UTILITY=false; eval "$body"; utility_unit_dropin "$root/r" runner ) || okk=1
   [ ! -e "$root/r/30-utility.conf" ] || okk=1
   rm -rf -- "$root"
