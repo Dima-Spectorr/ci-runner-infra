@@ -164,7 +164,7 @@ run_mint() {
   W="$WORK/run"; rm -rf "$W"; mkdir -p "$W/state"
   printf '%s\n' "$@" >"$W/codes"
   : >"$W/calls"; : >"$W/events"
-  W="$W" T_REPO="${T_REPO:-}" T_SCOPE="${T_SCOPE:-}" bash -c "
+  W="$W" T_REPO="${T_REPO:-}" T_SCOPE="${T_SCOPE:-}" T_ARGREPO="${T_ARGREPO:-}" bash -c "
     set -uo pipefail
     STATE_DIR=\"\$W/state\"; LOG=/dev/null; REPO=\"\${T_REPO:-svc-repo}\"; REPO_FULL=\"own/\$REPO\"
     INSTALL_ID=11; APP_ID=22; KEY_SECRET=k; CURL_TIMEOUTS=(); GH_TOKEN=''; GH_TOKEN_EXPIRY=0
@@ -172,7 +172,7 @@ run_mint() {
     $STUBS
     $(fn gh_token "$file")
     ${T_PRE:-}
-    out=\$(gh_token \${T_SCOPE:+\"\$T_SCOPE\"}); rc=\$?
+    out=\$(gh_token \${T_SCOPE:+\"\$T_SCOPE\"} \${T_ARGREPO:+\"\$T_ARGREPO\"}); rc=\$?
     printf 'rc=%s out=%s' \"\$rc\" \"\$out\"
   " 2>&1
 }
@@ -260,6 +260,22 @@ check "host: unnamed scope mints nothing" "rc=1 out= " "$r $(calls)"
 # Host: a repository name that could break the JSON body mints nothing.
 r=$(T_REPO='x","y' run_mint "$HOST" 201)
 check "host: malformed repo mints nothing" "rc=1 out= " "$r $(calls)"
+
+# Host, a utility slot (#1635): the repository named by the caller, and only it,
+# is in the body -- never the host's ci-github-repo beside it.
+r=$(T_SCOPE=register T_ARGREPO=other-repo run_mint "$HOST" 201)
+check "host: slot repo mint succeeds" "rc=0 out=tok-1" "$r"
+check "host: slot repo mint body" '{"repositories":["other-repo"],"permissions":{"administration":"write"}}' "$(calls)"
+r=$(T_SCOPE=register T_ARGREPO='x","y' run_mint "$HOST" 201)
+check "host: malformed slot repo mints nothing" "rc=1 out= " "$r $(calls)"
+sed 's/repo="\${2:-\$REPO}"/repo="$REPO"/' "$HOST" >"$WORK/host-mutant.sh"
+if cmp -s "$WORK/host-mutant.sh" "$HOST"; then
+  check "mutant slot repo ignored applies" "changed" "unchanged"
+else
+  T_SCOPE=register T_ARGREPO=other-repo run_mint "$WORK/host-mutant.sh" 201 >/dev/null
+  check "mutant slot repo ignored is caught" "caught" \
+    "$(case "$(calls)" in *other-repo*) echo missed ;; *) echo caught ;; esac)"
+fi
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -898,7 +898,11 @@ has_secrets_out_of_argv() { # <file>
   # the two settings must move together — a unit that hides /proc while the host
   # mount does not, or the reverse, is the same outage.
   ! matches "$code" '^ProtectProc=invisible' || return 1
-  ! matches "$code" 'hidepid=[1-9]' || return 1
+  # The one exception is a UTILITY host (#1635), whose own predicate is
+  # has_utility_isolation: hidepid=2 lives in harden_proc_utility and nowhere
+  # else, and harden_proc reaches it only behind ci-utility=true.
+  ! matches "$(printf '%s\n' "$code" | awk '/^harden_proc_utility\(\) \{/,/^\}/ {next} {print}')" 'hidepid=[1-9]' || return 1
+  matches "$code" '^  if \[ "\$UTILITY" = true \]; then$' || return 1
   [ "$(printf '%s\n' "$code" | grep -cE '^ProtectProc=default')" -eq 2 ] || return 1
   # Explicit, not absent: a warm host may already carry hidepid from a previous
   # boot of this script, and only a remount takes it off.
@@ -1381,7 +1385,7 @@ has_slot_sweep() { # <file>
   # can go up while the runner is minted and the controller's roster read may
   # already have missed it. A gated runner is withdrawn, never started.
   counts "$code" 'if why=\$\(gate\); then' 2 || return 1
-  matches "$code" 'delete_runner "\$id" \|\| log "slot \$idx: could not withdraw runner' || return 1
+  matches "$code" 'delete_runner "\$id" "\$SLOT_REPO" \|\| log "slot \$idx: could not withdraw runner' || return 1
 
   # The ONE stop left: a runner whose marker was withdrawn while it waited is
   # deleted through the API first -- GitHub refuses with 422 while a job is
@@ -1399,7 +1403,7 @@ has_slot_sweep() { # <file>
 
   # After the agent exits: its runner deleted, and the slot reset before the next
   # -- unless it was withdrawn only to relabel (#1600) and its clean marker stands.
-  matches "$code" '^  delete_runner "\$id" \|\| true$' || return 1
+  matches "$code" '^  delete_runner "\$id" "\$SLOT_REPO" \|\| true$' || return 1
   matches "$code" '^  if \[ "\$relabel" = 1 \] && \[ -f "\$dir/clean" \]; then$'
 }
 
@@ -2094,7 +2098,7 @@ host_admissible_behaves() { # <file>
   matches "$code" 'jit_labels_json mint_jit delete_runner host_admissible$' || return 1
   # every mint carries the answer
   matches "$code" '^  unheld=\$\(unheld_now\)$' || return 1
-  matches "$code" 'id=\$\(mint_jit "\$idx" "\$ENVFILE" "\$unheld"\)' || return 1
+  matches "$code" 'id=\$\(mint_jit "\$idx" "\$ENVFILE" "\$unheld" "\$SLOT_REPO"\)' || return 1
   # a stale answer on an idle runner is withdrawn, never one with a job
   matches "$code" 'if \[ "\$\(unheld_now\)" != "\$unheld" \] && ! job_running && withdraw_idle "\$id"; then' || return 1
   # a relabel skips the reset only while the clean marker stands
@@ -2117,11 +2121,11 @@ withdraw_backs_off() { # <file>
   esac
   (
     eval "$body"
-    # shellcheck disable=SC2034  # retry_at is read by the eval'd body
-    t=1000 calls=0 answer=1 retry_at=0
+    # shellcheck disable=SC2034  # retry_at and SLOT_REPO are read by the eval'd body
+    t=1000 calls=0 answer=1 retry_at=0 SLOT_REPO=slot-repo
     # shellcheck disable=SC2317,SC2329  # the stubs are called by the eval'd body
     date() { echo "$t"; }
-    # shellcheck disable=SC2317,SC2329
+    # shellcheck disable=SC2317,SC2329  # called by the eval'd withdraw_idle
     delete_runner() { calls=$((calls + 1)); return "$answer"; }
     withdraw_idle 7 && exit 1                        # GitHub refuses
     [ "$calls" = 1 ] || exit 1
@@ -2487,12 +2491,12 @@ mutate "expiry compared inclusively"         's@  \[ "\$expiry" -gt "\$2" \] && 
 mutate "no record reads as held"             's@  \[ -f "\$1" \] || return 0@  [ -f "$1" ] || return 1@'           host_admissible_behaves
 mutate "a record without a ttl is held"      '/^host_admissible() {/,/^}/{s@"\$run:\$slot:\$ttl:\$expiry:\$reserve"@"$run:$slot:$expiry:$reserve"@;s@?\*:\[0-9\]\*:\[0-9\]\*:\[0-9\]\*:\[01\])@?*:[0-9]*:[0-9]*:[01])@;}' host_admissible_behaves
 mutate "the loop never ships the predicate"  's@jit_labels_json mint_jit delete_runner host_admissible$@jit_labels_json mint_jit delete_runner@' host_admissible_behaves
-mutate "the mint ignores the answer"         's@id=\$(mint_jit "\$idx" "\$ENVFILE" "\$unheld")@id=$(mint_jit "$idx" "$ENVFILE")@' host_admissible_behaves
+mutate "the mint ignores the answer"         's@id=\$(mint_jit "\$idx" "\$ENVFILE" "\$unheld" "\$SLOT_REPO")@id=$(mint_jit "$idx" "$ENVFILE" 0 "$SLOT_REPO")@' host_admissible_behaves
 mutate "a stale label is never withdrawn"    '/if \[ "\$(unheld_now)" != "\$unheld" \] && ! job_running && withdraw_idle "\$id"; then/d' host_admissible_behaves
 mutate "a relabel withdraws a busy runner"   's@\] && ! job_running && withdraw_idle "\$id"; then@] \&\& withdraw_idle "$id"; then@' host_admissible_behaves
 mutate "a failed withdraw never backs off"     '/^withdraw_idle() {/,/^}/s@^  retry_at=\$((\$(date +%s) + 60))$@  :@' withdraw_backs_off
 mutate "the back-off never lifts"            '/^withdraw_idle() {/,/^}/s@-ge "\$retry_at"@-ge "$((retry_at + 600))"@' withdraw_backs_off
-mutate "the back-off holds a success"        '/^withdraw_idle() {/,/^}/s@delete_runner "\$1" && return 0@delete_runner "$1" \&\& { retry_at=$(($(date +%s) + 60)); return 0; }@' withdraw_backs_off
+mutate "the back-off holds a success"        '/^withdraw_idle() {/,/^}/s@delete_runner "\$1" "\$SLOT_REPO" && return 0@delete_runner "$1" "$SLOT_REPO" \&\& { retry_at=$(($(date +%s) + 60)); return 0; }@' withdraw_backs_off
 mutate "the dirty path bypasses the back-off" 's@if \[ "\$dirty" -ge 12 \] && withdraw_idle "\$id"; then@if [ "$dirty" -ge 12 ] \&\& delete_runner "$id"; then@' withdraw_backs_off
 mutate "the relabel bypasses the back-off"   's@! job_running && withdraw_idle "\$id"; then@! job_running \&\& delete_runner "$id"; then@' withdraw_backs_off
 mutate "a new runner inherits the back-off"  '/^  retry_at=0$/d' withdraw_backs_off
@@ -2641,10 +2645,225 @@ mutate "a runner stopped while assigned"  's@ \&\& withdraw_idle "\$id"; then@; 
 mutate "one sample is enough to stop"     's@-ge 12 \]@-ge 0 ]@'                                               has_slot_sweep
 mutate "reset under a previous loop's job" 's@^while agent_up; do sleep 5; done$@:@'                          has_slot_sweep
 mutate "the gate asked once"              '0,/if why=\$(gate); then/s@if why=\$(gate); then@if false; then@'     has_slot_sweep
-mutate "a gated runner started anyway"    's@delete_runner "\$id" || log "slot \$idx: could not withdraw runner@: || log "x@' has_slot_sweep
-mutate "the dead agent's runner kept"     's@^  delete_runner "\$id" || true$@  true@'                          has_slot_sweep
+mutate "a gated runner started anyway"    's@delete_runner "\$id" "\$SLOT_REPO" || log "slot \$idx: could not withdraw runner@: || log "x@' has_slot_sweep
+mutate "the dead agent's runner kept"     's@^  delete_runner "\$id" "\$SLOT_REPO" || true$@  true@'                        has_slot_sweep
 mutate "a second stop path"               's@^  if \[ "\$relabel" = 1 \]@  systemctl stop "$UNIT"; if [ "$relabel" = 1 ]@'           has_slot_sweep
 mutate "the loop cleans its own way"      's@timeout 900 /opt/ci/job-hooks/slot-reset\.sh completed "\$idx"@rm -rf "$dir"@' has_slot_sweep
+
+# --- a slot bound to its own repository (#1635) --------------------------------
+#
+# A utility host gives each slot its own repository (ci-slot-repos). The
+# functions that decide it are extracted and RUN with curl and the App token
+# stubbed to a log, so what is asserted is the URL and the token scope each slot
+# actually asks for -- never prose that names them.
+slot_repo_binding_behaves() { # <file>
+  local f="$1" fns code root got lbl
+  fns=$(for n in slot_field slot_field_count slot_repo slot_labels mint_jit delete_runner; do extract_fn "$f" "$n"; done)
+  case "$fns" in *'slot_repo() {'*'mint_jit() {'*'delete_runner() {'*) : ;; *) return 1 ;; esac
+  root=$(mktemp -d) || return 1
+  # run <cmd...> -- in a subshell, with every network call recorded, never made
+  # shellcheck disable=SC2329  # stubs are called by the eval'd bodies
+  run() (
+    # shellcheck disable=SC2034  # read by the eval'd mint_jit/delete_runner/slot_* bodies
+    OWNER=own REPO=global-repo LABELS=self-hosted-pool BACKGROUND_SLOTS=0 HOSTNAME_SHORT=h
+    # shellcheck disable=SC2034  # read by the eval'd mint_jit body
+    CURL_TIMEOUTS=() JIT_DIR="$root/jit"
+    # shellcheck disable=SC2034  # read by the eval'd slot_repo/slot_labels bodies
+    SLOT_REPOS="${T_REPOS:-}" SLOT_LABEL_SETS="${T_LABELS:-}"
+    log() { :; }
+    runner_group_id() { printf 1; }
+    jit_labels_json() { printf '[]'; }
+    gh_token() { printf 'token %s\n' "$*" >>"$root/calls"; printf tok; }
+    curl() { local a; for a; do :; done; printf 'url %s\n' "$a" >>"$root/calls"; printf '{"message":"no"}\n500'; }
+    eval "$fns"
+    "$@"
+  )
+  local okk=0
+  # ABSENT KEYS: every slot is the host's one repository, labels unchanged.
+  [ "$(run slot_repo 1)" = global-repo ] || okk=1
+  [ "$(run slot_repo 3)" = global-repo ] || okk=1
+  [ "$(run slot_labels 1)" = self-hosted-pool ] || okk=1
+  [ "$(run slot_labels 2 1)" = self-hosted-pool,ci-unheld ] || okk=1
+  # TWO SLOTS, TWO REPOSITORIES: each mints with a token for, and at, its own.
+  : >"$root/calls"
+  for i in 1 2; do
+    got=$(T_REPOS=alpha,beta run slot_repo "$i")
+    T_REPOS=alpha,beta run mint_jit "$i" "$root/env$i" 0 "$got" >/dev/null 2>&1
+    T_REPOS=alpha,beta run delete_runner 7"$i" "$got" >/dev/null 2>&1
+  done
+  got=$(cat "$root/calls")
+  [ "$(printf '%s\n' "$got" | grep -c '^token register alpha$')" -eq 2 ] || okk=1
+  [ "$(printf '%s\n' "$got" | grep -c '^token register beta$')" -eq 2 ] || okk=1
+  matches "$got" '^url https://api\.github\.com/repos/own/alpha/actions/runners/generate-jitconfig$' || okk=1
+  matches "$got" '^url https://api\.github\.com/repos/own/beta/actions/runners/generate-jitconfig$' || okk=1
+  matches "$got" '^url https://api\.github\.com/repos/own/alpha/actions/runners/71$' || okk=1
+  matches "$got" '^url https://api\.github\.com/repos/own/beta/actions/runners/72$' || okk=1
+  # NO FALLBACK: the host's own repository is never asked for when a slot has one,
+  # and a call that names no repository makes no call at all.
+  ! matches "$got" 'global-repo' || okk=1
+  : >"$root/calls"
+  run mint_jit 1 "$root/env" 0 >/dev/null 2>&1 && okk=1
+  run delete_runner 5 >/dev/null 2>&1 && okk=1
+  [ ! -s "$root/calls" ] || okk=1
+  # per-slot labels land on their slot only
+  lbl=$(T_LABELS='a,b;c' run slot_labels 1); [ "$lbl" = self-hosted-pool,a,b ] || okk=1
+  lbl=$(T_LABELS='a,b;c' run slot_labels 2); [ "$lbl" = self-hosted-pool,c ] || okk=1
+  rm -rf -- "$root"
+  [ "$okk" = 0 ] || return 1
+
+  # Every call site in the slot loop passes the slot's BOUND repository: no call
+  # of either with one argument, and none with the host's $REPO.
+  code=$(code_of "$f")
+  matches "$code" '^SLOT_REPO=\$\(slot_repo "\$idx"\)$' || return 1
+  ! matches "$code" '(^|[^_a-z])delete_runner "[^"]*"[[:space:]]*(\|\||&&|;|\)|$)' || return 1
+  ! matches "$code" '(mint_jit|delete_runner) [^#]*"\$REPO"' || return 1
+  counts "$code" 'delete_runner "\$(id|1)" "\$SLOT_REPO"' 4 || return 1
+  return 0
+}
+
+if slot_repo_binding_behaves "$SCRIPT"; then
+  ok
+else
+  bad "a slot does not mint, withdraw or take its token in its OWN repository -- on a utility host one repository's runner would register in, or be withdrawn from, another's (#1635)"
+fi
+
+# A REBIND WIPES (#1635). bind_slot is extracted and RUN against a scratch tree:
+# the same repository keeps the slot, another one destroys everything the old
+# one could have written and withdraws its runner from the OLD repository, and a
+# withdraw that fails leaves the old binding in place so the next boot retries.
+bind_slot_behaves() { # <file>
+  local body root okk=0
+  body=$(extract_fn "$1" bind_slot)
+  case "$body" in *SLOT_BINDING_DIR*) : ;; *) return 1 ;; esac
+  root=$(mktemp -d) || return 1
+  # shellcheck disable=SC2034,SC2329  # variables and stubs are read by the eval'd bind_slot body
+  b() ( # <idx> <repo> [delete-rc]
+    SLOT_ROOT="$root/slots" SLOT_STATE="$root/state" CACHE_SLOTS="$root/cache"
+    SLOT_HOME_BASE="$root/home" SLOT_BINDING_DIR="$root/binding"
+    log() { :; }; safe_for_log() { printf '%s' "$1"; }
+    slot_user() { printf 'ci-s%s' "$1"; }
+    systemctl() { :; }; pkill() { :; }; id() { return 1; }
+    install() { local a; for a; do :; done; mkdir -p "$a"; }
+    delete_runner() { printf '%s %s\n' "$1" "$2" >>"$root/deleted"; return "${DEL_RC:-0}"; }
+    eval "$body"
+    bind_slot "$@"
+  )
+  fill() { mkdir -p "$root/slots/1/_work" "$root/slots/.reset/1" "$root/state/1/docker" "$root/cache/1" "$root/home/ci-s1"
+           for d in "$root/slots/1/_work" "$root/slots/.reset/1" "$root/state/1/docker" "$root/cache/1" "$root/home/ci-s1"; do : >"$d/left"; done; }
+  left() { find "$root/slots" "$root/state" "$root/cache" "$root/home" -name left 2>/dev/null | wc -l | tr -d ' '; }
+  # no binding recorded: nothing proves what the slot last served -> wiped
+  fill; b 1 alpha || okk=1
+  [ "$(left)" = 0 ] || okk=1
+  [ "$(head -n1 "$root/binding/1")" = alpha ] || okk=1
+  # same repository: kept
+  fill; b 1 alpha || okk=1
+  [ "$(left)" = 5 ] || okk=1
+  # another repository, its runner recorded: withdrawn from the OLD one, all wiped
+  printf '42\n' >"$root/binding/1.runner"
+  b 1 beta || okk=1
+  [ "$(left)" = 0 ] || okk=1
+  [ "$(cat "$root/deleted" 2>/dev/null)" = "42 alpha" ] || okk=1
+  [ "$(head -n1 "$root/binding/1")" = beta ] || okk=1
+  [ ! -e "$root/binding/1.runner" ] || okk=1
+  # the withdraw fails: refused, the old binding stands, nothing trusted as wiped
+  fill; printf '43\n' >"$root/binding/1.runner"
+  DEL_RC=1 b 1 gamma && okk=1
+  [ "$(head -n1 "$root/binding/1")" = beta ] || okk=1
+  rm -rf -- "$root"
+  [ "$okk" = 0 ]
+}
+
+if bind_slot_behaves "$SCRIPT"; then
+  ok
+else
+  bad "a utility slot rebound to another repository is not wiped, or keeps its runner in the old one -- the next repository's job inherits the last one's home, _work, images and cache (#1635)"
+fi
+
+# THE UTILITY HOST'S ISOLATION (#1635), and only there.
+has_utility_isolation() { # <file>
+  local code body root okk=0 net
+  code=$(code_of "$1")
+  # B1: /proc hidden on the host and in both units, fail-closed, utility only
+  matches "$code" 'mount -o remount,nosuid,nodev,noexec,hidepid=2 /proc \|\|$' || return 1
+  matches "$code" 'die "could not remount /proc with hidepid=2' || return 1
+  matches "$code" '^    harden_proc_utility$' || return 1
+  matches "$code" '^  utility_unit_dropin "/etc/systemd/system/ci-dockerd@\$idx\.service\.d" dockerd \|\| return 1$' || return 1
+  matches "$code" '^  utility_unit_dropin "/etc/systemd/system/ci-runner@\$idx\.service\.d" runner \|\| return 1$' || return 1
+  body=$(extract_fn "$1" utility_unit_dropin)
+  [ -n "$body" ] || return 1
+  root=$(mktemp -d) || return 1
+  ( UTILITY=true; eval "$body"; utility_unit_dropin "$root/r" runner; utility_unit_dropin "$root/d" dockerd ) || okk=1
+  grep -qx 'ProtectProc=invisible' "$root/r/30-utility.conf" 2>/dev/null || okk=1
+  grep -qx 'ProtectProc=invisible' "$root/d/30-utility.conf" 2>/dev/null || okk=1
+  grep -q '^UnsetEnvironment=CI_SHARED_INFRA_ADDR ' "$root/r/30-utility.conf" 2>/dev/null || okk=1
+  ! grep -q UnsetEnvironment "$root/d/30-utility.conf" 2>/dev/null || okk=1
+  # a pool host carries no drop-in, even one a previous utility boot left
+  # shellcheck disable=SC2034  # read by the eval'd utility_unit_dropin body
+  ( UTILITY=false; eval "$body"; utility_unit_dropin "$root/r" runner ) || okk=1
+  [ ! -e "$root/r/30-utility.conf" ] || okk=1
+  rm -rf -- "$root"
+  [ "$okk" = 0 ] || return 1
+  # B2 (#249), on EVERY host: no slot reaches a sibling's address directly, and
+  # the drop sits BELOW the band accept (so the band survives on a pool host)
+  # and above the per-veth accepts (inserted before the first that exists).
+  net=$(extract_fn "$1" setup_slot_networking | grep -vE '^[[:space:]]*#')
+  matches "$net" 'iptables -w -I FORWARD "\$below" -s 10\.99\.0\.0/16 -d 10\.99\.0\.0/16 -j DROP' || return 1
+  matches "$net" 'iptables -w -A FORWARD -s 10\.99\.0\.0/16 -d 10\.99\.0\.0/16 -j DROP' || return 1
+  matches "$net" "-\\[io\\] cis\\[0-9\\]\\+ -j ACCEPT" || return 1
+  [ "$(printf '%s\n' "$net" | grep -nE 'ctstate DNAT --ctorigdst' | head -n1 | cut -d: -f1)" -lt \
+    "$(printf '%s\n' "$net" | grep -nE -- '-d 10\.99\.0\.0/16 -j DROP' | head -n1 | cut -d: -f1)" ] || return 1
+  ! matches "$(printf '%s\n' "$net" | grep -B3 -- '-d 10\.99\.0\.0/16 -j DROP')" 'UTILITY' || return 1
+  # B3: no band on a utility host -- no reservation, forward accept, DNAT or hairpin
+  matches "$code" '^  \[ "\$UTILITY" = true \] \|\| case ",\$reserved," in$' || return 1
+  # harden_proc, the band's reservation+accept, its DNAT+hairpin, the loop's
+  # runner record and main's bind loop -- and nothing else turns on it
+  counts "$code" '^  if \[ "\$UTILITY" = true \]; then$' 5 || return 1
+  matches "$code" '^  elif \[ -n "\$baddr" \]; then$' || return 1
+  matches "$code" '^  elif \[ -n "\$addr" \]; then$' || return 1
+  # B4: every slot bound, fail-closed, before anything is provisioned in it
+  matches "$code" 'bind_slot "\$i" "\$\(slot_repo "\$i"\)" \|\| die' || return 1
+  [ "$(printf '%s\n' "$code" | grep -nE 'bind_slot "\$i"' | cut -d: -f1)" -lt \
+    "$(printf '%s\n' "$code" | grep -nE 'provision_slot_user "\$i" \|\| die' | cut -d: -f1)" ] || return 1
+  matches "$code" 'for d in "\$SLOT_ROOT/\$idx" "\$SLOT_ROOT/\.reset/\$idx" "\$SLOT_STATE/\$idx" "\$CACHE_SLOTS/\$idx" "\$SLOT_HOME_BASE/\$u"; do' || return 1
+  # the loop records its runner on a utility host, so a rebind can withdraw it
+  matches "$code" 'mv -f "\$SLOT_BINDING_DIR/\$idx\.runner\.tmp" "\$SLOT_BINDING_DIR/\$idx\.runner"' || return 1
+  matches "$code" 'SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR$' || return 1
+  # ci-cache-seed=off skips every shared cache
+  matches "$code" '^  if \[ "\$CACHE_SEED" = off \]; then$' || return 1
+  # a utility host with no per-slot repositories never boots
+  matches "$code" 'die "ci-utility=true but ci-slot-repos is empty' || return 1
+  matches "$code" 'die "ci-slot-repos/ci-slot-labels are set but ci-utility is not true' || return 1
+  return 0
+}
+
+if has_utility_isolation "$SCRIPT"; then
+  ok
+else
+  bad "a utility host's slots are not isolated from each other -- /proc readable, a sibling's address reachable, the band published, or a rebind that keeps the last repository's tree (#1635)"
+fi
+
+mutate "a mint falls back to the host repo"  's@^  \[ -n "\$repo" \] || { log "slot \$idx: mint_jit was not told@  repo=${repo:-$REPO}; [ -n "$repo" ] || { log "slot $idx: mint_jit was not told@' slot_repo_binding_behaves
+mutate "a delete falls back to the host repo" 's@local tok code repo="\${2:-}"@local tok code repo="${2:-$REPO}"@' slot_repo_binding_behaves
+mutate "the token ignores the slot repo"     's@tok=\$(gh_token register "\$repo") || return 1@tok=$(gh_token register) || return 1@' slot_repo_binding_behaves
+mutate "the JIT url ignores the slot repo"   's@repos/\$OWNER/\$repo/actions/runners/generate-jitconfig@repos/$OWNER/$REPO/actions/runners/generate-jitconfig@' slot_repo_binding_behaves
+mutate "the loop withdraws in the host repo" 's@delete_runner "\$id" "\$SLOT_REPO" || true$@delete_runner "$id" "$REPO" || true@' slot_repo_binding_behaves
+mutate "every slot one repo"                 '/^slot_repo() {/,/^}/s@^  if \[ -n "\${SLOT_REPOS:-}" \]; then$@  if false; then@' slot_repo_binding_behaves
+mutate "slot labels go on every slot"        's@extra=\$(slot_field "\$SLOT_LABEL_SETS" .;. "\$1")@extra=$(printf %s "$SLOT_LABEL_SETS" | tr ";" ",")@' slot_repo_binding_behaves
+mutate "a rebind keeps the cache"            's@ "\$CACHE_SLOTS/\$idx" "\$SLOT_HOME_BASE/\$u"; do@ "$SLOT_HOME_BASE/$u"; do@' bind_slot_behaves
+mutate "a rebind keeps the daemon data"      's@ "\$SLOT_STATE/\$idx" "\$CACHE_SLOTS@ "$CACHE_SLOTS@' bind_slot_behaves
+mutate "a rebind keeps the old runner"       '/^bind_slot() {/,/^}/s@    delete_runner "\$oldid" "\$old" || {@    true || {@' bind_slot_behaves
+mutate "the binding is written first"        '/^bind_slot() {/,/^}/s@^  \[ "\$old" = "\$repo" \] && return 0$@  [ "$old" = "$repo" ] \&\& return 0; printf "%s\\n" "$repo" >"$f"@' bind_slot_behaves
+mutate "an unrecorded slot is trusted"       '/^bind_slot() {/,/^}/s@^  \[ -f "\$f" \] && old=\$(head -n1 "\$f")$@  old=$repo@' bind_slot_behaves
+mutate "utility /proc left open"             's@hidepid=2 /proc ||$@hidepid=0 /proc ||@' has_utility_isolation
+mutate "utility /proc failure ignored"       's@die "could not remount /proc with hidepid=2@log "could not remount /proc with hidepid=2@' has_utility_isolation
+mutate "the runner unit keeps /proc"         '/utility_unit_dropin "\/etc\/systemd\/system\/ci-runner@/d' has_utility_isolation
+mutate "the drop-in stays on a pool host"    '/^utility_unit_dropin() {/,/^}/s@^    rm -f -- "\$f"$@    :@' has_utility_isolation
+mutate "siblings reach each other"           '/-d 10\.99\.0\.0\/16 -j DROP/d' has_utility_isolation
+mutate "utility host publishes the band"     's@^  \[ "\$UTILITY" = true \] || case ",\$reserved," in$@  case ",$reserved," in@' has_utility_isolation
+mutate "utility host DNATs the band"         's@^  elif \[ -n "\$addr" \]; then$@  fi; if [ -n "$addr" ]; then@' has_utility_isolation
+mutate "slots provisioned before the wipe"   '/bind_slot "\$i" "\$(slot_repo "\$i")" || die/d' has_utility_isolation
+mutate "the cache seeded anyway"             's@^  if \[ "\$CACHE_SEED" = off \]; then$@  if false; then@' has_utility_isolation
+mutate "the runner id never recorded"        's@SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR$@SLOT_REPOS SLOT_LABEL_SETS@' has_utility_isolation
 
 # --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
 #
