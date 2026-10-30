@@ -799,8 +799,6 @@ jobs:
       # only place the kill-the-jobs-on-exit case runs — it needs `pgrep`,
       # which a Linux runner has and a developer's Windows shell does not.
       - name: merge-lane fetch-phase self-test
-        env:
-          SPAWN_REPEAT: '8' # DEBUG(#1644): remove with the fix
         run: bash scripts/ci/merge-lane-fetch.selftest.sh
 
       # THE OTHER HALF OF THE LANE'S REVIEW GATE, AND THE HALF THAT SPENDS
