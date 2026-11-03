@@ -279,7 +279,7 @@ render() {
   fi
 
   if [ "$compared" -ge "$MAX_COMPARE" ] || [ "$others_more" = "true" ]; then
-    printf '> Compared against the %s most recently updated open pull requests, not all of them.\n\n' "$MAX_COMPARE"
+    printf '> Compared against the %s most recently updated open pull requests, not all of them.\n\n' "$compared"
   fi
 
   # NAME THE MODE. A warning nobody has to act on and a failure that blocks look
