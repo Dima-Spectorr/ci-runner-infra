@@ -198,17 +198,24 @@ echo "pr-guard: $mine_n changed file(s)"
 # other workflow in it. Measured on entity-platform on 2026-11-03: 31 open pull
 # requests, ~78 guard runs an hour, ~2,900 requests an hour, and the guard
 # itself going red with "API rate limit exceeded for installation". This query
-# costs 2 points whatever the count. A pull request whose first hundred files
-# are not all of them is re-read over REST, paginated, so the intersection is
-# never computed on a truncated list (the reason `mine` above is paginated).
+# reported `rateLimit { cost }` = 1 there. A pull request whose first hundred
+# files are not all of them is re-read over REST, paginated, so the intersection
+# is never computed on a truncated list (the reason `mine` above is paginated).
+#
+# ONE PAGE OF PULL REQUESTS, SO THE CAP IS 100 WHATEVER `max-compare` SAYS, and
+# a base with more open than that is reported below rather than passed off as
+# a complete comparison.
 #
 # `jq --argjson`, never interpolation: the pull request's own number is data.
+[ "$MAX_COMPARE" -le 100 ] 2>/dev/null || MAX_COMPARE=100
 # SC2016: `$o`/`$r`/`$b` are GraphQL variables, not shell ones.
 # shellcheck disable=SC2016
 others_gql='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){
   pullRequests(states:OPEN,baseRefName:$b,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){
+    pageInfo{hasNextPage}
     nodes{number title isDraft files(first:100){pageInfo{hasNextPage} nodes{path}}}}}}'
 others_json="$(gh api graphql -f o="${R%%/*}" -f r="${R#*/}" -f b="$BASE" -f query="$others_gql" 2>/dev/null || true)"
+others_more="$(jq -r '.data.repository.pullRequests.pageInfo.hasNextPage // false' <<<"$others_json" 2>/dev/null || echo false)"
 others="$(jq -r --argjson me "$PR_NUMBER" \
     '.data.repository.pullRequests.nodes[]? | select(.number != $me and .isDraft == false)
      | [.number, .title, .files.pageInfo.hasNextPage] | @tsv' <<<"$others_json" 2>/dev/null || true)"
@@ -271,7 +278,7 @@ render() {
     printf '\n'
   fi
 
-  if [ "$compared" -ge "$MAX_COMPARE" ]; then
+  if [ "$compared" -ge "$MAX_COMPARE" ] || [ "$others_more" = "true" ]; then
     printf '> Compared against the %s most recently updated open pull requests, not all of them.\n\n' "$MAX_COMPARE"
   fi
 
