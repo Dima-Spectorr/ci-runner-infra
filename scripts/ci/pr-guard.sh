@@ -20,9 +20,9 @@ source "$HERE/pr-guard-decision.sh"
 MAX_BEHIND="${MAX_BEHIND:-0}"
 ENFORCE_FRESHNESS="${ENFORCE_FRESHNESS:-false}"
 ENFORCE_OVERLAP="${ENFORCE_OVERLAP:-false}"
-# How many other open pull requests to compare against. Every one of them costs
-# a `files` call, so on a repository with ninety open this is the difference
-# between one API call and ninety-one. The cap is applied to the list ordered by
+# How many other open pull requests to compare against, at most 100 (one page
+# of the single GraphQL read below; only a PR past a hundred changed files costs
+# a call of its own). The cap is applied to the list ordered by
 # MOST RECENTLY UPDATED, because the pull request somebody is actively pushing
 # to is the one worth colliding with; a branch untouched for a month is going to
 # need a rebase regardless of what this says.
@@ -192,23 +192,43 @@ mine="$(gh api --paginate "repos/$R/pulls/$PR_NUMBER/files?per_page=100" --jq '.
 mine_n="$(printf '%s\n' "$mine" | grep -cv '^[[:space:]]*$' || true)"
 echo "pr-guard: $mine_n changed file(s)"
 
-# PIPED TO `jq`, NOT `gh api --jq`. That flag takes the program and nothing
-# else — there is no way to pass `--argjson` through it — so the pull request's
-# own number would have had to be interpolated into the program text, where a
-# non-numeric value is code. `-s` collects `--paginate`'s one-array-per-page
-# into a single stream.
-others="$(gh api --paginate "repos/$R/pulls?state=open&base=$BASE&sort=updated&direction=desc&per_page=100" 2>/dev/null \
-  | jq -r -s --argjson me "$PR_NUMBER" \
-      'add // [] | .[] | select(.number != $me and .draft == false) | "\(.number)\t\(.title)"' 2>/dev/null || true)"
+# ONE GRAPHQL READ FOR EVERY OTHER PULL REQUEST'S FILES, NOT ONE REST CALL EACH.
+# A per-PR `files` call cost thirty-odd requests a run, on every push, against
+# the caller's `GITHUB_TOKEN` — 1,000 an hour per repository, shared with every
+# other workflow in it. Measured on entity-platform on 2026-11-03: 31 open pull
+# requests, ~78 guard runs an hour, ~2,900 requests an hour, and the guard
+# itself going red with "API rate limit exceeded for installation". This query
+# costs 2 points whatever the count. A pull request whose first hundred files
+# are not all of them is re-read over REST, paginated, so the intersection is
+# never computed on a truncated list (the reason `mine` above is paginated).
+#
+# `jq --argjson`, never interpolation: the pull request's own number is data.
+# SC2016: `$o`/`$r`/`$b` are GraphQL variables, not shell ones.
+# shellcheck disable=SC2016
+others_gql='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){
+  pullRequests(states:OPEN,baseRefName:$b,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){
+    nodes{number title isDraft files(first:100){pageInfo{hasNextPage} nodes{path}}}}}}'
+others_json="$(gh api graphql -f o="${R%%/*}" -f r="${R#*/}" -f b="$BASE" -f query="$others_gql" 2>/dev/null || true)"
+others="$(jq -r --argjson me "$PR_NUMBER" \
+    '.data.repository.pullRequests.nodes[]? | select(.number != $me and .isDraft == false)
+     | [.number, .title, .files.pageInfo.hasNextPage] | @tsv' <<<"$others_json" 2>/dev/null || true)"
+if [ -z "$(jq -r '.data.repository.pullRequests.nodes // empty' <<<"$others_json" 2>/dev/null || true)" ]; then
+  echo "pr-guard: could not list the other open pull requests — overlap is unknown rather than absent"
+fi
 
 declare -a COLLISIONS=()
 shared_total=0
 compared=0
-while IFS=$'\t' read -r onum otitle; do
+while IFS=$'\t' read -r onum otitle omore; do
   [ -n "$onum" ] || continue
   [ "$compared" -lt "$MAX_COMPARE" ] || break
   compared=$((compared + 1))
-  theirs="$(gh api --paginate "repos/$R/pulls/$onum/files?per_page=100" --jq '.[].filename' 2>/dev/null || true)"
+  if [ "$omore" = "true" ]; then
+    theirs="$(gh api --paginate "repos/$R/pulls/$onum/files?per_page=100" --jq '.[].filename' 2>/dev/null || true)"
+  else
+    theirs="$(jq -r --argjson n "$onum" \
+        '.data.repository.pullRequests.nodes[] | select(.number == $n) | .files.nodes[].path' <<<"$others_json" 2>/dev/null || true)"
+  fi
   both="$(guard_shared "$mine" "$theirs")"
   [ -n "$both" ] || continue
   n="$(printf '%s\n' "$both" | grep -c . || true)"

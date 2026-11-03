@@ -99,9 +99,9 @@ on:
       max-compare:
         description: >-
           How many other open pull requests to compare against, most recently
-          updated first. Every one costs an API call for its file list, so on a
-          repository with ninety open this is the difference between one call
-          and ninety-one. Most recently updated first because the pull request
+          updated first, at most 100. All their file lists arrive in one GraphQL
+          read; only a pull request past a hundred changed files costs a call of
+          its own. Most recently updated first because the pull request
           somebody is actively pushing to is the one worth colliding with; a
           branch untouched for a month needs a rebase regardless.
         required: false
