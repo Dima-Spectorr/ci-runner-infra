@@ -4284,9 +4284,9 @@ numbered_cases() { # <driver> <decision>
     lane_take_action "$1" "s$1" "merge:ready green=3 total=3" >/dev/null 2>&1 || rc=$?
     echo "$rc" >"$fix/rc-$1"
   }
-  # shellcheck disable=SC2317 # both are called through _nc's eval.
+  # shellcheck disable=SC2317,SC2329 # both are called through _nc's eval.
   _nc_merged() { [ -f "$fix/merged" ] && grep -qx "$1" "$fix/merged"; }
-  # shellcheck disable=SC2317
+  # shellcheck disable=SC2317,SC2329
   _nc_held() { ! _nc_merged "$1" && [ "$(cat "$fix/rc-$1")" = 2 ]; }
   _nc() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1 — $(tr '\n' ' ' <"$fix/calls" 2>/dev/null)"; fi; }
   local T=$'\t'
