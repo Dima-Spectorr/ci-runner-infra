@@ -630,6 +630,30 @@ premerge ok "no label gate: an unlabelled pull request is not held by the label"
 premerge ok "a pin-bump waiver for THIS head still waives the label" ready-to-merge "$PM" "$PM" open false "$PM" ""
 premerge skip:label-removed "a waiver granted for another head does not" ready-to-merge bbbbbbbb2222 "$PM" open false "$PM" ""
 
+# --- lane_landed_commit: a merge the base already holds (502 that landed) -----
+# args: num, then "sha subject" lines on stdin (printf %b turns \n into lines)
+landed() {
+  local want="$1" desc="$2" num="$3" lines="$4" got
+  got=$(printf '%b' "$lines" | lane_landed_commit "$num") || got=""
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$desc" "$want" "$got"
+  fi
+}
+landed f16ff79 "#10235's squash commit is found on the base" 10235 '138d284 fix(x): y (#10696)\nf16ff79 feat(records): z (#10235)\n'
+landed abc1234 "a title that already carries other numbers ends in its own" 10698 'abc1234 test(gw): scan (Closes #10632) (#10698)\n'
+landed def5678 "a merge commit names the pull request" 77 'def5678 Merge pull request #77 from o/b\n'
+landed def5678 "a CRLF line still matches" 77 'def5678 Merge pull request #77 from o/b\r\n'
+landed "" "a pull request named mid-subject is not the one that landed" 1659 'aaa1111 chore(release): v1 (#1652) (#1659) (#1660)\n'
+landed "" "#7 is not #77" 7 'bbb2222 feat: q (#77)\nccc3333 Merge pull request #77 from o/b\n'
+landed "" "a revert of #10235 is not #10235 landing" 10235 'ddd4444 Revert "feat(records): z (#10235)"\n'
+landed "" "nothing landed" 10235 '138d284 fix(x): y (#10696)\n'
+landed "" "an empty read finds nothing" 10235 ''
+landed "" "a non-numeric number matches nothing" '1.*' 'eee5555 x (#1.*)\n'
+landed aaa0001 "the newest match wins when two commits name it" 9 'aaa0001 a (#9)\naaa0002 b (#9)\n'
+
 # --- lane_settled_red: which heads may skip the rest of the reads --------------
 # args: green missing failed pending
 settled() {

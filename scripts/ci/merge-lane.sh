@@ -3100,6 +3100,16 @@ lane_report_refusal() {
         "The lane's read of ${sha:0:8} called the required checks green, but this repository also requires a review the lane cannot give — a code-owner or approving review, or a resolved conversation. This pull request was skipped for this pass, not demoted, and other pull requests keep merging past it. The lane tries it again on every pass and merges it on the first pass after the review lands."
       return 2
       ;;
+    *'HTTP 5'[0-9][0-9]*|*'Merge already in progress'*)
+      # NOT A REFUSAL — GitHub gave no answer about this pull request. Measured
+      # on entity-platform on 2026-11-04: a 502 whose merge landed anyway, then
+      # 405 "Merge already in progress" on every retry while the pull request
+      # stayed open. Ending the batch on it (return 1) let one pull request
+      # stall the whole lane for seven runs. Skip it for this pass instead; the
+      # next pass re-reads it, and `lane_landed_commit` holds it if it landed.
+      echo "::warning::$what of #$num got no clear answer from GitHub — the call may have been carried out anyway. Skipping #$num for this pass; the next pass re-reads it and does not merge it twice. GitHub said: $err"
+      return 2
+      ;;
   esac
 
   echo "::warning::$what of #$num was refused — head moved, or the branch became unmergeable. Re-reading next pass. GitHub said: $err"
@@ -3142,6 +3152,19 @@ lane_take_action() {
       fi
       if [ "$premerge" != "ok" ]; then
         echo "::warning::lane: #$action_num NOT merged — $premerge on a fresh read immediately before the merge call (the walk had ranked it $action_verdict). Skipped for this pass; nothing else in the batch changes."
+        return 2
+      fi
+      # AND NOT IF THE BASE ALREADY HOLDS IT. A merge call that got a 5xx can
+      # still have landed while GitHub keeps the pull request open for minutes;
+      # merging it again adds an empty commit, or is refused and stalls the
+      # batch (see `lane_landed_commit`). One read per merge. An unreadable
+      # list is not a reason to hold — the merge call below is still guarded
+      # by `sha=`, as it was before this read existed.
+      local landed
+      if landed="$(LANE_SNAP='' gh api "repos/$R/commits?sha=$LANE_BASE&per_page=30" \
+        --jq '.[] | .sha + " " + (.commit.message | split("\n")[0])' 2>/dev/null \
+        | lane_landed_commit "$action_num")"; then
+        echo "::warning::lane: #$action_num NOT merged — it is already on $LANE_BASE as ${landed:0:12}, and GitHub still shows the pull request open (an earlier merge call that reported an error landed anyway). Skipped for this pass; GitHub closes it on its own."
         return 2
       fi
       local merge_err
