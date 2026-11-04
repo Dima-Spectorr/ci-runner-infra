@@ -929,7 +929,9 @@ draws on one hourly budget — and all five are published under every pool's
 label, so read them with `max()` across pools, never `sum()`. The two rate
 gauges are **absent, not zero**, on a tick whose responses carried no rate
 headers. The two status run-list calls of the demand sweep send `If-None-Match`
-and reuse the stored body on a 304; each tick that received one writes a
+and reuse the stored body on a 304, and so does each run's jobs list (one
+validator-and-body pair per run under `etag-jobs/`, pruned every tick to the
+runs still listed); each tick that received one writes a
 `github-rate` event (log `ci-controller`) saying across how many of them
 `x-ratelimit-used` advanced, which is how to tell whether GitHub bills a 304.
 One sample proves nothing, because other repositories spend the same budget —

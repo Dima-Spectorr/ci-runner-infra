@@ -405,6 +405,72 @@ check "the fork-safe fetch still delivers its payload" '{"runs":1}' "$(cat "$W/s
 check "the fork-safe fetch leaves no header file beside the payload" no \
   "$(yn test -e "$W/state/job-1.hdr")"
 
+# --- the fork-safe fetch is conditional when given a cache base (#1652) -----
+#
+# The per-run jobs list was the one unconditional call in the demand sweep and
+# most of the installation's hourly budget on a busy repository. Without a cache
+# base nothing changes; with one, a repeat of an unchanged answer is a 304 that
+# hands the stored body back byte for byte.
+fresh
+STUB_REM=4990 STUB_USED=10 STUB_ETAG='W/"jobs-v1"' STUB_BODY='{"jobs":[1]}'
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/job-7"
+check "without a cache base no validator is sent" "" "$(cut -f2 <"$W/calls")"
+check "without a cache base nothing is stored" no "$(yn test -e "$W/state/c-7.etag")"
+
+fresh
+mkdir -p "$W/state/c"
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j1" "$W/state/c/7"
+check "the first conditional fetch is unconditional" "" "$(cut -f2 <"$W/calls")"
+check "a 200 stores the validator" 'W/"jobs-v1"' "$(cat "$W/state/c/7.etag" 2>/dev/null)"
+check "a 200 stores the body it validates" '{"jobs":[1]}' "$(cat "$W/state/c/7.body" 2>/dev/null)"
+check "a 200 still delivers its payload" '{"jobs":[1]}' "$(cat "$W/state/j1" 2>/dev/null)"
+
+: >"$W/calls"
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j2" "$W/state/c/7"
+check "the repeat sends the stored validator" 'W/"jobs-v1"' "$(cut -f2 <"$W/calls")"
+check "a 304 delivers the stored body byte for byte" '{"jobs":[1]}' "$(cat "$W/state/j2" 2>/dev/null)"
+check "a 304 is noted as one" "304" "$(sed -n 2p "$STATE_DIR/gh-rate.ledger" | cut -d' ' -f1)"
+check "a 304 leaves no header file or part file" no \
+  "$(yn test -e "$W/state/j2.hdr" -o -e "$W/state/j2.part")"
+
+# A changed answer replaces both halves of the pair.
+: >"$W/calls"
+STUB_ETAG='W/"jobs-v2"' STUB_BODY='{"jobs":[1,2]}'
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j3" "$W/state/c/7"
+check "a changed answer is delivered" '{"jobs":[1,2]}' "$(cat "$W/state/j3" 2>/dev/null)"
+check "a changed answer replaces the validator" 'W/"jobs-v2"' "$(cat "$W/state/c/7.etag" 2>/dev/null)"
+check "a changed answer replaces the body" '{"jobs":[1,2]}' "$(cat "$W/state/c/7.body" 2>/dev/null)"
+
+# A validator without its body is never sent: a 304 to it would have no answer.
+: >"$W/calls"
+rm -f "$W/state/c/7.body"
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j4" "$W/state/c/7"
+check "a validator without its body is not sent" "" "$(cut -f2 <"$W/calls")"
+
+# The stored validator becomes a request header; one not shaped like a
+# validator is state that went wrong, and is not sent.
+: >"$W/calls"
+printf 'x\r\nX-Injected: 1' >"$W/state/c/7.etag"
+printf '%s' '{"jobs":[1,2]}' >"$W/state/c/7.body"
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j5" "$W/state/c/7"
+check "a malformed stored validator is not sent by the fork-safe fetch" "" "$(cut -f2 <"$W/calls")"
+
+# A dead call delivers nothing and leaves the stored pair alone.
+STUB_MODE=dead
+printf '%s' 'W/"jobs-v2"' >"$W/state/c/7.etag"
+gh_api_fetch stub-token "repos/o/r/actions/runs/7/jobs" "$W/state/j6" "$W/state/c/7"
+STUB_MODE=rate
+check "a dead conditional call delivers nothing" no "$(yn test -e "$W/state/j6")"
+check "a dead conditional call keeps the stored validator" 'W/"jobs-v2"' "$(cat "$W/state/c/7.etag" 2>/dev/null)"
+STUB_ETAG='' STUB_BODY='{"runs":1}'
+
+# shellcheck disable=SC2016
+check "the demand sweep hands each run its own cache base" yes \
+  "$(found "$CTRL" '"$jobs_dir/$id" "${etag_dir:+$etag_dir/$id}" 2>/dev/null &')"
+# shellcheck disable=SC2016
+check "the demand sweep prunes the cache to the runs it still lists" yes \
+  "$(found "$CTRL" 'case "$live" in *" $fid "*) ;; *) rm -f "$f" 2>/dev/null ;; esac')"
+
 # A call that never got a response writes no header file. The previous call's
 # file must not be read as its answer: that would republish a `remaining` from
 # a request that succeeded as the state of one that could not connect.
