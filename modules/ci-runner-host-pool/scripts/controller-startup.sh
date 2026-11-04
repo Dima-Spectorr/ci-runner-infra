@@ -1386,21 +1386,59 @@ gh_api() {
 # Written to a temporary path and renamed on success, so a partially-written
 # body from a killed curl can never be read as a job list: the reader tests for
 # the final name, and a failed call simply leaves it absent.
-gh_api_fetch() { # <token> <api-path> <destination-file>
-  local tok="$1" path="$2" dest="$3" status
+#
+# CONDITIONAL when a fourth argument names a cache base (#1652): the same
+# validator-and-body pair gh_api keeps, at "<base>.etag" / "<base>.body" rather
+# than under a shared name, so each branch of the fan-out owns its own pair and
+# none can read another's. The per-run jobs list was the one unconditional call
+# left in the sweep, and on a repository with ~100 queued runs it was most of
+# the installation's hourly budget: a queued run's job list does not change
+# from one tick to the next, and a 304 sent with a token does not count against
+# the primary rate limit. The rules are gh_api's: a validator is only ever sent
+# with its body present and only if it is shaped like one; the old validator is
+# removed first and the new one written last; a 304 hands back the stored body
+# byte for byte, so the reader cannot tell the two answers apart.
+gh_api_fetch() { # <token> <api-path> <destination-file> [cache-base]
+  local tok="$1" path="$2" dest="$3" cache="${4:-}" status etag="" cond=()
+  if [ -n "$cache" ] && [ -s "$cache.body" ]; then
+    etag=$(head -c 200 "$cache.etag" 2>/dev/null) || etag=""
+    case "$etag" in "" | *[!A-Za-z0-9\"/+=_.:-]*) etag="" ;; esac
+    [ -n "$etag" ] && cond=(-H "If-None-Match: $etag")
+  fi
   # The headers go beside the caller-named body, for the same reason the body
   # does: a fixed path is a race between branches of the fan-out.
   rm -f "$dest.hdr" 2>/dev/null
   status=$(curl "${CURL_TIMEOUTS[@]}" -sS -o "$dest.part" -D "$dest.hdr" -w '%{http_code}' \
     -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.github+json" \
+    ${cond[@]+"${cond[@]}"} \
     "https://api.github.com/$path" 2>>"$LOG") || status="000"
   gh_rate_note "$status" "$dest.hdr"
-  rm -f "$dest.hdr" 2>/dev/null
   case "$status" in
-    2*) mv -f "$dest.part" "$dest" && return 0 ;;
+    2*)
+      if [ -n "$cache" ]; then
+        local e=""
+        rm -f "$cache.etag" 2>/dev/null
+        e=$(tr -d '\r' <"$dest.hdr" 2>/dev/null | awk 'tolower($1) == "etag:" { sub(/^[^:]*:[ \t]*/, ""); v = $0 } END { print v }' 2>/dev/null) || e=""
+        if [ -n "$e" ]; then
+          cp -f "$dest.part" "$cache.body.part" 2>/dev/null \
+            && mv -f "$cache.body.part" "$cache.body" 2>/dev/null \
+            && printf '%s' "$e" >"$cache.etag.part" 2>/dev/null \
+            && mv -f "$cache.etag.part" "$cache.etag" 2>/dev/null
+        fi
+      fi
+      rm -f "$dest.hdr" 2>/dev/null
+      mv -f "$dest.part" "$dest" && return 0
+      ;;
+    304)
+      # Only ever sent with a stored body, so this is that body's validator.
+      rm -f "$dest.hdr" 2>/dev/null
+      if [ -n "$etag" ] && cp -f "$cache.body" "$dest.part" 2>/dev/null; then
+        mv -f "$dest.part" "$dest" && return 0
+      fi
+      ;;
   esac
-  rm -f "$dest.part"
+  rm -f "$dest.hdr" "$dest.part" 2>/dev/null
   return 1
 }
 
@@ -1660,6 +1698,26 @@ collect_demand() {
   rm -rf "$jobs_dir"
   mkdir -p "$jobs_dir" || return 0
 
+  # The conditional-request cache for the same calls (#1652). It OUTLIVES the
+  # tick, which is its whole point, and is safe to: a stored body is only ever
+  # handed back on a 304, which is GitHub saying it is still the answer. Pruned
+  # here to the runs this tick still lists, so a finished run's pair is gone the
+  # tick it leaves the list and the directory is bounded by the run list, not by
+  # the controller's uptime. Unusable (no directory) means unconditional calls,
+  # exactly as before.
+  local etag_dir f fid live
+  live=" ${ids//$'\n'/ } "
+  etag_dir="$STATE_DIR/etag-jobs"
+  mkdir -p "$etag_dir" 2>/dev/null || etag_dir=""
+  if [ -n "$etag_dir" ]; then
+    for f in "$etag_dir"/*; do
+      [ -e "$f" ] || continue
+      fid=${f##*/}
+      fid=${fid%%.*}
+      case "$live" in *" $fid "*) ;; *) rm -f "$f" 2>/dev/null ;; esac
+    done
+  fi
+
   # ONCE, in the parent, so the cache in gh_token is the one that answers and
   # the children are handed a string. See gh_api_fetch.
   tok=$(gh_token) || { rm -rf "$jobs_dir"; return 0; }
@@ -1680,7 +1738,7 @@ collect_demand() {
     fi
     examined=$((examined + 1))
     gh_api_fetch "$tok" "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" \
-      "$jobs_dir/$id" 2>/dev/null &
+      "$jobs_dir/$id" "${etag_dir:+$etag_dir/$id}" 2>/dev/null &
     pids+=("$!")
     if [ "${#pids[@]}" -ge "$DEMAND_FETCH_CONCURRENCY" ]; then
       for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
