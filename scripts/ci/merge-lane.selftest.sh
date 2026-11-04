@@ -3686,6 +3686,11 @@ Waiting on code owner review from some-owner. (HTTP 405)'
   _rc_case "a failing-required-check 405 skips the candidate, not the pass" 2 'gh: Repository rule violations found  Required status check "ci" is failing.   (HTTP 405)' ffff6666
   _rc_case "a workflows-permission refusal still skips the candidate" 2 'gh: refusing to allow a GitHub App to create or update workflow without `workflows` permission (HTTP 403)' ''
   _rc_case "an unrecognised refusal still ends the pass" 1 'gh: Head branch was modified. Review and try the merge again. (HTTP 409)' dddd4444
+  # 2026-11-04: one pull request's 502 / 405 "Merge already in progress" ended
+  # every batch for seven runs while fifteen green ones waited.
+  _rc_case "a 502 skips the candidate, not the pass" 2 'gh: Bad Gateway (HTTP 502)' eeee5555
+  _rc_case "a 5xx in gh's other shape skips the candidate" 2 'HTTP 503: Service Unavailable' eeee5555
+  _rc_case "a merge already in progress skips the candidate" 2 'gh: Merge already in progress (HTTP 405)' eeee5555
 
   # One comment per refused sha: the code-owner case above posted for aaaa1111;
   # a second pass on the same sha must not post again.
@@ -3988,8 +3993,9 @@ behavioural_premerge_cases() {
   declare -A LANE_LABEL_WAIVED=()
   local fn
   eval "$(sed -n "/^lane_premerge_verdict() {/,/^}/p" "$DECISION")"
+  eval "$(sed -n "/^lane_landed_commit() {/,/^}/p" "$DECISION")"
   eval "$(sed -n "/^lane_take_action() {/,/^}/p" "$DRIVER")"
-  for fn in lane_premerge_verdict lane_take_action; do
+  for fn in lane_premerge_verdict lane_landed_commit lane_take_action; do
     if ! declare -F "$fn" >/dev/null 2>&1; then
       echo "FAIL $fn could not be lifted, so no pre-merge case ran"
       rm -rf "$fix"
@@ -4003,6 +4009,11 @@ behavioural_premerge_cases() {
       *'repos/owner/repo/pulls/7 '*'--jq'*)
         [ -f "$fix/fresh" ] || return 1
         cat "$fix/fresh"
+        ;;
+      # The base's recent commits, already shaped by `--jq` as "sha subject".
+      *'repos/owner/repo/commits?sha=main'*)
+        [ -f "$fix/commits" ] || return 1
+        cat "$fix/commits"
         ;;
       *) echo "premerge stub: unexpected gh call '$*'" >&2; return 1 ;;
     esac
@@ -4031,6 +4042,14 @@ behavioural_premerge_cases() {
   _pm_case "an unreadable fresh read — no merge call" held ready-to-merge __none__
   _pm_case "still labelled, open, same head — merges" merged ready-to-merge $'open\nfalse\n'"$V"$'\nready-to-merge\n'
   _pm_case "no label gate — the label is not a hold, so it merges" merged '' "$UNLABELLED"
+  # 2026-11-04: a merge call that got a 502 landed anyway and GitHub kept the
+  # pull request open; merging it again added an empty commit to main.
+  printf '%s\n' "1111111 fix: other (#6)" "f16ff79 feat: this one (#7)" >"$fix/commits"
+  _pm_case "already on the base, still shown open — no second merge call" held '' "$UNLABELLED"
+  printf '%s\n' "1111111 fix: other (#6)" "2222222 feat: q (#77)" >"$fix/commits"
+  _pm_case "only other pull requests on the base — merges" merged '' "$UNLABELLED"
+  rm -f "$fix/commits"
+  _pm_case "an unreadable commit list does not hold the merge" merged '' "$UNLABELLED"
   if [ -f "$fix/merged" ] && ! grep -q -- "sha=$V" "$fix/merged"; then
     echo "FAIL the merge call does not pin the verified sha"
   else

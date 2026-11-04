@@ -586,6 +586,42 @@ lane_premerge_verdict() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_landed_commit — is this pull request already on the base branch?
+#
+#   printf '%s
+' "<sha> <subject>" ... | lane_landed_commit <num>
+#
+# Prints the sha of the first commit whose subject is GitHub's merge of #num —
+# a squash title ending in "(#num)", or "Merge pull request #num from ..." —
+# and returns 0. Prints nothing and returns 1 when none is.
+#
+# WHY. Measured on entity-platform on 2026-11-04: the merge call for #10235
+# got a 502 but the squash commit landed, and GitHub kept the pull request
+# OPEN for ten more minutes. Every pass ranked it first again; the retries got
+# 405 "Merge already in progress" or another 502, each refusal ended the batch,
+# and seven runs in a row ended "0 action(s)" with fifteen green pull requests
+# waiting. Two retries that did go through added EMPTY squash commits to main.
+# A merge the base already holds is never retried: the caller skips it.
+#
+# A false match only HOLDS a pull request (it is skipped, never merged), so
+# matching on the subject alone fails safe.
+# ---------------------------------------------------------------------------
+lane_landed_commit() {
+  # Reads to the end even after a match: the caller pipes `gh` into this, and
+  # under `pipefail` a reader that leaves early can fail the pipeline (SIGPIPE).
+  local num="${1:-}" sha subject found=""
+  while IFS=' ' read -r sha subject; do
+    [ -z "$found" ] && [ -n "$sha" ] && [[ "$num" =~ ^[0-9]+$ ]] || continue
+    subject="${subject%$'\r'}"
+    if [[ "$subject" == *"(#$num)" ]] || [[ "$subject" == "Merge pull request #$num "* ]]; then
+      found="$sha"
+    fi
+  done
+  [ -n "$found" ] || return 1
+  echo "$found"
+}
+
+# ---------------------------------------------------------------------------
 # lane_pass_expired — has this pass spent its walking budget?
 #
 #   lane_pass_expired <started_epoch> <budget_seconds> <now_epoch>

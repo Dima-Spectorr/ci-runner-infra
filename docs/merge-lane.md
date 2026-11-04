@@ -1369,6 +1369,26 @@ read per merge, never per candidate. Pinned by `lane_premerge_verdict`'s cases i
 `merge-lane.selftest.sh`, which runs the real `lane_take_action` against a
 stubbed `gh` and fails if a held pull request reaches the merge call.
 
+**A merge the base already holds is not tried again.** Measured on
+entity-platform on 2026-11-04: the merge call for one pull request got a 502,
+but the squash commit landed, and GitHub kept the pull request open for ten
+more minutes. Every pass ranked it first again. Each retry got a 405 "Merge
+already in progress" or another 502, which ended the batch, so seven runs in a
+row ended `0 action(s)` while fifteen green pull requests waited. Two retries
+that went through added empty commits to `main`. Two changes stop this:
+
+- After the fresh read, `lane_take_action` reads the last 30 commits on the
+  base. If one is GitHub's merge of this pull request (`lane_landed_commit`: a
+  subject ending `(#<n>)`, or `Merge pull request #<n> …`), it logs
+  `NOT merged — it is already on <base>` and skips the pull request for this
+  pass. If the list can't be read, the merge goes ahead as before, still
+  guarded by `sha=`.
+- `lane_report_refusal` treats a 5xx or "Merge already in progress" as having
+  no answer, not as a refusal. It skips that one pull request (return 2) and
+  doesn't end the batch.
+
+Cost: one more read per merge.
+
 ### Waiting for the automated reviewers
 
 Codex reviews cost credits, and the fleet was spending them on pull requests
