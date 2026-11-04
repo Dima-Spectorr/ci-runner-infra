@@ -800,6 +800,44 @@ same_winner "" "nothing but red, draft and conflicted leaves nothing to act on" 
   "702 1 0 2 0 0 0 0 60 -" \
   "703 0 1 2 0 0 0 0 60 -"
 
+# --- the numbered-file hold: how a number is read, and what clashes ----------
+# The driver-level cases (stubbed API, in-pass set, fail-safe, mutations) are in
+# merge-lane.selftest.sh; these pin the pure reading of a name.
+num_is() { # <want or __none__> <description> <name>
+  local got
+  got="$(lane_numbered_number "$3")" || got=__none__
+  if [ "$got" = "$1" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  name: %s\n  want: %s\n  got:  %s\n' "$2" "$3" "$1" "$got"
+  fi
+}
+num_is 249 "an ADR's leading digits, leading zeros dropped" "docs/adr/0249-foo.md"
+num_is 12 "a Flyway V prefix is read past" "db/migrations/V0012__orders.sql"
+num_is 0 "an all-zero number is zero, not empty" "0000-template.md"
+num_is __none__ "a name with no leading digits claims nothing" "docs/adr/README.md"
+num_is __none__ "a Flyway repeatable claims nothing" "db/migrations/R__views.sql"
+num_is __none__ "digits later in the name are not a number" "docs/adr/adr-0249.md"
+
+clash_is() { # <want or __none__> <description> <pr-files> <taken>
+  local got
+  got="$(lane_numbered_clash $'docs/adr/' "$3" "$4")" || got=__none__
+  if [ "$got" = "$1" ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$2" "$1" "$got"
+  fi
+}
+T=$'\t'
+clash_is "docs/adr/0249-mine.md${T}docs/adr/0249-x.md${T}249${T}0251" "taken under another name; next free is past the highest" \
+  "added${T}docs/adr/0249-mine.md${T}" $'docs/adr/0249-x.md\ndocs/adr/0250-y.md'
+clash_is __none__ "the same name on the base is not a clash" \
+  "added${T}docs/adr/0249-x.md${T}" "docs/adr/0249-x.md"
+clash_is __none__ "a file in a sub-directory is not in the directory" \
+  "added${T}docs/adr/old/0249-mine.md${T}" "docs/adr/0249-x.md"
+clash_is __none__ "a modified file claims nothing" \
+  "modified${T}docs/adr/0249-mine.md${T}" "docs/adr/0249-x.md"
+clash_is __none__ "a removed holder frees its number" \
+  "added${T}docs/adr/0249-mine.md${T}"$'\n'"removed${T}docs/adr/0249-x.md${T}" "docs/adr/0249-x.md"
+
 if [ "$FAIL" -gt 0 ]; then
   echo "merge-lane-decision: $FAIL failed, $PASS passed"
   exit 1

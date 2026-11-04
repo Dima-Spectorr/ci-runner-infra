@@ -442,6 +442,25 @@ on:
         required: false
         default: 'ci-runner-infra'
         type: string
+      numbered-paths:
+        description: >-
+          Directories whose files are numbered, one repository-relative path a
+          line (ADRs, SQL migrations). A pull request that ADDS a file directly
+          under one of them, whose number the base tip already holds under a
+          different file name, or that another pull request merged earlier in
+          the same pass took, is held instead of merged (verdict `hold`, reason
+          `number-taken`) with one comment naming the holder and the next free
+          number; every other candidate keeps merging.
+
+          The number is the leading run of digits of the file name, after an
+          optional single `V` (so `0249-x.md` and `V0249__x.sql` both claim
+          249; leading zeros do not count). A file name with no leading digits
+          claims nothing.
+
+          Empty (the default) turns the hold off and makes no extra read.
+        required: false
+        default: ''
+        type: string
       priority-label-prefix:
         description: >-
           Labels beginning with this prefix carry a number that orders the lane,
@@ -711,6 +730,7 @@ jobs:
           REQUIRE_LABEL: ${{ inputs.require-label }}
           PIN_BUMP_ACTOR: ${{ inputs.pin-bump-actor }}
           PIN_BUMP_REPO: ${{ inputs.pin-bump-repo }}
+          NUMBERED_PATHS_INPUT: ${{ inputs.numbered-paths }}
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
           BASE_HEALTH_MAX_STALENESS: ${{ inputs.base-health-max-staleness-seconds }}

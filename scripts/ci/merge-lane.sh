@@ -47,6 +47,10 @@ STATUS_ISSUE="${STATUS_ISSUE:-}"
 # already publishes, and the lane has been bitten once already by two lists that
 # had to be kept equal by hand.
 REQUIRE_UP_TO_DATE="${REQUIRE_UP_TO_DATE:-auto}"
+# The directories whose files are numbered (`numbered-paths`), normalised one a
+# line. Empty — the default — turns the collision hold off entirely: no extra
+# read is made and nothing behaves differently. See `lane_numbered_guard`.
+NUMBERED_PATHS="$(lane_numbered_prefixes "${NUMBERED_PATHS_INPUT:-}")"
 
 R="$GITHUB_REPOSITORY"
 
@@ -260,6 +264,14 @@ lane_quota_allows() {
 # read is the row someone needs to see first, above every ordinary wait.
 # ---------------------------------------------------------------------------
 QUEUE_ROWS=()
+# Pull requests the numbered-file hold kept back in this run, number → verdict.
+# The walk ranked them `merge`; this is what the queue view shows instead.
+declare -A LANE_NUMBERED_HELD=()
+# The numbered paths the candidate being merged claims, recorded into this
+# pass's in-pass set once its merge lands. See `lane_numbered_guard`.
+LANE_NUMBERED_PENDING=''
+# The base tip this pass read, which is what the numbered hold lists.
+LANE_PASS_BASE=''
 
 # `-` for an unknown field, never the empty string: every row is split on tabs
 # further down, tab is IFS whitespace, and an empty field would collapse and
@@ -476,6 +488,9 @@ LANE_BASE_ARMED=''
 LANE_MERGED_THIS_RUN=''
 
 echo "lane: base=$LANE_BASE required=${#REQUIRED[@]} budget=${BUDGET}s pass-budget=${PASS_BUDGET}s max-actions=$MAX_ACTIONS dry-run=$DRY_RUN"
+if [ -n "$NUMBERED_PATHS" ]; then
+  echo "lane: numbered-file hold ON for: $(printf '%s' "$NUMBERED_PATHS" | tr '\n' ' ')"
+fi
 for c in "${REQUIRED[@]}"; do echo "lane: requires '$c'"; done
 
 # ---------------------------------------------------------------------------
@@ -1977,6 +1992,7 @@ one_pass() {
   fi
   rm -f "$base_err"
   read -r base_sha base_at <<<"$base_read"
+  LANE_PASS_BASE="$base_sha"
 
   # Counted for the log only: a head carried forward says which pass settled it.
   LANE_PASS_NO=$((LANE_PASS_NO + 1))
@@ -3117,6 +3133,133 @@ lane_report_refusal() {
 }
 
 # ---------------------------------------------------------------------------
+# THE NUMBERED-FILE COLLISION HOLD (`numbered-paths`) — the reads.
+#
+# Two pull requests that each add "the next free number" (an ADR, a migration)
+# both pass their own CI and, on a base that does not require up-to-date
+# branches, both merge — and the base's numbering gate goes red, which halts
+# the whole lane until someone renumbers. So, immediately before a merge call,
+# a candidate that ADDS a numbered file under a configured directory is checked
+# against the numbers the base tip already holds there, and against the ones
+# this pass already merged. A number held under a DIFFERENT name is a hold:
+# `hold:number-taken`, one comment on the pull request naming the holder and
+# the next free number, and the batch goes on — it is not counted as an action.
+#
+# Cost: one paginated file-list read per merge candidate, and one tree read per
+# configured directory per pass, made only when some candidate claims a number.
+#
+# FAIL-SAFE: HOLD THE ONE PULL REQUEST, NEVER MERGE BLIND, NEVER HALT. When the
+# file list or the base listing cannot be read, whether the merge would break
+# the base is unknown. Merging anyway is the exact failure this hold exists to
+# prevent; halting the lane would turn one unreadable directory into a stopped
+# queue. So the candidate is held for this pass (`hold:number-unread`, logged,
+# no comment — it is not the author's to fix) and the next pass reads again.
+# A directory the base does not have yet (404) is not a failure: it holds no
+# number.
+# ---------------------------------------------------------------------------
+number_taken_marker() { printf '<!-- merge-lane:number-taken:%s -->' "$1"; }
+
+already_commented_number_taken() {
+  local num="$1" sha="$2" bodies
+  bodies="$(gh api --paginate "repos/$R/issues/$num/comments?per_page=100" --jq '.[].body' 2>/dev/null || true)"
+  printf '%s\n' "$bodies" | grep -cF -- "$(number_taken_marker "$sha")" >/dev/null
+}
+
+# Once per head sha, like `lane_comment_refusal_once`, and never fatal for the
+# same reason: the pull request is already being held rather than merged.
+lane_comment_number_taken_once() {
+  local num="$1" sha="$2" mine="$3" holder="$4" where="$5" n="$6" next="$7" advice
+  [ -n "$sha" ] || return 0
+  if already_commented_number_taken "$num" "$sha"; then return 0; fi
+  advice="Renumber it to \`$next\`, the next number free on \`$LANE_BASE\` (rename the file and anything that refers to it), and push; the lane merges it on a later pass once its checks are green again."
+  [ "$next" != '-' ] || advice="Renumber it to a number \`$LANE_BASE\` does not hold yet and push; the lane merges it on a later pass once its checks are green again."
+  if ! gh api "repos/$R/issues/$num/comments" -f body="$(printf '%s\n\n%s\n\n%s\n' \
+    "The merge lane did not merge this pull request: \`$mine\` takes number $n, but \`$holder\` $where." \
+    "$advice Nothing else is wrong as far as the lane knows, and other pull requests keep merging past this one." \
+    "$(number_taken_marker "$sha")")" --silent 2>&1; then
+    echo "::warning::could not comment #$num's number-taken hold — it is still visible above, in the run log" >&2
+  fi
+  return 0
+}
+
+# lane_numbered_base_listing <base-sha> — every file directly under each
+# configured directory at <base-sha>, one repo path a line. Read ONCE per pass:
+# the answer (or the failure) is kept, keyed by the tip, and a merge moves the
+# tip, so the next pass reads the directory as it now stands. Returns 1, with
+# the reason on stderr, when a directory could not be read.
+lane_numbered_base_listing() {
+  local base="$1" cache="$LANE_TMP/numbered-base-$1" prefix dir out err rc f
+  if [ -f "$cache.failed" ]; then
+    cat "$cache.failed" >&2
+    return 1
+  fi
+  if [ -f "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+  err="$LANE_TMP/numbered-base-err"
+  : >"$cache.part"
+  while IFS= read -r prefix; do
+    [ -n "$prefix" ] || continue
+    dir="${prefix%/}"
+    rc=0
+    out="$(LANE_SNAP='' gh api "repos/$R/git/trees/$base:$dir" \
+      --jq '.tree[] | select(.type == "blob") | .path' 2>"$err")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # Not on the base yet: the first file of its kind holds no number.
+      if grep -cF 'HTTP 404' "$err" >/dev/null; then continue; fi
+      printf 'reading %s at %s failed: %s\n' "$prefix" "${base:0:12}" "$(tr '\n' ' ' <"$err")" >"$cache.failed"
+      cat "$cache.failed" >&2
+      rm -f "$cache.part"
+      return 1
+    fi
+    while IFS= read -r f; do
+      [ -z "$f" ] || printf '%s%s\n' "$prefix" "$f" >>"$cache.part"
+    done <<<"$out"
+  done <<<"$NUMBERED_PATHS"
+  mv -f "$cache.part" "$cache"
+  cat "$cache"
+}
+
+# lane_numbered_guard <num> <sha> — 0 when the merge may go ahead, 2 when the
+# pull request is held for this pass (logged, and commented on for a clash).
+# Sets LANE_NUMBERED_PENDING to what it claims, for the caller to record into
+# the in-pass set once the merge lands.
+lane_numbered_guard() {
+  local num="$1" sha="$2" base="${LANE_PASS_BASE:-$LANE_BASE}" files claims listing claimed='' claimed_file clash
+  LANE_NUMBERED_PENDING=''
+  if ! files="$(LANE_SNAP='' gh api --paginate "repos/$R/pulls/$num/files?per_page=100" \
+    --jq '.[] | [.status, .filename, (.previous_filename // "")] | @tsv' 2>/dev/null)"; then
+    echo "::warning::lane: #$num NOT merged — its file list could not be read, so whether it takes a number already held under numbered-paths is unknown. Held for this pass, never merged blind; the next pass reads it again."
+    LANE_NUMBERED_HELD[$num]='hold:number-unread'
+    return 2
+  fi
+  claims="$(lane_numbered_claims "$NUMBERED_PATHS" "$files")"
+  [ -n "$claims" ] || return 0
+  if ! listing="$(lane_numbered_base_listing "$base" 2>"$LANE_TMP/numbered-why")"; then
+    echo "::warning::lane: #$num NOT merged — it adds a numbered file, and the numbered directories on $LANE_BASE could not be listed ($(tr '\n' ' ' <"$LANE_TMP/numbered-why")). Held for this pass, never merged blind; the rest of the batch goes on."
+    LANE_NUMBERED_HELD[$num]='hold:number-unread'
+    return 2
+  fi
+  claimed_file="$LANE_TMP/numbered-claimed-$base"
+  [ ! -f "$claimed_file" ] || claimed="$(cat "$claimed_file")"
+  if clash="$(lane_numbered_clash "$NUMBERED_PATHS" "$files" "$listing"$'\n'"$claimed")"; then
+    local mine holder n next where
+    IFS=$'\t' read -r mine holder n next <<<"$clash"
+    where="is already on \`$LANE_BASE\`"
+    if [[ $'\n'"$claimed"$'\n' == *$'\n'"$holder"$'\n'* ]]; then
+      where="was merged into \`$LANE_BASE\` by the lane earlier in the same pass"
+    fi
+    echo "::warning::lane: #$num NOT merged — number-taken: $mine takes number $n, but $holder ${where//\`/}. Held, not counted; the rest of the batch goes on. Next free: $next."
+    LANE_NUMBERED_HELD[$num]='hold:number-taken'
+    lane_comment_number_taken_once "$num" "$sha" "$mine" "$holder" "$where" "$n" "$next"
+    return 2
+  fi
+  LANE_NUMBERED_PENDING="$claims"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Take one action. 0 if it landed, 1 if GitHub refused it — a refusal is never
 # retried in place, because the reason for it is always that the world moved,
 # and the next pass is where the lane looks at the world it moved to. 2 is the
@@ -3167,10 +3310,24 @@ lane_take_action() {
         echo "::warning::lane: #$action_num NOT merged — it is already on $LANE_BASE as ${landed:0:12}, and GitHub still shows the pull request open (an earlier merge call that reported an error landed anyway). Skipped for this pass; GitHub closes it on its own."
         return 2
       fi
+      # AND NOT IF IT TAKES A NUMBER ALREADY TAKEN (`numbered-paths`). Off, and
+      # no read made, unless the caller configured it. A hold is return 2:
+      # skipped for this pass, not counted, the batch goes on.
+      LANE_NUMBERED_PENDING=''
+      if [ -n "${NUMBERED_PATHS:-}" ]; then
+        local numbered_rc=0
+        lane_numbered_guard "$action_num" "$action_sha" || numbered_rc=$?
+        [ "$numbered_rc" -eq 0 ] || return 2
+      fi
       local merge_err
       if merge_err="$(gh api -X PUT "repos/$R/pulls/$action_num/merge" \
         -f merge_method=squash -f sha="$action_sha" --silent 2>&1)"; then
         echo "::notice::merged #$action_num ($action_verdict)"
+        # What it claimed is on the base now, and the listing this pass read
+        # predates it: the next candidate in the batch must see it taken.
+        if [ -n "$LANE_NUMBERED_PENDING" ]; then
+          printf '%s\n' "$LANE_NUMBERED_PENDING" >>"$LANE_TMP/numbered-claimed-${LANE_PASS_BASE:-$LANE_BASE}"
+        fi
         # Closes the base-health staleness window for the rest of the run. From
         # here the tip is partly the lane's own work, and an answer that predates
         # it cannot speak for it — see `BASE_HEALTH_MAX_STALENESS`. Set on the
@@ -3265,6 +3422,8 @@ render_queue() {
       # A title is free text and a `|` in it would end the cell early, taking
       # every column after it with it.
       t="${t//|/\\|}"
+      # The walk ranked it `merge`; the numbered-file hold kept it back.
+      v="${LANE_NUMBERED_HELD[$n]:-$v}"
       reason="${v#*:}"
       [ "$reason" = "$v" ] && reason='—'
       printf '| [#%s](https://github.com/%s/pull/%s) %s | `%s` | %s | %s | %s | %s |\n' \
