@@ -1771,7 +1771,12 @@ Two consequences worth stating plainly:
   `unanswered` — a tip that answered red still halts the pass. The walk stops at
   the first ancestor that answered *either way*, so a red ancestor halts the lane
   instead of being searched past for an older green one. It is bounded by age and
-  by five hops. And it is **closed for the rest of any run in which the lane has
+  by `base-health-max-hops` (default five, at most 50). Raise the hop cap when
+  the base's push CI tests one tip at a time while the lane merges several pull
+  requests in between: the newest green answer is then further back than five
+  commits, and the walk gives up on a base that answered green minutes ago
+  (#1668). Note the age is the ancestor's *commit* date, so the window must also
+  exceed the health job's duration plus the time between its answers. And it is **closed for the rest of any run in which the lane has
   merged**, because an ancestor's answer predates that merge by definition and
   must not speak for a tip the lane itself created — which is the whole point of
   the between-merges check above.

@@ -1965,6 +1965,24 @@ passes_the_staleness_window_to_the_driver() {
   matches "$code" '^          BASE_HEALTH_MAX_STALENESS: \$\{\{ inputs\.base-health-max-staleness-seconds \}\}$'
 }
 
+# The hop cap is a per-repository knob (#1668). It must reach the driver, keep
+# five as the default so no other repository's gate changes, and refuse a value
+# that would make the one-page history read silently short.
+passes_the_hop_cap_to_the_driver() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      base-health-max-hops:$' || return 1
+  matches "$code" '^          BASE_HEALTH_MAX_HOPS: \$\{\{ inputs\.base-health-max-hops \}\}$'
+}
+
+the_hop_cap_defaults_to_five_and_is_bounded() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^BASE_HEALTH_MAX_HOPS="\$\{BASE_HEALTH_MAX_HOPS:-5\}"$' || return 1
+  matches "$code" '\[ "\$BASE_HEALTH_MAX_HOPS" -gt 50 \]' || return 1
+  matches "$code" '\[ "\$BASE_HEALTH_MAX_HOPS" -lt 1 \]'
+}
+
 # ARMED-NESS IS READ FROM THE PASS TIP, NEVER FROM THE ONE A MERGE JUST MADE.
 # Seconds after a merge the post-merge run does not exist yet, so its checks
 # read as MISSING on the new tip -- identical to an unarmed repository, forever.
@@ -2101,6 +2119,8 @@ check the_staleness_window_closes_after_the_lane_merges "$DRIVER" "an ancestor's
 check a_red_ancestor_inside_the_window_halts_the_lane "$DRIVER" "the walk searches past a red ancestor for an older green one, so a base that is broken and has said so reads as vouched"
 check the_window_walk_is_bounded "$DRIVER" "the ancestor walk is unbounded in age or in hops, so any green commit in history vouches for the tip, or a pass is spent at two check reads per commit proving nothing answered"
 check passes_the_staleness_window_to_the_driver "$CALLEE" "the workflow declares the staleness window but never hands it to the driver, so a repository that sets it watches the lane go on halting with no way to tell which end is wrong"
+check passes_the_hop_cap_to_the_driver "$CALLEE" "the workflow declares base-health-max-hops but never hands it to the driver, so a repository that raises it still stops at five and keeps halting"
+check the_hop_cap_defaults_to_five_and_is_bounded "$DRIVER" "the hop cap changed for every repository, or accepts a value past the one-page history read, so the walk silently reads fewer commits than it was told to"
 check the_newer_incomplete_hold_is_bounded "$DRIVER" "the hold on a later unfinished suite of the same app has no ceiling, so one suite that never completes holds every required name of that app pending for as long as the head sha lives while the ruleset itself is satisfied"
 check the_bound_can_only_decline_the_downgrade "$DRIVER" "the staleness escape sits outside the branch that only a surviving success reaches, so a bound meant to decline one downgrade can turn a red, absent or genuinely pending check into a pass"
 check the_bound_reads_the_newest_holding_suite "$DRIVER" "the hold expires on the oldest holding suite or on a suite whose creation time could not be read, so a suite created seconds ago is walked past and the #955 405 comes back with a timer on it"
