@@ -166,6 +166,20 @@ on:
         required: false
         default: 0
         type: number
+      base-health-max-hops:
+        description: >-
+          How many commits back the staleness window above may walk to find an
+          answer, whatever its clock allows. 5 by default, 1 to 50.
+
+
+          Raise it on a base whose push CI tests one tip at a time while the
+          lane merges many PRs in between: the newest green answer is then
+          several commits back, and at five hops the walk stops short of it and
+          the lane halts on a base that answered green minutes ago. Each hop can
+          cost two check reads. Has no effect while the staleness window is 0.
+        required: false
+        default: 5
+        type: number
       newer-incomplete-max-staleness-seconds:
         description: >-
           How long a later, unfinished check_suite of the SAME app may keep a
@@ -734,6 +748,7 @@ jobs:
           PRIORITY_PREFIX: ${{ inputs.priority-label-prefix }}
           BASE_HEALTH_GRACE: ${{ inputs.base-health-grace-seconds }}
           BASE_HEALTH_MAX_STALENESS: ${{ inputs.base-health-max-staleness-seconds }}
+          BASE_HEALTH_MAX_HOPS: ${{ inputs.base-health-max-hops }}
           NEWER_INCOMPLETE_MAX_STALENESS: ${{ inputs.newer-incomplete-max-staleness-seconds }}
           STATUS_ISSUE: ${{ inputs.status-issue }}
           DRY_RUN: ${{ inputs.dry-run }}

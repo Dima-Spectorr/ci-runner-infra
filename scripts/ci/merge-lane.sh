@@ -396,7 +396,20 @@ BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
 # answered for in an hour would spend a pass reading commits to conclude what
 # the age test concludes for free. Five is comfortably past the "a sha or two
 # behind" the window exists to bridge.
-BASE_HEALTH_MAX_HOPS=5
+#
+# FIVE IS TOO FEW FOR A BASE THAT MERGES FASTER THAN ITS HEALTH JOB ANSWERS
+# (#1668). When the push CI of the base runs one tip at a time (a concurrency
+# group that keeps one pending run) and takes ~15 minutes while the lane merges
+# ~40 an hour, the newest green answer is routinely 8-12 commits back, the walk
+# stops at five, and the lane halts on a base that answered green minutes ago.
+# `base-health-max-hops` raises it per repository; capped at 50 because the
+# history read is one unpaginated page (`per_page` = hops + 1, at most 100) and
+# each hop may cost two check reads.
+BASE_HEALTH_MAX_HOPS="${BASE_HEALTH_MAX_HOPS:-5}"
+if ! [[ "$BASE_HEALTH_MAX_HOPS" =~ ^[0-9]+$ ]] || [ "$BASE_HEALTH_MAX_HOPS" -lt 1 ] || [ "$BASE_HEALTH_MAX_HOPS" -gt 50 ]; then
+  echo "lane: base-health-max-hops is '$BASE_HEALTH_MAX_HOPS', which is not a whole number from 1 to 50" >&2
+  exit 1
+fi
 
 # A SHORT CLOCK IS WAITED OUT IN THE RUN, BECAUSE NO EVENT FIRES WHEN IT CLEARS
 # (#1402). The review grace and the base-health grace both end on a clock. A
