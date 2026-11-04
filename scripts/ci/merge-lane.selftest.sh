@@ -4197,6 +4197,250 @@ while IFS= read -r _br_line; do
   esac
 done <<<"$_br_out"
 
+# ---------------------------------------------------------------------------
+# BEHAVIOURAL CASES: THE NUMBERED-FILE COLLISION HOLD (`numbered-paths`).
+#
+# `lane_take_action` and the hold's functions, lifted from <driver> and
+# <decision> and run against a stub `gh`: the base tree, the pull request's
+# file list and its comments are fixtures, and the merge PUT is recorded. Each
+# line is `PASS <id>` or `FAIL <id> — why`; the ids are what `numbered_mutant`
+# expects to go red, so every assertion here is shown to be able to fail.
+# ---------------------------------------------------------------------------
+numbered_cases() { # <driver> <decision>
+  local drv="$1" dec="$2" fix fn
+  fix="$(mktemp -d)"
+  # shellcheck disable=SC2034  # read by the evalled driver functions.
+  local R="owner/repo" LANE_MERGED_THIS_RUN=0 LANE_BASE=main REQUIRE_LABEL='' LANE_PASS_BASE=b1 LANE_TMP="$fix/tmp" LANE_NUMBERED_PENDING=''
+  # shellcheck disable=SC2034
+  declare -A LANE_LABEL_WAIVED=() LANE_NUMBERED_HELD=()
+  for fn in lane_premerge_verdict lane_landed_commit _lane_numbered_parse lane_numbered_number \
+    lane_numbered_prefixes _lane_numbered_dir lane_numbered_claims lane_numbered_clash; do
+    eval "$(sed -n "/^$fn() {/,/^}/p" "$dec")"
+  done
+  for fn in lane_take_action already_commented_number_taken \
+    lane_comment_number_taken_once lane_numbered_base_listing lane_numbered_guard; do
+    eval "$(sed -n "/^$fn() {/,/^}/p" "$drv")"
+  done
+  for fn in lane_take_action lane_numbered_guard lane_numbered_clash lane_numbered_base_listing; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      echo "FAIL numbered-lift $fn could not be lifted, so no numbered-hold case ran"
+      rm -rf "$fix"
+      return
+    fi
+  done
+  # One-line functions are not lifted by a range that ends at `^}`.
+  eval "$(grep '^number_taken_marker() {' "$drv")"
+  # shellcheck disable=SC2317,SC2329  # reached through the evalled functions.
+  gh() {
+    # Joined first: `${*#...}` would strip each argument on its own.
+    local a="$*"
+    printf '%s\n' "$a" >>"$fix/calls"
+    case "$a" in
+      *'-X PUT'*'/merge'*)
+        local n="${a#*pulls/}"
+        printf '%s\n' "${n%%/*}" >>"$fix/merged"
+        ;;
+      *'/comments -f body='*)
+        local n="${a#*issues/}"
+        n="${n%%/*}"
+        printf '%s\n' "$*" >>"$fix/comments-$n"
+        echo x >>"$fix/posted-$n"
+        ;;
+      *'/comments?per_page=100'*)
+        local n="${a#*issues/}"
+        n="${n%%/*}"
+        [ ! -f "$fix/comments-$n" ] || cat "$fix/comments-$n"
+        ;;
+      *'/files?per_page=100'*)
+        local n="${a#*pulls/}"
+        n="${n%%/*}"
+        [ -f "$fix/files-$n" ] || return 1
+        cat "$fix/files-$n"
+        ;;
+      *'git/trees/'*)
+        [ ! -f "$fix/tree-fail" ] || { echo 'gh: Server Error (HTTP 502)' >&2; return 1; }
+        local d="${a#*git/trees/}"
+        d="${d%% *}"
+        d="${d#*:}"
+        if [ -f "$fix/tree-${d//\//_}" ]; then cat "$fix/tree-${d//\//_}"; else
+          echo '{"message":"Not Found"}'
+          echo 'gh: Not Found (HTTP 404)' >&2
+          return 1
+        fi
+        ;;
+      *'repos/owner/repo/pulls/'*'--jq'*)
+        local n="${a#*pulls/}"
+        n="${n%% *}"
+        printf 'open\nfalse\ns%s\n\n' "$n"
+        ;;
+      *'commits?sha=main'*) return 1 ;;
+      *) echo "numbered stub: unexpected gh call '$*'" >&2; return 1 ;;
+    esac
+  }
+  # shellcheck disable=SC2034 # LANE_NUMBERED_HELD is read by the lifted driver functions.
+  _nc_reset() { rm -rf "${fix:?}"/* && mkdir -p "$LANE_TMP"; LANE_NUMBERED_HELD=(); }
+  _nc_take() { # <num> — prints nothing; leaves rc in $fix/rc-<num>
+    local rc=0
+    lane_take_action "$1" "s$1" "merge:ready green=3 total=3" >/dev/null 2>&1 || rc=$?
+    echo "$rc" >"$fix/rc-$1"
+  }
+  # shellcheck disable=SC2317 # both are called through _nc's eval.
+  _nc_merged() { [ -f "$fix/merged" ] && grep -qx "$1" "$fix/merged"; }
+  # shellcheck disable=SC2317
+  _nc_held() { ! _nc_merged "$1" && [ "$(cat "$fix/rc-$1")" = 2 ]; }
+  _nc() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1 — $(tr '\n' ' ' <"$fix/calls" 2>/dev/null)"; fi; }
+  local T=$'\t'
+  local NUMBERED_PATHS=$'docs/adr/\ndb/migrations/'
+
+  # A number the base already holds, under another name: held, one comment
+  # naming the holder and the next free number; a second pass adds none.
+  _nc_reset
+  printf '%s\n' "0248-a.md" "0249-theirs.md" "README.md" >"$fix/tree-docs_adr"
+  printf 'added%sdocs/adr/0249-mine.md%s\n' "$T" "$T" >"$fix/files-7"
+  _nc_take 7
+  _nc numbered-clash-on-base-holds '_nc_held 7 && [ "${LANE_NUMBERED_HELD[7]:-}" = hold:number-taken ]'
+  _nc numbered-comment-names-holder-and-next 'grep -q "docs/adr/0249-theirs.md" "$fix/comments-7" && grep -q "0250" "$fix/comments-7" && grep -qF "merge-lane:number-taken:s7" "$fix/comments-7"'
+  _nc_take 7
+  _nc numbered-comment-once '[ "$(wc -l <"$fix/posted-7")" -eq 1 ] && _nc_held 7'
+
+  # Two candidates in one pass claiming the same number: the first merges, the
+  # second is held — and the base listing is read once for both.
+  _nc_reset
+  printf '%s\n' "0248-a.md" "0249-b.md" >"$fix/tree-docs_adr"
+  printf 'added%sdocs/adr/0250-first.md%s\n' "$T" "$T" >"$fix/files-8"
+  printf 'added%sdocs/adr/0250-second.md%s\n' "$T" "$T" >"$fix/files-9"
+  _nc_take 8
+  _nc_take 9
+  _nc numbered-in-pass-first-merges '_nc_merged 8'
+  _nc numbered-in-pass-second-held '_nc_held 9 && grep -q "docs/adr/0250-first.md" "$fix/comments-9" && grep -q "0251" "$fix/comments-9" && grep -q "earlier in the same pass" "$fix/comments-9"'
+  # One tree read per configured directory (two here), not one per candidate.
+  _nc numbered-listing-read-once '[ "$(grep -c "git/trees/" "$fix/calls")" -eq 2 ]'
+
+  # The same file name on the base is the pull request's own file: merges.
+  _nc_reset
+  printf '%s\n' "0248-a.md" "0249-theirs.md" >"$fix/tree-docs_adr"
+  printf 'added%sdocs/adr/0249-theirs.md%s\n' "$T" "$T" >"$fix/files-10"
+  _nc_take 10
+  _nc numbered-same-file-merges '_nc_merged 10'
+
+  # A rename within the same number frees the old name: merges.
+  _nc_reset
+  printf '%s\n' "0249-old.md" >"$fix/tree-docs_adr"
+  printf 'renamed%sdocs/adr/0249-new.md%sdocs/adr/0249-old.md\n' "$T" "$T" >"$fix/files-11"
+  _nc_take 11
+  _nc numbered-rename-own-file-merges '_nc_merged 11'
+
+  # Flyway-style names: V0012 and V12 are the same number.
+  _nc_reset
+  printf '%s\n' "V12__users.sql" >"$fix/tree-db_migrations"
+  printf 'added%sdb/migrations/V0012__orders.sql%s\n' "$T" "$T" >"$fix/files-12"
+  _nc_take 12
+  _nc numbered-flyway-style-holds '_nc_held 12 && grep -q "V0013" "$fix/comments-12"'
+
+  # The first file of its kind: the directory is not on the base (404).
+  _nc_reset
+  printf 'added%sdb/migrations/0001-init.sql%s\n' "$T" "$T" >"$fix/files-13"
+  _nc_take 13
+  _nc numbered-new-dir-merges '_nc_merged 13'
+
+  # A pull request that claims no number costs no tree read.
+  _nc_reset
+  printf '%s\n' "0249-theirs.md" >"$fix/tree-docs_adr"
+  printf 'modified%sdocs/adr/0249-theirs.md%s\nadded%sdocs/adr/README.md%s\n' "$T" "$T" "$T" "$T" >"$fix/files-14"
+  _nc_take 14
+  _nc numbered-no-claim-no-read '_nc_merged 14 && ! grep -q "git/trees/" "$fix/calls"'
+
+  # FAIL-SAFE: an unreadable listing or file list holds the one pull request,
+  # never merges it, and posts nothing.
+  _nc_reset
+  : >"$fix/tree-fail"
+  printf 'added%sdocs/adr/0300-x.md%s\n' "$T" "$T" >"$fix/files-15"
+  _nc_take 15
+  _nc numbered-listing-failure-holds '_nc_held 15 && [ ! -f "$fix/posted-15" ] && [ "${LANE_NUMBERED_HELD[15]:-}" = hold:number-unread ]'
+  _nc_reset
+  _nc_take 16
+  _nc numbered-files-failure-holds '_nc_held 16 && [ ! -f "$fix/posted-16" ]'
+
+  # Guard off: the same clashing pull request merges, and no extra read is made.
+  _nc_reset
+  # shellcheck disable=SC2034 # read by the lifted lane_take_action.
+  NUMBERED_PATHS=''
+  printf '%s\n' "0249-theirs.md" >"$fix/tree-docs_adr"
+  printf 'added%sdocs/adr/0249-mine.md%s\n' "$T" "$T" >"$fix/files-17"
+  _nc_take 17
+  _nc numbered-off-unchanged '_nc_merged 17 && ! grep -qE "/files\?|git/trees/" "$fix/calls"'
+  rm -rf "$fix"
+}
+
+# numbered_mutant <description> driver|decision <sed-program> <id>
+numbered_mutant() {
+  local desc="$1" which="$2" prog="$3" id="$4" src tmp out
+  if [ "$which" = driver ]; then src="$DRIVER"; else src="$DECISION"; fi
+  tmp=$(mktemp)
+  if ! sed "$prog" "$src" >"$tmp" 2>/dev/null; then
+    bad "the mutation program is not valid sed, so it asserts nothing: $desc"
+  elif cmp -s "$tmp" "$src"; then
+    bad "mutation changed nothing, so it asserts nothing: $desc"
+  else
+    if [ "$which" = driver ]; then out=$(numbered_cases "$tmp" "$DECISION"); else out=$(numbered_cases "$DRIVER" "$tmp"); fi
+    if [ "$(printf '%s\n' "$out" | grep -c "^FAIL $id\( \|$\)")" -eq 1 ]; then ok; else bad "mutation not detected by '$id': $desc"; fi
+  fi
+  rm -f "$tmp"
+}
+
+_nb_out="$(numbered_cases "$DRIVER" "$DECISION")"
+[ "$(printf '%s\n' "$_nb_out" | grep -c '^PASS ')" -eq 14 ] || bad "numbered cases: expected 14 PASS lines, got: $(printf '%s' "$_nb_out" | tr '\n' ' ')"
+while IFS= read -r _nb_line; do
+  case "$_nb_line" in
+    PASS\ *) ok ;;
+    FAIL\ *) bad "behavioural numbered-file hold: ${_nb_line#FAIL }" ;;
+    '') : ;;
+    *) bad "behavioural numbered-file hold: unparseable result line '$_nb_line'" ;;
+  esac
+done <<<"$_nb_out"
+numbered_mutant "the merge arm never asks the hold" driver \
+  's@^      if \[ -n "\${NUMBERED_PATHS:-}" \]; then$@      if false; then@' numbered-clash-on-base-holds
+numbered_mutant "the hold runs with no directories configured" driver \
+  's@^      if \[ -n "\${NUMBERED_PATHS:-}" \]; then$@      if true; then@' numbered-off-unchanged
+numbered_mutant "a clash is let through" driver \
+  's@^    lane_comment_number_taken_once "\$num" .*@    return 0@' numbered-clash-on-base-holds
+numbered_mutant "the comment is posted on every pass" driver \
+  's@^  if already_commented_number_taken "\$num" "\$sha"; then return 0; fi$@  :@' numbered-comment-once
+numbered_mutant "a merge does not record what it claimed" driver \
+  's@^          printf .%s\\n. "\$LANE_NUMBERED_PENDING" >>.*@          :@' numbered-in-pass-second-held
+numbered_mutant "the listing is read for every candidate" driver \
+  's@^  if \[ -f "\$cache" \]; then$@  if false; then@' numbered-listing-read-once
+numbered_mutant "a 404 directory is a failure" driver \
+  's@^      if grep -cF .HTTP 404. "\$err" >/dev/null; then continue; fi$@      :@' numbered-new-dir-merges
+numbered_mutant "an unreadable listing merges blind" driver \
+  's@^  if ! listing="\$(lane_numbered_base_listing@  if false \&\& listing="$(lane_numbered_base_listing@' numbered-listing-failure-holds
+numbered_mutant "an unreadable file list merges blind" driver \
+  's@^    LANE_NUMBERED_HELD\[\$num\]=.hold:number-unread.$@    return 0@' numbered-files-failure-holds
+numbered_mutant "a claimless pull request still reads the tree" driver \
+  's@^  \[ -n "\$claims" \] || return 0$@  :@' numbered-no-claim-no-read
+numbered_mutant "the pull request's own file counts as a clash" decision \
+  's@^      \[ "\$t" != "\$claim" \] || continue$@      :@' numbered-same-file-merges
+numbered_mutant "a renamed-away file still holds its number" decision \
+  's@^      renamed) \[ -z "\$prev" \] || gone+=.*@      renamed) : ;;@' numbered-rename-own-file-merges
+numbered_mutant "the V prefix is not read" decision \
+  's@\^(\[Vv\]?)(\[0-9\]+)@^()([0-9]+)@' numbered-flyway-style-holds
+numbered_mutant "next-free is not one past the highest" decision \
+  's@"\$((max + 1))"@"$max"@' numbered-comment-names-holder-and-next
+
+# The input reaches the driver, and defaults to off.
+wires_numbered_paths() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^      numbered-paths:$' || return 1
+  matches "$code" '^          NUMBERED_PATHS_INPUT: \$\{\{ inputs.numbered-paths \}\}$' || return 1
+  [ "$(awk '/^      numbered-paths:$/{f=1} f && /^        default:/{print; exit}' "$1")" = "        default: ''" ]
+}
+check wires_numbered_paths "$CALLEE" "the numbered-paths input does not reach the lane, or is not off by default"
+mutate "the numbered-paths env is dropped" "$CALLEE" \
+  's@^          NUMBERED_PATHS_INPUT: .*@          X_UNUSED_NUMBERED: 0@' wires_numbered_paths
+mutate "numbered-paths defaults on" "$CALLEE" \
+  "/^      numbered-paths:\$/,/^        default:/s@^        default: ''\$@        default: 'docs/'@" wires_numbered_paths
+
 _pm_out="$(behavioural_premerge_cases)"
 while IFS= read -r _pm_line; do
   case "$_pm_line" in

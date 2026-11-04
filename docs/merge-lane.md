@@ -1983,6 +1983,63 @@ byte-for-byte what a lost runner looks like, and sends you to the pool to
 investigate a workflow bug. The `job-` infix exists to make the collision
 impossible rather than merely documented; keep the caller's name distinct anyway.
 
+### Two pull requests claiming the same number (`numbered-paths`)
+
+Measured on 2026-11-04 in one consumer: two pull requests each added "the next
+free" ADR number, both went green on their own CI, and the lane merged both in
+one pass. The base's numbering gate went red, the lane halted every merge
+(base red), and nothing merged for about 45 minutes until a renumber pull
+request landed — the fifteenth such renumber in that repository in a week.
+Another repository had the same with SQL migrations. On a base that does not
+require up-to-date branches nothing else can see this: each pull request's
+checks ran against a base that did not yet hold the other's file.
+
+Name the numbered directories and the lane checks before it merges:
+
+```yaml
+    with:
+      numbered-paths: |
+        docs/adr/
+        db/migrations/
+```
+
+Immediately before the merge call, a candidate that **adds** (or renames or
+copies to) a file directly in one of those directories is compared with the
+files the base tip already holds there, and with the files this pass already
+merged. When its number is already taken under a **different** file name:
+
+- it is not merged — verdict `hold`, reason `number-taken` in the queue table
+  and the status issue;
+- it gets **one** comment per head sha (marker
+  `<!-- merge-lane:number-taken:<sha> -->`) naming the file that holds the
+  number and the next number free on the base (one past the highest there,
+  written as wide as the claim);
+- it does not use one of the pass's `max-actions`, and every other candidate
+  keeps merging. Of two candidates in one pass claiming the same number, the
+  first merges and the second is held.
+
+What counts as the number: the leading run of digits of the file name, after
+an optional single `V` — `0249-foo.md` and `V0249__foo.sql` both claim 249, and
+leading zeros do not count. A name without leading digits (`README.md`, a
+Flyway `R__` repeatable) claims nothing. Deliberately nothing more configurable
+than that. A file counts only when it sits directly in the listed directory;
+list nested directories separately.
+
+Not a clash: the same file name already on the base (the pull request's own
+file, already landed or re-run), and a number whose old file this pull request
+removes or renames away.
+
+**Fail-safe: hold the one pull request, never merge blind, never halt.** If the
+pull request's file list or a directory listing cannot be read, the candidate
+is held for that pass (`hold:number-unread`, a warning in the log, no comment —
+it is not the author's to fix) and the next pass reads again. A directory the
+base does not have yet (404) is not a failure: it holds no number.
+
+Cost: one paginated file-list read per merge candidate, and one tree read per
+configured directory per pass, made only when a candidate actually claims a
+number. Empty (the default) turns all of it off. A dry run never reaches the
+merge call, so it does not exercise the hold.
+
 ### The pool images do not ship `gh`
 
 GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That

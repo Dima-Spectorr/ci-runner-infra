@@ -986,3 +986,137 @@ lane_quota_verdict() {
     echo "allow:above-floor"
   fi
 }
+
+# ---------------------------------------------------------------------------
+# THE NUMBERED-FILE COLLISION HOLD (`numbered-paths`) — the pure half.
+#
+# Measured on 2026-11-04: two pull requests each claimed "the next free number"
+# for an ADR, both went green on their own, the lane merged both in one pass,
+# and the base's own numbering gate went red. The lane then halted every merge
+# until a renumber pull request landed — about 45 minutes, and the fifteenth
+# such renumber in that repository in a week. A base that does not require
+# up-to-date branches cannot see this, because each pull request's checks ran
+# against a base that did not yet hold the other one's file.
+#
+# These functions decide; the driver (`lane_numbered_guard`) reads the facts.
+# How a number is read, and deliberately nothing more configurable than this:
+# the leading run of digits of the basename, after an optional single `V`/`v`
+# (Flyway's `V0123__x.sql`). Leading zeros do not count, so `0012` and `12`
+# are the same number. A name with no such digits claims no number.
+# ---------------------------------------------------------------------------
+
+# _lane_numbered_parse <path> — sets LANE_NUM (the number, no leading zeros),
+# LANE_NUM_RAW (the digits as written) and LANE_NUM_LEAD (the `V`, or empty);
+# 1 when the basename claims no number. No subshell: called once per listed
+# file, and a migrations directory can list a thousand.
+_lane_numbered_parse() {
+  local b="${1##*/}"
+  [[ "$b" =~ ^([Vv]?)([0-9]+) ]] || return 1
+  LANE_NUM_LEAD="${BASH_REMATCH[1]}"
+  LANE_NUM_RAW="${BASH_REMATCH[2]}"
+  LANE_NUM="${LANE_NUM_RAW#"${LANE_NUM_RAW%%[!0]*}"}"
+  LANE_NUM="${LANE_NUM:-0}"
+}
+
+# lane_numbered_number <path> — the number a file name claims, or rc 1.
+lane_numbered_number() {
+  _lane_numbered_parse "$1" || return 1
+  printf '%s' "$LANE_NUM"
+}
+
+# lane_numbered_prefixes <multi-line input> — one directory a line, trimmed,
+# without a leading `./` or `/`, always ending in `/`. Blank lines dropped.
+lane_numbered_prefixes() {
+  local line
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    line="${line#./}"
+    line="${line#/}"
+    case "$line" in */) ;; *) line="$line/" ;; esac
+    printf '%s\n' "$line"
+  done <<<"$1"
+}
+
+# _lane_numbered_dir <path> — sets LANE_DIR to the path's directory with a
+# trailing `/`, or empty for a file at the root. A file counts for a prefix
+# only when it sits DIRECTLY in that directory: numbering is per directory.
+_lane_numbered_dir() {
+  case "$1" in
+    */*) LANE_DIR="${1%/*}/" ;;
+    *) LANE_DIR='' ;;
+  esac
+}
+
+# lane_numbered_claims <prefixes> <pr-files> — the numbered files a pull
+# request ADDS under a configured directory, one path a line. <pr-files> is
+# `status<TAB>path<TAB>previous_path` per file, as the pull-request files API
+# reports it; added, renamed-to and copied-to paths are claims, a modification
+# or a removal is not.
+lane_numbered_claims() {
+  local prefixes=$'\n'"$1"$'\n' status path prev
+  while IFS=$'\t' read -r status path prev; do
+    : "$prev"
+    case "$status" in added | renamed | copied) ;; *) continue ;; esac
+    _lane_numbered_dir "$path"
+    [[ "$prefixes" == *$'\n'"$LANE_DIR"$'\n'* ]] || continue
+    _lane_numbered_parse "$path" || continue
+    printf '%s\n' "$path"
+  done <<<"$2"
+}
+
+# lane_numbered_clash <prefixes> <pr-files> <taken>
+#
+# <taken> is every numbered path the base already holds under the configured
+# directories, plus the ones this lane merged earlier in the same pass. Prints
+# the FIRST clash as `claim<TAB>holder<TAB>number<TAB>next-free` and returns 0;
+# prints nothing and returns 1 when the pull request takes no number already
+# taken.
+#
+#   - The SAME path on the base is not a clash: that is the pull request's own
+#     file, already landed, or a re-run of a merge that went through.
+#   - A path this pull request removes, or renames away, does not hold its
+#     number any more — a pull request that renames `0249-a.md` to `0249-b.md`
+#     is not clashing with itself.
+#   - next-free is one past the highest number in that directory on the base
+#     (and this pass), written as wide as the claim's own digits and with its
+#     `V` if it had one; `-` when the number is too long for shell arithmetic
+#     (a timestamp-numbered directory, where "next" means nothing anyway).
+lane_numbered_clash() {
+  local prefixes="$1" files="$2" taken="$3" gone=$'\n' status path prev
+  while IFS=$'\t' read -r status path prev; do
+    case "$status" in
+      removed) gone+="$path"$'\n' ;;
+      renamed) [ -z "$prev" ] || gone+="$prev"$'\n' ;;
+    esac
+  done <<<"$files"
+
+  local claim n raw lead dir t hit max next
+  while IFS= read -r claim; do
+    [ -n "$claim" ] || continue
+    _lane_numbered_parse "$claim" || continue
+    n="$LANE_NUM" raw="$LANE_NUM_RAW" lead="$LANE_NUM_LEAD"
+    _lane_numbered_dir "$claim"
+    dir="$LANE_DIR"
+    hit='' max=-1
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      [ "$t" != "$claim" ] || continue
+      [[ "$gone" != *$'\n'"$t"$'\n'* ]] || continue
+      _lane_numbered_dir "$t"
+      [ "$LANE_DIR" = "$dir" ] || continue
+      _lane_numbered_parse "$t" || continue
+      if [ -z "$hit" ] && [ "$LANE_NUM" = "$n" ]; then hit="$t"; fi
+      if [ "${#LANE_NUM}" -le 18 ] && [ "$LANE_NUM" -gt "$max" ]; then max="$LANE_NUM"; fi
+    done <<<"$taken"
+    [ -n "$hit" ] || continue
+    next='-'
+    if [ "${#n}" -le 18 ] && [ "$max" -ge "$n" ]; then
+      next="$lead$(printf '%0*d' "${#raw}" "$((max + 1))")"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$claim" "$hit" "$n" "$next"
+    return 0
+  done < <(lane_numbered_claims "$prefixes" "$files")
+  return 1
+}
