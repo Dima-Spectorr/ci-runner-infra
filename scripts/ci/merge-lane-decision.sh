@@ -588,8 +588,7 @@ lane_premerge_verdict() {
 # ---------------------------------------------------------------------------
 # lane_landed_commit — is this pull request already on the base branch?
 #
-#   printf '%s
-' "<sha> <subject>" ... | lane_landed_commit <num>
+#   (lines "<sha> <subject>" on stdin) | lane_landed_commit <num>
 #
 # Prints the sha of the first commit whose subject is GitHub's merge of #num —
 # a squash title ending in "(#num)", or "Merge pull request #num from ..." —
