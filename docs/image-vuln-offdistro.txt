@@ -2,12 +2,20 @@
 #
 # One line per DISTINCT pair:
 #
-#     <cve-or-ghsa-id> <package> [free-text note]
+#     <cve-or-ghsa-id> <package> [expires=YYYY-MM-DD] [free-text note]
 #
 # `#` starts a comment. The note is optional — this file records what the image
 # CONTAINS, not a decision to tolerate it, and 273 seeded lines each carrying a
 # sentence of invented prose would be 273 lines of nothing. Where somebody has
 # actually looked at one, write down what they concluded.
+#
+# EXPIRY (#1682). `expires=YYYY-MM-DD`, as the THIRD field and only there, makes
+# a line an exception with a deadline. It covers its pair through that date;
+# from the day after, a scan that still carries the pair fails VULN3 naming the
+# expired line. Re-affirming it is a pull request with a new date and a written
+# conclusion. A line without the token never expires. A malformed date fails the
+# gate (VULN0) rather than being read as no expiry. Use it for any line recorded
+# under pressure, before anyone reviewed it.
 #
 # WHAT IT IS FOR
 #
@@ -264,38 +272,53 @@ GHSA-p77j-4mvh-x3m3 google.golang.org/grpc
 
 # ── 2026-11-05: first build with runner 2.338.2 (ci-runner-infra#1676) ───────
 # 33 pairs the grype feed added since the 2026-09-19 image; build 638046f4.
-# Recorded to restore the fleet after a deprecated runner took every pool down;
-# not yet reviewed pair by pair (review: #1678).
-CVE-2026-100075 linux-kernel
-CVE-2026-111497 node
-CVE-2026-115557 python
-CVE-2026-63808 linux-kernel
-CVE-2026-63830 linux-kernel
-CVE-2026-63886 linux-kernel
-CVE-2026-63887 linux-kernel
-CVE-2026-63888 linux-kernel
-CVE-2026-63912 linux-kernel
-CVE-2026-63922 linux-kernel
-CVE-2026-63924 linux-kernel
-CVE-2026-63938 linux-kernel
-CVE-2026-63939 linux-kernel
-CVE-2026-63940 linux-kernel
-CVE-2026-63992 linux-kernel
-CVE-2026-63993 linux-kernel
-CVE-2026-63994 linux-kernel
-CVE-2026-64000 linux-kernel
-CVE-2026-64007 linux-kernel
-CVE-2026-64018 linux-kernel
-CVE-2026-64024 linux-kernel
-CVE-2026-64025 linux-kernel
-CVE-2026-64033 linux-kernel
-CVE-2026-64034 linux-kernel
-CVE-2026-64035 linux-kernel
-CVE-2026-64037 linux-kernel
-CVE-2026-98432 linux-kernel
-GHSA-5xjx-3w67-w9x9 pypa/gh-action-pypi-publish
-GHSA-6q48-6c7w-9gw2 certifi
-GHSA-ffc3-869f-jxw9 pyjwt
-GO-2026-6604 stdlib
-GO-2026-6612 golang.org/x/net
-GO-2026-6612 stdlib
+# Recorded to restore the fleet after a deprecated runner took every pool down,
+# before review. Every line EXPIRES 2026-12-05 (#1682): by then each is
+# upgraded out of the image, or re-affirmed with a new date.
+#
+# Reviewed 2026-11-05 against build 638046f4's verdict output. That log carries
+# each finding's package and version but NOT grype's `locations`, so a carrier
+# below is inferred from the version and from what packer/ci-host-image.pkr.hcl
+# installs, and says so where it is an inference. Installed by that build:
+# docker-ce 29.9.3, containerd.io 2.4.2, buildx 0.38.1, compose 5.7.0 (all
+# unpinned, from download.docker.com), system nodejs 24.22.2 (nodesource), tool
+# cache node 24.21.0, powershell 7.6.9, actions runner 2.338.2.
+#
+# linux-kernel (25): kernel 7.0.0-1014-gcp from the ubuntu-2404-lts-amd64 base
+# image, read off the kernel binary and compared against upstream versions
+# ("fixed in 6.12.95, 7.1.3…"), where Ubuntu's backports are invisible. The
+# same reasoning as the 105 seeded kernel lines. Not a packer-installed tool:
+# cleared by Canonical's next linux-gcp ABI, which a rebuild picks up.
+CVE-2026-100075 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-111497 node expires=2026-12-05 node 20.20.2 = runner 2.338.2 externals/node20 (system and tool-cache node are 24.x); no 20.x fix exists (node 20 is EOL), runs only for actions declaring node20; drops when a runner release stops bundling node20
+CVE-2026-115557 python expires=2026-12-05 python 3.14.8, not installed by packer (noble ships 3.12) and carrier unidentified without grype locations; fixed in 3.14.10
+CVE-2026-63808 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63830 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63886 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63887 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63888 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63912 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63922 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63924 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63938 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63939 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63940 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63992 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63993 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-63994 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64000 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64007 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64018 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64024 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64025 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64033 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64034 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64035 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-64037 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+CVE-2026-98432 linux-kernel expires=2026-12-05 base-image kernel 7.0.0-1014-gcp; upstream-version match, cleared by the next linux-gcp ABI
+GHSA-5xjx-3w67-w9x9 pypa/gh-action-pypi-publish expires=2026-12-05 six `uses:` refs (release/v1, v1.8.8, v1.12.4, v1.14.2) read out of workflow YAML files on disk; data a CI host never executes, no packer tool to bump
+GHSA-6q48-6c7w-9gw2 certifi expires=2026-12-05 certifi 2023.11.17 is noble's python3-certifi version (inferred, not installed by packer); a python dist-info match where Ubuntu's own deb data applies; fixed upstream in 2026.10.18
+GHSA-ffc3-869f-jxw9 pyjwt expires=2026-12-05 pyjwt 2.7.0 is noble's python3-jwt version (inferred, not installed by packer); a python dist-info match where Ubuntu's own deb data applies; fixed upstream in 2.14.0
+GO-2026-6604 stdlib expires=2026-12-05 Go binaries built with go1.22.2 through go1.27.1 (fix 1.26.9/1.27.2); go1.27.1 is most likely a download.docker.com binary, installed unpinned, so a rebuild after Docker ships a go1.27.2 build drops it
+GO-2026-6612 golang.org/x/net expires=2026-12-05 x/net v0.49.0-v0.59.0 vendored in Go binaries (fix 0.60.0); carrier per version unidentified without grype locations; upstream rebuilds of the docker plugins clear the ones packer installs
+GO-2026-6612 stdlib expires=2026-12-05 same Go binaries as GO-2026-6604 (go1.22.2 through go1.26.x; fix 1.26.9); cleared by upstream rebuilds, not by a packer edit
