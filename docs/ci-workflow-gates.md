@@ -52,7 +52,7 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 |---|---|
 | `RUNNER0` | the file does not load, or the gate cannot run |
 | `RUNNER1` | a fleet-reachable `runs-on` also names a repository-scoping label |
-| `RUNNER2` | with `--scope=<label>`, it is THAT label |
+| `RUNNER2` | with `--scope=<label>`, it is THAT label, or that label's utility-host slot (`<label>-util`, `<label>-lane`); another repository's slot is refused |
 | `RUNNER3` | every job that runs steps declares `timeout-minutes` (see the note below) |
 | `RUNNER4` | a fork-reachable workflow keeps fleet-reachable jobs behind a fork guard |
 | `RUNNER5` | the runner is selected dynamically — reported as UNDECIDED, not passed; declarable per repository (`--allow-dynamic-runner`) or per job (`# dynamic-runner-allowed(<job>, #<issue>)`) |
@@ -62,6 +62,11 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER9` | with `--shared-infra`, a fleet-reachable **Linux** job in a `pull_request` workflow resolves `runs-on` from the anchor job's output, or — in a called workflow that opens no pull-request run of its own — from a **required** `workflow_call` input, or is the anchor, or carries a declared exemption |
 | `RUNNER10` | with `--shared-infra`, at most **one** job invocation across a repository's `pull_request` workflows is an infrastructure owner — `services:` blocks and `# shared-infra-owner(<job>)` markers counted together, including on a `uses:` job, because a repository that has adopted the contract has no `services:` left to count and its anchor is a call |
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
+| `RUNNER15` | a job on a utility-host label (`-util`/`-lane`) declares no `container:` and no `services:` ([#1643](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1643)) |
+| `RUNNER16` | a job on a utility-host label is not in a `pull_request_target` workflow, nor in a local callee one reaches ([#1696](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1696)) |
+| `RUNNER17` | a job on a `-util` label: the run declares `--forks=blocked` ([#1649](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1649)) |
+| `RUNNER18` | a job on a `-lane` label is the REMOTE call to the fleet's merge-lane workflow, and nothing else (a consumer's own `./…merge-lane.yml` does not count) |
+| `RUNNER19` | the merge-lane call is not routed to a `-util` label, and its `with: runs-on:` is written literally (a computed one is undecidable and refused) |
 
 **`RUNNER12`, `RUNNER13` and `RUNNER14` are retired and the numbers are not
 reused.** All three judged the route between a pull-request pool and a
