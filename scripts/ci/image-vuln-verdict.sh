@@ -655,6 +655,19 @@ selftest() {
   check "an expired exception no longer seen is reported, not blocking" 0 "expired exception no longer seen" \
     --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-expgone.txt" --today 2026-06-01
 
+  # …and ONLY when it is gone: an expired pair the scan still carries is the
+  # VULN3 above, and telling the reader to "prune" it would invite deleting the
+  # line instead of fixing the image. Output captured first: this run exits 1,
+  # and under pipefail `run | grep` would be false whatever grep found.
+  local exp_out
+  exp_out="$(run --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-06-01 2>&1)"
+  if printf '%s\n' "$exp_out" | grep -q "expired exception no longer seen"; then
+    echo "FAIL an expired pair still in the scan is not offered for pruning"
+    status=1
+  else
+    echo "ok   an expired pair still in the scan is not offered for pruning"
+  fi
+
   # A malformed date fails rather than being read as no expiry.
   printf 'GHSA-x golang.org/x/crypto expires=2026-5-31\n' > "$tmp/base-baddate.txt"
   check "a malformed expiry fails the gate" 2 "VULN0.*expires=YYYY-MM-DD" \
