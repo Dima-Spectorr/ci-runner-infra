@@ -83,6 +83,63 @@ safe_for_log() {
 # one that would have taken the queued job.
 CURL_TIMEOUTS=(--connect-timeout 10 --max-time 30)
 
+# --- GitHub rate-limit pause (#1672) -------------------------------------------
+#
+# Every slot of every host registers through ONE App installation, and that
+# installation has one hourly API budget. On 2026-11-05 a pool that doubled at
+# once spent it in ten minutes; then ~176 slot loops each retried every 30s,
+# every attempt refused with a 403 -- and the hammering earned the token mint a
+# secondary (abuse) limit on top. No runner was online for an hour.
+#
+# So a 403/429 that IS a rate limit writes, host-wide, the epoch until which no
+# slot on this host calls GitHub to register: x-ratelimit-reset when the budget
+# is spent, retry-after when GitHub names a wait, 60s when it says "rate limit"
+# with neither header. The file holds a number and nothing else; only root
+# writes it (/run), and it only ever moves later. Bounded to [30s, 65min] so a
+# garbled header can neither spin the loop nor park a host for longer than one
+# window.
+GH_RATE_FILE=/run/ci-gh-rate-limit-until
+
+# rate_limit_note <http_code> <header_dump> [message] -- true when the answer was
+# GitHub's rate limit (and the pause is recorded), false for any other refusal.
+rate_limit_note() {
+  local code="$1" hdr="$2" msg="${3:-}" now rem="" reset="" after="" until cur
+  case "$code" in 403 | 429) ;; *) return 1 ;; esac
+  [ -n "${GH_RATE_FILE:-}" ] || return 1
+  if [ -f "$hdr" ]; then
+    rem=$(sed -n 's/^x-ratelimit-remaining:[[:space:]]*\([0-9][0-9]*\).*/\1/Ip' "$hdr" | tail -n 1)
+    reset=$(sed -n 's/^x-ratelimit-reset:[[:space:]]*\([0-9][0-9]*\).*/\1/Ip' "$hdr" | tail -n 1)
+    after=$(sed -n 's/^retry-after:[[:space:]]*\([0-9][0-9]*\).*/\1/Ip' "$hdr" | tail -n 1)
+  fi
+  now=$(date +%s)
+  if [ -n "$after" ]; then
+    until=$((now + after))
+  elif [ "$rem" = 0 ] && [ -n "$reset" ]; then
+    until=$reset
+  else
+    case "$msg" in *[Rr]"ate limit"*) until=$((now + 60)) ;; *) return 1 ;; esac
+  fi
+  [ "$until" -ge $((now + 30)) ] || until=$((now + 30))
+  [ "$until" -le $((now + 3900)) ] || until=$((now + 3900))
+  cur=$(rate_limit_left)
+  [ "$until" -gt $((now + cur)) ] || return 0
+  if ! { printf '%s\n' "$until" >"$GH_RATE_FILE.$$" && mv -f "$GH_RATE_FILE.$$" "$GH_RATE_FILE"; }; then
+    rm -f "$GH_RATE_FILE.$$"
+    log "could not record the GitHub rate-limit pause"
+  fi
+  return 0
+}
+
+# rate_limit_left -- seconds until this host may call GitHub to register again;
+# 0 when it may now. A file that does not parse is no pause.
+rate_limit_left() {
+  local u="" now
+  [ -n "${GH_RATE_FILE:-}" ] && [ -f "$GH_RATE_FILE" ] && read -r u <"$GH_RATE_FILE" 2>/dev/null
+  case "$u" in '' | *[!0-9]*) printf 0; return 0 ;; esac
+  now=$(date +%s)
+  if [ "$u" -gt "$now" ]; then printf '%s' $((u - now)); else printf 0; fi
+}
+
 md() {
   curl "${CURL_TIMEOUTS[@]}" -fsS -H "Metadata-Flavor: Google" \
     "http://metadata.google.internal/computeMetadata/v1/$1" 2>/dev/null
@@ -424,10 +481,13 @@ gh_token() {
   case "$repo" in
     "" | *[!A-Za-z0-9_.-]*) log "refusing to mint: '$(safe_for_log "$repo")' is not a bare repository name"; return 1 ;;
   esac
-  local body resp code
+  local body resp code hdr msg
   body=$(printf '{"repositories":["%s"],"permissions":%s}' "$repo" "$perms")
-  # Body and status in one capture, never a file: the body IS the token.
-  resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
+  # The response HEADERS go to a file (rate_limit_note reads them on a refusal);
+  # they carry no credential. Body and status stay in one capture, never a file:
+  # the body IS the token.
+  hdr=$(mktemp 2>/dev/null) || hdr=/dev/null
+  resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -D "$hdr" -w '\n%{http_code}' \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
     -H "Accept: application/vnd.github+json" \
     -d "$body" \
@@ -437,9 +497,13 @@ gh_token() {
     local hint=""
     [ "$code" = 422 ] && hint=" -- the installation lacks that permission or does not select this repository; NOT retried unscoped"
     # The message only, never the body: a 2xx body is a token.
-    log "installation token mint (repo $repo, scope $perms) refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')$hint"
+    msg=$(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    case "$code" in 403 | 429) rate_limit_note "$code" "$hdr" "$msg" && hint=" -- GitHub's rate limit; this host pauses registering for $(rate_limit_left)s" ;; esac
+    [ "$hdr" = /dev/null ] || rm -f -- "$hdr"
+    log "installation token mint (repo $repo, scope $perms) refused: HTTP $code $msg$hint"
     return 1
   fi
+  [ "$hdr" = /dev/null ] || rm -f -- "$hdr"
   printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
@@ -526,17 +590,19 @@ jit_labels_json() { # <idx> [unheld:0|1]
 # registers it is scoped to it alone. A caller that forgot it gets nothing, not
 # a runner in ci-github-repo that the slot's own repository's jobs never reach.
 mint_jit() { # <idx> <envfile> <unheld:0|1> <repo>
-  local idx="$1" envfile="$2" repo="${4:-}" tok group labels name body resp code out id try
+  local idx="$1" envfile="$2" repo="${4:-}" tok group labels name body resp code out id try hdr msg hint
   [ -n "$repo" ] || { log "slot $idx: mint_jit was not told which repository -- not registering"; return 1; }
   group=$(runner_group_id) || return 1
   labels=$(jit_labels_json "$idx" "${3:-0}") || return 1
   tok=$(gh_token register "$repo") || return 1
   [ -n "$tok" ] || return 1
+  hdr=$(mktemp 2>/dev/null) || hdr=/dev/null
   for try in 1 2; do
     name="$HOSTNAME_SHORT-s$idx-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
     body=$(printf '{"name":"%s","runner_group_id":%s,"labels":%s,"work_folder":"_work"}' "$name" "$group" "$labels")
     # Body and status in one capture, never a file: the body IS the credential.
-    resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -w '\n%{http_code}' \
+    # Only the response headers go to a file, for rate_limit_note.
+    resp=$(curl "${CURL_TIMEOUTS[@]}" -sS -X POST -D "$hdr" -w '\n%{http_code}' \
       -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
       -H "Accept: application/vnd.github+json" \
       -d "$body" \
@@ -550,9 +616,14 @@ mint_jit() { # <idx> <envfile> <unheld:0|1> <repo>
   done
   if [ "$code" != 201 ]; then
     # The message only, never the body: a 2xx body is a credential.
-    log "slot $idx: generate-jitconfig refused: HTTP $code $(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -c 200)"
+    msg=$(printf '%s' "${resp%$'\n'*}" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -c 200)
+    hint=""
+    case "$code" in 403 | 429) rate_limit_note "$code" "$hdr" "$msg" && hint=" -- GitHub's rate limit; this host pauses registering for $(rate_limit_left)s" ;; esac
+    [ "$hdr" = /dev/null ] || rm -f -- "$hdr"
+    log "slot $idx: generate-jitconfig refused: HTTP $code $msg$hint"
     return 1
   fi
+  [ "$hdr" = /dev/null ] || rm -f -- "$hdr"
   # STDIN, not argv; stderr dropped so a parse error can never echo a fragment.
   out=$(printf '%s' "${resp%$'\n'*}" | python3 -I -c '
 import base64, json, sys
@@ -2813,8 +2884,8 @@ install_pin_run_status() {
     printf 'set -uo pipefail\n'
     printf 'PATH=%q\n' "$PATH"
     printf 'LOG_TAG=ci-pin-sweep\n'
-    declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET CURL_TIMEOUTS
-    declare -f log safe_for_log gh_token
+    declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET CURL_TIMEOUTS GH_RATE_FILE
+    declare -f log safe_for_log gh_token rate_limit_note rate_limit_left
     cat <<'EOF'
 
 # GITHUB_RUN_ID is a number. The hold accepts a wider shape, and anything that
@@ -3212,9 +3283,10 @@ install_slot_loop() {
     printf 'LOG_TAG=ci-slot-loop\n'
     declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET RUNNER_GROUP HOSTNAME_SHORT \
       LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS \
-      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR
+      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR GH_RATE_FILE
     declare -f log safe_for_log md gh_token slot_field slot_repo slot_labels runner_group_id \
       jit_labels_json mint_jit delete_runner host_admissible
+    declare -f rate_limit_note rate_limit_left
     cat <<'EOF'
 
 idx="${1:-}"
@@ -3313,6 +3385,7 @@ unheld_now() {
 # -- that runner is busy until the agent exits.
 withdraw_idle() { # <id>
   [ "$(date +%s)" -ge "$retry_at" ] || return 1
+  [ "$(rate_limit_left)" = 0 ] || return 1
   delete_runner "$1" "$SLOT_REPO" && return 0
   retry_at=$(($(date +%s) + 60))
   return 1
@@ -3335,6 +3408,7 @@ while agent_up; do sleep 5; done
 rm -f -- "$ENVFILE"
 
 need_reset=1
+paused=0
 while :; do
   if [ "$need_reset" = 1 ]; then
     # Bounded, so one wedged docker call cannot hold the slot out of service for
@@ -3371,6 +3445,20 @@ while :; do
     need_reset=1
     continue
   fi
+
+  # GitHub's rate limit (#1672): no call until it resets. Slept in steps of at
+  # most 15s so drain and cordon are still read, and the last step carries up to
+  # a minute of jitter so a fleet's slots do not all ask in the same second the
+  # window reopens. Logged once per pause, not once per step.
+  rl=$(rate_limit_left)
+  if [ "$rl" -gt 0 ]; then
+    [ "$paused" = 1 ] || log "slot $idx: not registering -- GitHub's API rate limit for this App installation; resuming in ${rl}s"
+    paused=1
+    if [ "$rl" -gt 15 ]; then sleep 15; else sleep $((rl + RANDOM % 60)); fi
+    continue
+  fi
+  [ "$paused" = 1 ] && log "slot $idx: the rate-limit pause is over -- registering"
+  paused=0
 
   rm -f -- "$ENVFILE"
   unheld=$(unheld_now)
