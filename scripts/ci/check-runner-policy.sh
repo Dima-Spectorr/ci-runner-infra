@@ -62,9 +62,10 @@
 #              SHA (#1712; see "WHO THE FLEET LANE BELONGS TO").
 #     RUNNER19 the merge-lane call is not routed to a `-util` label, and its
 #              `with: runs-on:` is literal (a computed pool is undecidable).
-#     RUNNER20 a `-lane` job is not in a workflow a pull request triggers —
-#              `pull_request` or `pull_request_target`, its own or a local
-#              caller's (#1712).
+#     RUNNER20 a `-lane` job is in a workflow triggered ONLY by
+#              `workflow_run`, `schedule`, `workflow_dispatch` or
+#              `workflow_call` — its own triggers and every local caller's
+#              (an allowlist, #1712).
 #   (RUNNER12-14 are retired numbers and are not reused.)
 #
 # WHAT COUNTS AS REACHING THE FLEET
@@ -187,10 +188,12 @@
 #   - RUNNER19, the converse: the merge lane carries the merge App key, so its
 #     call is never routed to the shared gatekeeper host.
 #   - RUNNER20, the lane runs default-branch code on `workflow_run`, `schedule`
-#     or `workflow_dispatch`. A `-lane` job in a workflow a pull request
-#     triggers — `pull_request` or `pull_request_target`, its own trigger or a
-#     local caller's — runs a pull request's choice of code next to the merge
-#     key, so it is refused whatever its `if:` says (#1712).
+#     or `workflow_dispatch`. A `-lane` job in a workflow with any other
+#     trigger — `pull_request`, `pull_request_target`, `push` from any branch,
+#     `merge_group`, its own trigger or a local caller's — can run code that is
+#     not the default branch's next to the merge key, so it is refused whatever
+#     its `if:` says. An allowlist, so a trigger GitHub adds later is refused
+#     until someone decides otherwise (#1712).
 #
 # WHO THE FLEET LANE BELONGS TO (RUNNER18)
 #   Any account can create a repository named `ci-runner-infra`, so the name
@@ -382,6 +385,8 @@ ensure_yaml() {
 #   #PR                              a `pull_request`, `pull_request_review` or
 #                                    `pull_request_review_comment` trigger is present
 #   #PRTARGET                        a `pull_request_target` trigger is present
+#   #NONLANETRIG\t<name>             a trigger outside workflow_run, schedule,
+#                                    workflow_dispatch and workflow_call (RUNNER20)
 #   #CALLINPUTREQ\t<name>            a `workflow_call` input declared REQUIRED
 #   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>`
 #   #JOB\t<id>                       a job exists (or one resolved matrix leg,
@@ -452,6 +457,13 @@ if ("pull_request" in names or "pull_request_review" in names
     out("#PR")
 if "pull_request_target" in names:
     out("#PRTARGET")
+# RUNNER20 is an ALLOWLIST, not a list of bad triggers: the lane host runs
+# default-branch code, and only these four triggers guarantee that. `push` from
+# any branch, `merge_group` (the queued pull requests' YAML), `issue_comment`
+# and every trigger GitHub adds later are refused by default (#1712).
+for _n in names:
+    if _n not in ("workflow_run", "schedule", "workflow_dispatch", "workflow_call"):
+        out("#NONLANETRIG", _n)
 
 # The `workflow_call` inputs this file declares REQUIRED. RUNNER9 reads them:
 # a callee whose `runs-on` resolves from an input is pinned by its CALLER, and
@@ -1127,6 +1139,10 @@ REACHABLE_PR_ANY=""
 # call, guarded or not (#1696). RUNNER16 asks it: a callee declares only
 # `workflow_call`, yet runs with its caller's base-repository secrets.
 REACHABLE_PRTARGET=""
+# Files a workflow with a trigger outside the lane's four reaches through ANY
+# local `uses:` call (#1712). RUNNER20 asks it: a callee runs with its caller's
+# trigger, so a `workflow_call` file is only as default-branch as its callers.
+REACHABLE_NONLANE=""
 # A `timeout-minutes` at or above this bounds nothing GitHub was not already
 # bounding. Overridable downwards by a consumer whose queue expires sooner.
 MAX_TIMEOUT=360
@@ -1499,6 +1515,12 @@ check_file() {
   if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr_any=1
   fi
+  # RUNNER20's allowlist: any trigger outside the lane's four, own or a caller's.
+  local has_nonlane=0
+  if [ "$(printf '%s\n' "$records" | grep -c '^#NONLANETRIG	')" -gt 0 ] ||
+     printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
+    has_nonlane=1
+  fi
 
   local job job_re
   while IFS= read -r job; do
@@ -1753,10 +1775,12 @@ EOF
       if [ "$lane_host" -eq 1 ] && [ "$merge_lane_call" -eq 0 ]; then
         err RUNNER18 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) but is not the call to the fleet's merge-lane reusable workflow${lane_why} — that host exists for the merge lane alone (use the -util label for a gatekeeper job, or the pool label)"
       fi
-      # RUNNER20 — and never from a pull request: the lane runs default-branch
-      # code on workflow_run, schedule or dispatch (#1712).
-      if [ "$lane_host" -eq 1 ] && [ "$has_pr_any" -eq 1 ]; then
-        err RUNNER20 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) in a workflow a pull request triggers (pull_request or pull_request_target, its own or a local caller's) — the lane host holds the merge App key and runs default-branch code on workflow_run, schedule or workflow_dispatch only (docs/adr-utility-host.md)"
+      # RUNNER20 — and only on the lane's own triggers, an allowlist: the lane
+      # runs default-branch code on workflow_run, schedule or dispatch (#1712).
+      # Every pull-request trigger is outside the four, and REACHABLE_NONLANE
+      # walks the same CALL_EDGES as REACHABLE_PR_ANY, so has_nonlane covers it.
+      if [ "$lane_host" -eq 1 ] && [ "$has_nonlane" -eq 1 ]; then
+        err RUNNER20 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) in a workflow with a trigger other than workflow_run, schedule, workflow_dispatch or workflow_call (its own or a local caller's: pull_request, push, merge_group, …) — the lane host holds the merge App key and runs default-branch code on workflow_run, schedule or workflow_dispatch only (docs/adr-utility-host.md)"
       fi
       # RUNNER19 — and the merge lane stays off the gatekeeper host.
       if [ "$util_host" -eq 1 ] && [ "$merge_lane_any" -eq 1 ]; then
@@ -2038,7 +2062,7 @@ EOF
 # which this gate does not have; that limitation is named in RUNNER7 rather than
 # assumed away.
 compute_reachable() {
-  local f records seed="" prt_seed="" edges="" caller target changed=1 line _cjob
+  local f records seed="" prt_seed="" nl_seed="" edges="" caller target changed=1 line _cjob
   # Reset, because RUNNER10 reads it and the self-test drives the pass more than
   # once in a single process: edges left over from the previous fixture would be
   # counted against the next one's owners.
@@ -2061,6 +2085,9 @@ compute_reachable() {
     fi
     if [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
       prt_seed="$prt_seed$f"$'\n'
+    fi
+    if [ "$(printf '%s\n' "$records" | grep -c '^#NONLANETRIG	')" -gt 0 ]; then
+      nl_seed="$nl_seed$f"$'\n'
     fi
     # An edge carries its CALLER JOB, because a guard on the calling job is a
     # guard on everything that job reaches: `if: …fork == false` on the `uses:`
@@ -2132,6 +2159,22 @@ EOF
       printf '%s\n' "$REACHABLE_PRTARGET" | grep -cxF -- "$caller" >/dev/null || continue
       printf '%s\n' "$REACHABLE_PRTARGET" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PRTARGET="$REACHABLE_PRTARGET$target"$'\n'
+      changed=1
+    done <<EOF
+$CALL_EDGES
+EOF
+  done
+
+  # …and from every file with a trigger outside the lane's four, for RUNNER20.
+  REACHABLE_NONLANE="$nl_seed"
+  changed=1
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while IFS=$'\t' read -r target caller _cjob; do
+      [ -n "${caller:-}" ] || continue
+      printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$target" >/dev/null && continue
+      REACHABLE_NONLANE="$REACHABLE_NONLANE$target"$'\n'
       changed=1
     done <<EOF
 $CALL_EDGES
@@ -2921,7 +2964,7 @@ jobs:
   # RUNNER18: a gatekeeper on the lane host. RUNNER2 accepts `<scope>-lane`, so
   # RUNNER18 is the only id — and RUNNER2 joins it if that acceptance regresses.
   expect "a step job on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
@@ -2930,7 +2973,7 @@ jobs:
 
   # Case-insensitively, as `-util` is.
   expect "the -lane suffix is matched case-insensitively" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-LANE]
@@ -2947,7 +2990,7 @@ jobs:
     steps: [{run: "true"}]'
 
   expect "another reusable workflow on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3052,6 +3095,45 @@ jobs:
     with:
       runs-on: ExampleRepo-lane'
 
+  # RUNNER20 is an allowlist: `push` (any branch's YAML) and `merge_group` (the
+  # queued pull requests' YAML) are refused although neither is a pull_request.
+  expect "the merge-lane call on push is refused" "RUNNER20" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  expect "the merge-lane call on merge_group is refused" "RUNNER20" "ExampleRepo" blocked \
+'on:
+  merge_group:
+  schedule:
+    - cron: "*/15 * * * *"
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # …and the lane's own four triggers together are clean.
+  expect "the merge-lane call on its own four triggers is clean" "" "ExampleRepo" blocked \
+'on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
   # …and RUNNER20 is a `-lane` rule: a gatekeeper on `-util` runs on a pull
   # request by design.
   expect "a -util job on pull_request is not RUNNER20" "" "ExampleRepo" blocked \
@@ -3084,7 +3166,7 @@ jobs:
       runs-on: [self-hosted, linux, gcp, OtherRepo-lane]'
 
   expect "a -lane job with services: is refused" "RUNNER15 RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
@@ -3105,7 +3187,7 @@ jobs:
   # A slot named inside an expression is still read: a `uses:` job has no
   # `runs-on` of its own, so nothing else would ever look at it.
   expect "a slot inside a with: expression is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3204,7 +3286,7 @@ jobs:
       runs-on: '"'"'["self-hosted", "ExampleRepo\u002dutil"]'"'"''
 
   expect "a -lane slot spelled with a JSON escape is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3240,7 +3322,7 @@ jobs:
       runs-on: ExampleRepo-lane'
 
   expect "a built -lane slot on another call is RUNNER18" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3249,7 +3331,7 @@ jobs:
 
   # Any input, not only `runs-on`, and inside a JSON object.
   expect "a -lane slot in another input is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml

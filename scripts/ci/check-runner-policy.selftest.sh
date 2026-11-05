@@ -408,17 +408,21 @@ mutate "RUNNER17 asked of -util only again" \
 mutate "RUNNER17 no longer asked of -util" \
   's@if { \[ "$util_host" -eq 1 \] || \[ "$lane_host" -eq 1 \]; } && \[ "$forks"@if [ "$lane_host" -eq 1 ] \&\& [ "$forks"@'
 
-# RUNNER20 (#1712): a -lane job reachable from a pull request. Never
-# reported, judged on the gatekeeper host instead, or on the file's own
-# trigger only (a local callee of a pull_request caller escapes).
+# RUNNER20 (#1712): a -lane job in a workflow with a trigger outside
+# workflow_run/schedule/workflow_dispatch/workflow_call. Never reported, judged
+# on the gatekeeper host instead, blind to a local caller's trigger (a callee of
+# a pull_request caller escapes), or a denylist again (push and merge_group
+# escape).
 mutate "the RUNNER20 diagnostic never emitted" \
   's@ err RUNNER20 @ : RUNNER20 @'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "RUNNER20 judged on the -util host instead" \
-  's@if \[ "$lane_host" -eq 1 \] && \[ "$has_pr_any" -eq 1 \]; then@if [ "$util_host" -eq 1 ] \&\& [ "$has_pr_any" -eq 1 ]; then@'
+  's@if \[ "$lane_host" -eq 1 \] && \[ "$has_nonlane" -eq 1 \]; then@if [ "$util_host" -eq 1 ] \&\& [ "$has_nonlane" -eq 1 ]; then@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "RUNNER20 reads the file's own trigger only" \
-  's@if \[ "$lane_host" -eq 1 \] && \[ "$has_pr_any" -eq 1 \]; then@if [ "$lane_host" -eq 1 ] \&\& [ "$has_own_pr" -eq 1 ]; then@'
+mutate "RUNNER20 never crosses a local call" \
+  's@REACHABLE_NONLANE="$REACHABLE_NONLANE$target"@:@'
+mutate "RUNNER20 is a denylist again: push and merge_group pass" \
+  's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
 # The utility-host arms widened to every job: a pool job with `container:` —
 # how the Linux pool is meant to be used — goes red.
@@ -655,8 +659,9 @@ CASES="$(case_list | wc -l)"
 # (`-util` and `-lane`, #1635). Ratcheted to 65, the count the list actually
 # yields, with the three host-label cases (#1703) — it had drifted ten below.
 # 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
-# its two suffixes (+2) in place of the "asked of -lane too" case (-1).
-FLOOR=76
+# its two suffixes (+2) in place of the "asked of -lane too" case (-1). 77 when
+# RUNNER20 became an allowlist (+1, the denylist case).
+FLOOR=77
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
