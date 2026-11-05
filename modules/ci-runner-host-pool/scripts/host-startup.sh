@@ -3283,9 +3283,10 @@ install_slot_loop() {
     printf 'LOG_TAG=ci-slot-loop\n'
     declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET RUNNER_GROUP HOSTNAME_SHORT \
       LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS \
-      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR GH_RATE_FILE
+      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR
     declare -f log safe_for_log md gh_token slot_field slot_repo slot_labels runner_group_id \
       jit_labels_json mint_jit delete_runner host_admissible
+    declare -p GH_RATE_FILE
     declare -f rate_limit_note rate_limit_left
     cat <<'EOF'
 

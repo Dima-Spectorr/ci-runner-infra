@@ -2127,6 +2127,8 @@ withdraw_backs_off() { # <file>
     date() { echo "$t"; }
     # shellcheck disable=SC2317,SC2329  # called by the eval'd withdraw_idle
     delete_runner() { calls=$((calls + 1)); return "$answer"; }
+    # shellcheck disable=SC2317,SC2329  # no rate-limit pause in this test (#1672)
+    rate_limit_left() { printf 0; }
     withdraw_idle 7 && exit 1                        # GitHub refuses
     [ "$calls" = 1 ] || exit 1
     t=1030; withdraw_idle 7 && exit 1                # inside the minute: no call
@@ -3284,7 +3286,7 @@ mutate "the loop sleeps without jitter"  's@sleep \$((rl + RANDOM % 60))@sleep "
 mutate "a mint records nothing"          '0,/403 | 429) rate_limit_note/s@403 | 429) rate_limit_note@403 | 429) false@' rate_limit_pause_behaves
 mutate "the slot loop lacks the helpers" 's@^    declare -f rate_limit_note rate_limit_left$@    :@' rate_limit_pause_behaves
 mutate "an idle withdraw ignores the pause" 's@^  \[ "\$(rate_limit_left)" = 0 \] || return 1$@  :@' rate_limit_pause_behaves
-mutate "the loop is not told where the pause lives" 's@SLOT_BINDING_DIR GH_RATE_FILE$@SLOT_BINDING_DIR@' rate_limit_pause_behaves
+mutate "the loop is not told where the pause lives" 's@^    declare -p GH_RATE_FILE$@    :@' rate_limit_pause_behaves
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
