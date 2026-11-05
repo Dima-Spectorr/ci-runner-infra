@@ -93,7 +93,7 @@ variable "runner_version" {
   # deprecated and cannot receive messages" — so the pool looks healthy while
   # every slot is offline. Bump this and rebuild the image; --disableupdate
   # means the host never self-heals.
-  default     = "2.336.0"
+  default     = "2.338.2"
 }
 
 variable "source_image_family" {
