@@ -1830,14 +1830,14 @@ the_wait_for_an_answer_is_bounded() {
 # Measured on a consumer, where a 6-14 minute health job answers for a `main`
 # that advances every 2-16 and the lane merged nothing for a working day.
 #
-# HALF AN HOUR BY DEFAULT, AND 0 STILL MEANS OFF (#1705). It was opt-in until
-# 2026-11-05; every repository that outran its health job had to discover that
-# by stalling, and the two that did both chose 1800. The `-gt 0` guard is what
-# keeps an explicit 0 meaning "only the tip's own answer counts".
-the_staleness_window_defaults_to_half_an_hour() {
+# OFF UNLESS ASKED FOR, AND 0 MEANS OFF. Re-weighed and kept on 2026-11-05
+# (#1705): on a quiet base the tip answers inside the grace, and that wait is
+# what catches two pull requests green alone and broken together. The `-gt 0`
+# guard is what makes 0 mean "only the tip's own answer counts".
+the_staleness_window_is_off_by_default() {
   local code
   code=$(code_of "$1")
-  matches "$code" '^BASE_HEALTH_MAX_STALENESS="\$\{BASE_HEALTH_MAX_STALENESS:-1800\}"$' || return 1
+  matches "$code" '^BASE_HEALTH_MAX_STALENESS="\$\{BASE_HEALTH_MAX_STALENESS:-0\}"$' || return 1
   matches "$code" '\[ "\$BASE_HEALTH_MAX_STALENESS" -gt 0 \]'
 }
 
@@ -1984,7 +1984,7 @@ input_default_of() { # <file> <input-name>
   awk -v k="      $2:" '$0 == k {f=1; next} f && /^      [a-z]/ {exit} f && /^        default:/ {sub(/^        default: */, ""); print; exit}' "$1"
 }
 the_callee_defaults_match_the_driver() {
-  [ "$(input_default_of "$1" base-health-max-staleness-seconds)" = 1800 ] || return 1
+  [ "$(input_default_of "$1" base-health-max-staleness-seconds)" = 0 ] || return 1
   [ "$(input_default_of "$1" base-health-max-hops)" = 50 ]
 }
 
@@ -2127,14 +2127,14 @@ echo "merge-lane self-test:"
 check waits_for_the_tip_between_merges "$DRIVER" "a batch keeps merging after the first merge without re-reading the base, so two pull requests that are green alone and broken together bury the rest of the backlog on top of the break"
 check waits_for_the_tip_at_the_top_of_a_pass "$DRIVER" "only the batch waits for the tip to answer, so the run loop's next pass merges onto it anyway and the rule is undone by the loop around it"
 check the_wait_for_an_answer_is_bounded "$DRIVER" "the lane waits for a base-health answer with no ceiling, so a health job cancelled by its own successor stalls the lane hardest on the busiest base"
-check the_staleness_window_defaults_to_half_an_hour "$DRIVER" "the staleness window lost its half-hour default or its off switch, so armed bases either wait out the grace and merge on no answer, or cannot turn the window off"
+check the_staleness_window_is_off_by_default "$DRIVER" "the staleness window is on for every repository by default, or 0 no longer turns it off, so armed bases get a relaxed base-health gate none of them asked for"
 check the_staleness_window_closes_after_the_lane_merges "$DRIVER" "an ancestor's answer vouches for a tip the lane itself just created, which undoes the between-merges gate through the window and lets a batch pile onto a semantic conflict"
 check a_red_ancestor_inside_the_window_halts_the_lane "$DRIVER" "the walk searches past a red ancestor for an older green one, so a base that is broken and has said so reads as vouched"
 check the_window_walk_is_bounded "$DRIVER" "the ancestor walk is unbounded in age or in hops, so any green commit in history vouches for the tip, or a pass is spent at two check reads per commit proving nothing answered"
 check passes_the_staleness_window_to_the_driver "$CALLEE" "the workflow declares the staleness window but never hands it to the driver, so a repository that sets it watches the lane go on halting with no way to tell which end is wrong"
 check passes_the_hop_cap_to_the_driver "$CALLEE" "the workflow declares base-health-max-hops but never hands it to the driver, so a repository that raises it still stops at five and keeps halting"
 check the_hop_cap_defaults_to_fifty_and_is_bounded "$DRIVER" "the hop cap fell below fifty so it ends the walk before the clock does, or accepts a value past the one-page history read, so the walk silently reads fewer commits than it was told to"
-check the_callee_defaults_match_the_driver "$CALLEE" "the workflow's base-health-max-staleness-seconds or base-health-max-hops default is not 1800/50, so the fleet default the driver documents never reaches a caller"
+check the_callee_defaults_match_the_driver "$CALLEE" "the workflow's base-health-max-staleness-seconds or base-health-max-hops default is not 0/50, so the default the driver documents never reaches a caller"
 check the_newer_incomplete_hold_is_bounded "$DRIVER" "the hold on a later unfinished suite of the same app has no ceiling, so one suite that never completes holds every required name of that app pending for as long as the head sha lives while the ruleset itself is satisfied"
 check the_bound_can_only_decline_the_downgrade "$DRIVER" "the staleness escape sits outside the branch that only a surviving success reaches, so a bound meant to decline one downgrade can turn a red, absent or genuinely pending check into a pass"
 check the_bound_reads_the_newest_holding_suite "$DRIVER" "the hold expires on the oldest holding suite or on a suite whose creation time could not be read, so a suite created seconds ago is walked past and the #955 405 comes back with a timer on it"
@@ -2647,14 +2647,14 @@ mutate "a green base skips the wait as if it were red" "$DRIVER" \
   's@^  if \[ -z "\$LANE_BASE_RED" \] && @  if [ -n "$LANE_BASE_RED" ] \&\& @' waits_for_the_tip_at_the_top_of_a_pass
 mutate "the wait for a base-health answer loses its ceiling" "$DRIVER" \
   's@^  if \[ "\$age" -ge "\$BASE_HEALTH_GRACE" \]; then$@  if false; then@' the_wait_for_an_answer_is_bounded
-mutate "the staleness window goes back to off-by-default" "$DRIVER" \
-  's@^BASE_HEALTH_MAX_STALENESS=.*$@BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"@' the_staleness_window_defaults_to_half_an_hour
+mutate "the staleness window becomes on-by-default for the whole fleet" "$DRIVER" \
+  's@^BASE_HEALTH_MAX_STALENESS=.*$@BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-1800}"@' the_staleness_window_is_off_by_default
 mutate "an explicit 0 no longer turns the window off" "$DRIVER" \
-  's@\[ "\$BASE_HEALTH_MAX_STALENESS" -gt 0 \]@true@g' the_staleness_window_defaults_to_half_an_hour
+  's@\[ "\$BASE_HEALTH_MAX_STALENESS" -gt 0 \]@true@g' the_staleness_window_is_off_by_default
 mutate "the hop cap goes back to five" "$DRIVER" \
   's@^BASE_HEALTH_MAX_HOPS=.*$@BASE_HEALTH_MAX_HOPS="${BASE_HEALTH_MAX_HOPS:-5}"@' the_hop_cap_defaults_to_fifty_and_is_bounded
-mutate "the workflow keeps the window off while the driver turns it on" "$CALLEE" \
-  '/^      base-health-max-staleness-seconds:$/,/^        default:/s@^        default: .*$@        default: 0@' the_callee_defaults_match_the_driver
+mutate "the workflow turns the window on for the whole fleet" "$CALLEE" \
+  '/^      base-health-max-staleness-seconds:$/,/^        default:/s@^        default: .*$@        default: 1800@' the_callee_defaults_match_the_driver
 mutate "the workflow keeps five hops while the driver walks fifty" "$CALLEE" \
   '/^      base-health-max-hops:$/,/^        default:/s@^        default: .*$@        default: 5@' the_callee_defaults_match_the_driver
 mutate "the window stays open after the lane has merged" "$DRIVER" \

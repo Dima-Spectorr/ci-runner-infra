@@ -1759,15 +1759,14 @@ Two consequences worth stating plainly:
   with no `merge:ready` line above it, which is also exactly what an idle,
   healthy lane says. If a repository's lane has never merged anything, read the
   `lane:` notices, not the run conclusion.
-- **The fix for that is `base-health-max-staleness-seconds` (default `1800`;
-  `0` turns it off).** Non-zero lets a green answer on a recent *ancestor* vouch
-  for a tip that has not answered yet, which is the question the gate actually
-  asks — is the base broken right now. A sane value is a small multiple of how
-  long the health job takes; half an hour covers every health job in the fleet,
-  so a repository sets it only for a slower one. It was opt-in until 2026-11-05
-  (#1705): each repository that outran its health job found out by stalling, and
-  the two that did both chose 1800. Opt-in never made the others stricter — see
-  the last paragraph of this item — only slower.
+- **The fix for that is `base-health-max-staleness-seconds` (default `0`, off).**
+  Non-zero lets a green answer on a recent *ancestor* vouch for a tip that has
+  not answered yet, which is the question the gate actually asks — is the base
+  broken right now. Set it to a small multiple of how long the health job takes.
+  It is deliberately opt-in. A fleet default was weighed and refused on
+  2026-11-05 (#1705): on a quiet base the tip's own answer arrives inside the
+  grace, and that wait is what catches two pull requests green alone and broken
+  together. Only a base whose tip never answers in time gains from the window.
 
   What it relaxes is narrow, and each bound is enforced by the self-test rather
   than by this paragraph. The window is consulted **only** when the tip reads
@@ -1867,7 +1866,7 @@ throughput argument is not enough to buy it back.
 |---|---|---|---|
 | 1 | Do nothing | no | The ceiling sits above the normal arrival rate, but it bites exactly when it hurts — once a backlog has already formed. |
 | 2 | **Make the health job itself faster** | **yes** | Gives up no safety at all: every merge still waits for a fresh green answer on the tip it is landing on. Only the answer arrives sooner. |
-| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | yes, fleet default since 2026-11-05 | Lets an *ancestor's* answer vouch for a tip nothing has answered for. Opt-in per repository until #1705; it replaces only the merge-unvouched fallback, so opting out was slower, not safer. |
+| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | no, but available | Lets an *ancestor's* answer vouch for a tip nothing has answered for. Deliberately **opt-in per repository**: on a quiet base the wait for the tip's own answer is what catches two pull requests green alone and broken together (re-weighed and kept in #1705). |
 | 4 | Merge a batch, then health-check once | no | Largest gain, largest blast radius: a batch that breaks the base implicates several pull requests at once and makes bisection harder. That guarantee is the reason the gate exists, so spending it for cadence is the one trade this design refuses. |
 
 **What option 2 actually was, and the prediction it has to answer for.** The

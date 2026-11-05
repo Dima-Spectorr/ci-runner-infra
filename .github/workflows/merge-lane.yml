@@ -138,12 +138,11 @@ on:
       base-health-max-staleness-seconds:
         description: >-
           How old a base-health answer may be and still vouch for a tip that has
-          not answered yet. 1800 (half an hour) by default since 2026-11-05;
-          `0` means only the tip's own answer counts -- the rule the gate
-          shipped with.
+          not answered yet. `0`, the default, means only the tip's own answer
+          counts -- the rule the gate shipped with.
 
 
-          It matters on a base that moves faster than its health job answers. The
+          Set it on a base that moves faster than its health job answers. The
           grace above bounds the wait for ONE tip and nothing bounds the
           sequence: the clock is keyed to the tip's commit date, so every merge
           restarts it and the lane holds forever while the base moves the whole
@@ -163,11 +162,12 @@ on:
 
 
           A sane value is a small multiple of how long the health job takes.
-          Much larger and it is a fail-open with extra steps. The default
-          covers health jobs of up to ~25 minutes, which is the whole fleet;
-          set it only for a slower one.
+          Much larger and it is a fail-open with extra steps. Not a fleet
+          default (#1705): on a quiet base the tip answers inside the grace,
+          and that wait is what catches two pull requests green alone and
+          broken together.
         required: false
-        default: 1800
+        default: 0
         type: number
       base-health-max-hops:
         description: >-

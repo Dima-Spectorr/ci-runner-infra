@@ -390,14 +390,14 @@ BASE_HEALTH_GRACE="${BASE_HEALTH_GRACE:-900}"
 # Apigee-Portal incident the batch gate was added for. An ancestor's answer
 # predates that merge by definition, so it is not allowed to speak for it.
 #
-# HALF AN HOUR BY DEFAULT SINCE 2026-11-05, NO LONGER OPT-IN (#1705). It was 0
-# so that one repository outrunning its health job would not relax the gate on
-# the others. But the window replaces only the fail-open fallback above, so a
-# repository without it was not stricter, only slower: it waited out the grace
-# and then merged on no answer at all. The two repositories that needed it each
-# had to find that out by stalling, and both settled on 1800. `0` still turns
-# it off for a repository that asks.
-BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-1800}"
+# STILL OPT-IN, DECIDED AGAIN 2026-11-05 (#1705). A fleet default of 1800 was
+# considered and refused: on a quiet base the tip's own answer arrives inside
+# the grace, and that wait is what catches two pull requests green alone and
+# broken together. The window would merge on an ancestor's answer instead. It
+# earns its keep only where the tip never answers in time, and those bases set
+# it. The hop cap below is different: a cost cap only, so its default could
+# change for everyone.
+BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
 
 # How far back the window will walk, whatever the clock allows. Each ancestor
 # costs two paginated check reads, so an unbounded walk on a base nothing has
