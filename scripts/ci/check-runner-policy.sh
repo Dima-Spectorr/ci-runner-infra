@@ -9,6 +9,7 @@
 #                                          [--max-timeout=<minutes>]
 #                                          [--allow-dynamic-runner]
 #                                          [--shared-infra]
+#                                          [--lane-owner=<owner>]
 #                                          [<file>...]
 #
 # PURPOSE
@@ -54,10 +55,17 @@
 #
 #     RUNNER15 the job declares no `container:` and no `services:` (#1643).
 #     RUNNER16 the workflow is not triggered by `pull_request_target`.
-#     RUNNER17 a `-util` job: the run declares `--forks=blocked` (#1649).
-#     RUNNER18 a `-lane` job IS the call to the fleet's merge-lane workflow.
+#     RUNNER17 the run declares `--forks=blocked` (#1649), for `-util` and
+#              `-lane` alike (#1712).
+#     RUNNER18 a `-lane` job IS the call to the fleet's merge-lane workflow:
+#              the fleet owner's `ci-runner-infra`, pinned by a full commit
+#              SHA (#1712; see "WHO THE FLEET LANE BELONGS TO").
 #     RUNNER19 the merge-lane call is not routed to a `-util` label, and its
 #              `with: runs-on:` is literal (a computed pool is undecidable).
+#     RUNNER20 a `-lane` job is in a workflow triggered ONLY by
+#              `workflow_run`, `schedule`, `workflow_dispatch` or
+#              `workflow_call` — its own triggers and every local caller's
+#              (an allowlist, #1712).
 #   (RUNNER12-14 are retired numbers and are not reused.)
 #
 # WHAT COUNTS AS REACHING THE FLEET
@@ -171,14 +179,40 @@
 #     DECLARATION — `--forks=blocked`, in the consuming workflow where it is
 #     reviewable — which is the same posture RUNNER4 already reads. A fork
 #     guard on the job does not answer it: the requirement is on the
-#     repository, and one unguarded job later is all it takes. Asked of `-util`
-#     only: RUNNER18 already keeps everything but the merge lane — which runs
-#     default-branch code on `workflow_run` — off a `-lane` host.
+#     repository, and one unguarded job later is all it takes. Asked of `-lane`
+#     too (#1712): that host holds the merge App key, so the repositories it
+#     serves need the posture at least as much as a gatekeeper's do.
 #   - RUNNER18, a `-lane` host runs the merge-lane call and nothing else: the
 #     job must `uses:` the fleet's REMOTE `merge-lane.yml` — a consumer's own
 #     `./…merge-lane.yml` is its own steps. Anything else belongs on `-util` or the pool.
 #   - RUNNER19, the converse: the merge lane carries the merge App key, so its
 #     call is never routed to the shared gatekeeper host.
+#   - RUNNER20, the lane runs default-branch code on `workflow_run`, `schedule`
+#     or `workflow_dispatch`. A `-lane` job in a workflow with any other
+#     trigger — `pull_request`, `pull_request_target`, `push` from any branch,
+#     `merge_group`, its own trigger or a local caller's — can run code that is
+#     not the default branch's next to the merge key, so it is refused whatever
+#     its `if:` says. An allowlist, so a trigger GitHub adds later is refused
+#     until someone decides otherwise (#1712).
+#
+# WHO THE FLEET LANE BELONGS TO (RUNNER18)
+#   Any account can create a repository named `ci-runner-infra`, so the name
+#   alone is not the fleet. The OWNER is read at run time, never written here
+#   (this gate ships to every customer's fleet): `--lane-owner=<owner>` if given
+#   — even empty — else `$GITHUB_REPOSITORY_OWNER`, which Actions sets in every
+#   run and which is the fleet's owner wherever the consumers live under the
+#   same owner as `ci-runner-infra`. A consumer under another owner passes the
+#   flag. Compared case-insensitively, as GitHub compares owners.
+#
+#   With no owner at all the gate FAILS CLOSED by refusing, not by erroring:
+#   no call counts as the fleet lane, so every `-lane` job is RUNNER18 and the
+#   message says why, while a repository with no `-lane` job — every one
+#   today — is unaffected. Never "any owner": that is the look-alike bypass.
+#
+#   The ref must be a full 40-character commit SHA. A tag or a branch moves
+#   under the caller after review, and this is the call that receives the merge
+#   App key. Every consumer pinned by SHA when this was added (31 callers,
+#   surveyed 2026-11-05), so nothing was asked to change.
 #
 #   A utility host also holds no shared stack, so RUNNER9 does not ask a
 #   `-util`/`-lane` job to pin to the anchor: pinning it would move it back onto
@@ -284,13 +318,40 @@ LANE_SUFFIX='-lane'
 # reusable workflow, remote only (`<owner>/ci-runner-infra/…@<ref>`). Matched
 # against the `uses:` target the reader reports. Not `./`: the gate runs in
 # every consumer, where `./.github/workflows/merge-lane.yml` is that
-# repository's own file with whatever steps it likes. The owner part stays
-# open; a remote callee still needs a reviewed `remote-reusable-allowed`
-# marker (RUNNER7), which is where a look-alike owner is caught.
-MERGE_LANE_CALL='^[^/]+/ci-runner-infra/\.github/workflows/merge-lane\.ya?ml(@.*)?$'
+# repository's own file with whatever steps it likes. The ref is a full commit
+# SHA; the owner part is matched open HERE and compared to LANE_OWNER by
+# `lane_owner_matches` — see "WHO THE FLEET LANE BELONGS TO" (#1712).
+LANE_REF_SHA='[0-9a-f]{40}'
+MERGE_LANE_CALL='^[^/]+/ci-runner-infra/\.github/workflows/merge-lane\.ya?ml@'"$LANE_REF_SHA"'$'
+# The fleet lane's owner, resolved once by main() (`resolve_lane_owner`); the
+# self-test sets its own. Empty means unknown, and unknown refuses.
+LANE_OWNER=""
 # Any merge-lane call, local included: arms RUNNER19 (never on `-util`, never
 # a computed runs-on). A local lane may still carry the merge App key.
 MERGE_LANE_CALL_ANY='^([^/]+/ci-runner-infra/|\./)\.github/workflows/merge-lane\.ya?ml(@.*)?$'
+
+# resolve_lane_owner <flag-given 0|1> <flag-value> — print the fleet lane's
+# owner: the flag when given (an explicit empty value stays empty, so it
+# refuses rather than falling back), else the Actions-provided owner.
+resolve_lane_owner() {
+  local given="$1" value="$2"
+  if [ "$given" -eq 1 ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  printf '%s' "${GITHUB_REPOSITORY_OWNER:-}"
+}
+
+# lane_owner_matches <owner> — 0 when <owner> is the fleet lane's owner.
+# Unknown owner matches nothing (fail closed); GitHub owners compare
+# case-insensitively.
+lane_owner_matches() {
+  [ -n "$LANE_OWNER" ] || return 1
+  local want got
+  want="$(printf '%s' "$LANE_OWNER" | tr '[:upper:]' '[:lower:]')"
+  got="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [ "$got" = "$want" ]
+}
 
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
@@ -324,6 +385,8 @@ ensure_yaml() {
 #   #PR                              a `pull_request`, `pull_request_review` or
 #                                    `pull_request_review_comment` trigger is present
 #   #PRTARGET                        a `pull_request_target` trigger is present
+#   #NONLANETRIG\t<name>             a trigger outside workflow_run, schedule,
+#                                    workflow_dispatch and workflow_call (RUNNER20)
 #   #CALLINPUTREQ\t<name>            a `workflow_call` input declared REQUIRED
 #   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>`
 #   #JOB\t<id>                       a job exists (or one resolved matrix leg,
@@ -394,6 +457,13 @@ if ("pull_request" in names or "pull_request_review" in names
     out("#PR")
 if "pull_request_target" in names:
     out("#PRTARGET")
+# RUNNER20 is an ALLOWLIST, not a list of bad triggers: the lane host runs
+# default-branch code, and only these four triggers guarantee that. `push` from
+# any branch, `merge_group` (the queued pull requests' YAML), `issue_comment`
+# and every trigger GitHub adds later are refused by default (#1712).
+for _n in names:
+    if _n not in ("workflow_run", "schedule", "workflow_dispatch", "workflow_call"):
+        out("#NONLANETRIG", _n)
 
 # The `workflow_call` inputs this file declares REQUIRED. RUNNER9 reads them:
 # a callee whose `runs-on` resolves from an input is pinned by its CALLER, and
@@ -1069,6 +1139,10 @@ REACHABLE_PR_ANY=""
 # call, guarded or not (#1696). RUNNER16 asks it: a callee declares only
 # `workflow_call`, yet runs with its caller's base-repository secrets.
 REACHABLE_PRTARGET=""
+# Files a workflow with a trigger outside the lane's four reaches through ANY
+# local `uses:` call (#1712). RUNNER20 asks it: a callee runs with its caller's
+# trigger, so a `workflow_call` file is only as default-branch as its callers.
+REACHABLE_NONLANE=""
 # A `timeout-minutes` at or above this bounds nothing GitHub was not already
 # bounding. Overridable downwards by a consumer whose queue expires sooner.
 MAX_TIMEOUT=360
@@ -1441,6 +1515,12 @@ check_file() {
   if [ "$has_pr_any" -eq 0 ] && printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
     has_pr_any=1
   fi
+  # RUNNER20's allowlist: any trigger outside the lane's four, own or a caller's.
+  local has_nonlane=0
+  if [ "$(printf '%s\n' "$records" | grep -c '^#NONLANETRIG	')" -gt 0 ] ||
+     printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
+    has_nonlane=1
+  fi
 
   local job job_re
   while IFS= read -r job; do
@@ -1455,7 +1535,7 @@ check_file() {
     local job_base="${job%%~leg*}"
 
     local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
-    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 merge_lane_any=0 call_target lane_runs_on_expr=0
+    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 merge_lane_any=0 call_target lane_runs_on_expr=0 lane_why=""
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     # "Every literal label is a GitHub-hosted image" is the reader's answer, not
     # a second opinion computed here — see `#HOSTEDONLY`.
@@ -1516,13 +1596,26 @@ EOF
     fi
     { [ "$util_host" -eq 1 ] || [ "$lane_host" -eq 1 ]; } && co_tenant=1
     call_target="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p; s/^#CALLS\t${job_re}\t//p" | head -1)"
+    # …and only the fleet owner's (#1712). `lane_why` says which half failed,
+    # so a refused lane names its fix.
     if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL" >/dev/null; then
-      merge_lane_call=1
+      if lane_owner_matches "${call_target%%/*}"; then
+        merge_lane_call=1
+      elif [ -z "$LANE_OWNER" ]; then
+        lane_why=" (the fleet lane's owner is unknown, so no call counts as it: pass --lane-owner=<owner>, or run where GITHUB_REPOSITORY_OWNER is set)"
+      else
+        lane_why=" (its owner '${call_target%%/*}' is not the fleet lane's owner '$LANE_OWNER')"
+      fi
     fi
     # RUNNER18 admits only the remote lane; RUNNER19 is armed for a local
     # `./…/merge-lane.yml` too, so a local lane is never routed to `-util`.
     if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL_ANY" >/dev/null; then
       merge_lane_any=1
+      case "$call_target" in
+        ./*) ;;
+        *) [ "$merge_lane_call" -eq 0 ] && [ -z "$lane_why" ] &&
+             lane_why=" (pin it by a full 40-character commit SHA, not a tag or a branch)" ;;
+      esac
       # The lane's pool can be read nowhere but here (its callee lives in
       # another repository), so a computed `runs-on` is undecidable: refused
       # below as RUNNER19 rather than trusted (#1635 re-review).
@@ -1674,12 +1767,20 @@ EOF
       if [ "$has_prtarget" -eq 1 ]; then
         err RUNNER16 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX} / *${LANE_SUFFIX}) in a workflow triggered by pull_request_target — that trigger runs with the base repository's secrets on a pull request anyone may open, and docs/adr-utility-host.md keeps every such workflow hosted"
       fi
-      if [ "$util_host" -eq 1 ] && [ "$forks" != "blocked" ]; then
-        err RUNNER17 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX}) but the run does not declare --forks=blocked — every repository bound to the utility host must have fork pull-request workflows disabled (docs/adr-utility-host.md), and that is declared here, where it is reviewable (#1649)"
+      # Every co-tenant suffix, `-lane` included (#1712).
+      if { [ "$util_host" -eq 1 ] || [ "$lane_host" -eq 1 ]; } && [ "$forks" != "blocked" ]; then
+        err RUNNER17 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX} / *${LANE_SUFFIX}) but the run does not declare --forks=blocked — every repository bound to a utility host must have fork pull-request workflows disabled (docs/adr-utility-host.md), and that is declared here, where it is reviewable (#1649, #1712)"
       fi
       # RUNNER18 — the lane host runs the merge lane and nothing else.
       if [ "$lane_host" -eq 1 ] && [ "$merge_lane_call" -eq 0 ]; then
-        err RUNNER18 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) but is not the call to the fleet's merge-lane reusable workflow — that host exists for the merge lane alone (use the -util label for a gatekeeper job, or the pool label)"
+        err RUNNER18 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) but is not the call to the fleet's merge-lane reusable workflow${lane_why} — that host exists for the merge lane alone (use the -util label for a gatekeeper job, or the pool label)"
+      fi
+      # RUNNER20 — and only on the lane's own triggers, an allowlist: the lane
+      # runs default-branch code on workflow_run, schedule or dispatch (#1712).
+      # Every pull-request trigger is outside the four, and REACHABLE_NONLANE
+      # walks the same CALL_EDGES as REACHABLE_PR_ANY, so has_nonlane covers it.
+      if [ "$lane_host" -eq 1 ] && [ "$has_nonlane" -eq 1 ]; then
+        err RUNNER20 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) in a workflow with a trigger other than workflow_run, schedule, workflow_dispatch or workflow_call (its own or a local caller's: pull_request, push, merge_group, …) — the lane host holds the merge App key and runs default-branch code on workflow_run, schedule or workflow_dispatch only (docs/adr-utility-host.md)"
       fi
       # RUNNER19 — and the merge lane stays off the gatekeeper host.
       if [ "$util_host" -eq 1 ] && [ "$merge_lane_any" -eq 1 ]; then
@@ -1961,7 +2062,7 @@ EOF
 # which this gate does not have; that limitation is named in RUNNER7 rather than
 # assumed away.
 compute_reachable() {
-  local f records seed="" prt_seed="" edges="" caller target changed=1 line _cjob
+  local f records seed="" prt_seed="" nl_seed="" edges="" caller target changed=1 line _cjob
   # Reset, because RUNNER10 reads it and the self-test drives the pass more than
   # once in a single process: edges left over from the previous fixture would be
   # counted against the next one's owners.
@@ -1984,6 +2085,9 @@ compute_reachable() {
     fi
     if [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
       prt_seed="$prt_seed$f"$'\n'
+    fi
+    if [ "$(printf '%s\n' "$records" | grep -c '^#NONLANETRIG	')" -gt 0 ]; then
+      nl_seed="$nl_seed$f"$'\n'
     fi
     # An edge carries its CALLER JOB, because a guard on the calling job is a
     # guard on everything that job reaches: `if: …fork == false` on the `uses:`
@@ -2060,6 +2164,22 @@ EOF
 $CALL_EDGES
 EOF
   done
+
+  # …and from every file with a trigger outside the lane's four, for RUNNER20.
+  REACHABLE_NONLANE="$nl_seed"
+  changed=1
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while IFS=$'\t' read -r target caller _cjob; do
+      [ -n "${caller:-}" ] || continue
+      printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_NONLANE" | grep -cxF -- "$target" >/dev/null && continue
+      REACHABLE_NONLANE="$REACHABLE_NONLANE$target"$'\n'
+      changed=1
+    done <<EOF
+$CALL_EDGES
+EOF
+  done
 }
 
 # --- self-test ---------------------------------------------------------------
@@ -2076,14 +2196,19 @@ EOF
 selftest() {
   local tmp status=0
   tmp="$(mktemp -d)"
+  # The fixtures' fleet owner, whatever the environment says: a self-test that
+  # read GITHUB_REPOSITORY_OWNER would score differently per repository.
+  LANE_OWNER="Example-Owner"
 
   # Asserts the SET of check ids a fixture produces. A count would let one
   # detector's regression hide behind another firing on the same file.
+  # The 7th argument overrides the lane owner; `-` not `:-`, so an explicit
+  # empty one is the unknown-owner case.
   expect() {
-    local name="$1" want="$2" scope="$3" forks="$4" body="$5" dynamic="${6:-0}"
+    local name="$1" want="$2" scope="$3" forks="$4" body="$5" dynamic="${6:-0}" lane_owner="${7-Example-Owner}"
     local got out_text
     printf '%s\n' "$body" > "$tmp/wf.yml"
-    out_text="$(fail=0; ALLOW_DYNAMIC=$dynamic; check_file "$tmp/wf.yml" "$scope" "$forks" 2>&1)"
+    out_text="$(fail=0; ALLOW_DYNAMIC=$dynamic; LANE_OWNER=$lane_owner; check_file "$tmp/wf.yml" "$scope" "$forks" 2>&1)"
     got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
     got="$(printf '%s' "$got" | sed 's/ *$//')"
     if [ "$got" != "$want" ]; then
@@ -2802,9 +2927,9 @@ jobs:
 
   # --- the lane-only host: `<Repo>-lane` runs the merge lane and nothing else -
   # The main flow: the merge-lane call, remote and declared, handed its own
-  # `-lane` slot as the input's JSON-list string. Forks ALLOWED on purpose:
-  # RUNNER17 is a `-util` rule, and a lane host runs default-branch code only.
-  expect "the merge-lane call on its own -lane slot" "" "ExampleRepo" allowed \
+  # `-lane` slot as the input's JSON-list string, from the fleet owner's
+  # repository at a full SHA, with forks blocked (RUNNER17 asks `-lane` too).
+  expect "the merge-lane call on its own -lane slot" "" "ExampleRepo" blocked \
 'on:
   workflow_run:
     workflows: [CI]
@@ -2839,7 +2964,7 @@ jobs:
   # RUNNER18: a gatekeeper on the lane host. RUNNER2 accepts `<scope>-lane`, so
   # RUNNER18 is the only id — and RUNNER2 joins it if that acceptance regresses.
   expect "a step job on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
@@ -2848,7 +2973,7 @@ jobs:
 
   # Case-insensitively, as `-util` is.
   expect "the -lane suffix is matched case-insensitively" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-LANE]
@@ -2865,7 +2990,7 @@ jobs:
     steps: [{run: "true"}]'
 
   expect "another reusable workflow on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -2873,14 +2998,151 @@ jobs:
       runs-on: ExampleRepo-lane'
 
   # A file NAMED merge-lane.yml in some other repository is not the fleet's.
+  # The fleet owner and a full SHA, so the repository name is the only thing
+  # wrong with it — the fixture the "any repository" mutant has to get past.
   expect "a look-alike merge-lane from another repository is refused" "RUNNER18" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:
   lane:
-    # remote-reusable-allowed(someone/other-infra/.github/workflows/merge-lane.yml, #1635): look-alike
-    uses: someone/other-infra/.github/workflows/merge-lane.yml@v1
+    # remote-reusable-allowed(Example-Owner/other-infra/.github/workflows/merge-lane.yml, #1635): look-alike
+    uses: Example-Owner/other-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
     with:
       runs-on: ExampleRepo-lane'
+
+  # #1712: a look-alike OWNER — `ci-runner-infra` under another account, at a
+  # full SHA — is not the fleet lane either.
+  expect "a look-alike owner's ci-runner-infra lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(evil/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): look-alike owner
+    uses: evil/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # GitHub owners are case-insensitive, so the fleet owner in another case IS
+  # the fleet owner.
+  expect "the lane owner is compared case-insensitively" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(example-owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: example-owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # With no owner known the gate refuses every lane rather than accept any
+  # owner: the main-flow call above, owner unknown, is RUNNER18.
+  expect "an unknown lane owner refuses the lane" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane' 0 ""
+
+  # The ref is a full commit SHA: a tag, a branch or a short SHA moves (or can
+  # be made to collide) after review.
+  expect "a tag-pinned merge-lane call on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@v5
+    with:
+      runs-on: ExampleRepo-lane'
+
+  expect "a branch-pinned merge-lane call on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@main
+    with:
+      runs-on: ExampleRepo-lane'
+
+  expect "a short-SHA merge-lane call on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # RUNNER17 asks `-lane` too (#1712): the main-flow call, forks allowed.
+  expect "a -lane merge-lane call without --forks=blocked is refused" "RUNNER17" "ExampleRepo" allowed \
+'on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # RUNNER20 (#1712): the lane never runs from a pull request. A uses: job has
+  # no runs-on of its own, so RUNNER4 is silent; forks blocked, so RUNNER17 is.
+  expect "the merge-lane call on pull_request is refused" "RUNNER20" "ExampleRepo" blocked \
+'on: [pull_request]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # RUNNER20 is an allowlist: `push` (any branch's YAML) and `merge_group` (the
+  # queued pull requests' YAML) are refused although neither is a pull_request.
+  expect "the merge-lane call on push is refused" "RUNNER20" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  expect "the merge-lane call on merge_group is refused" "RUNNER20" "ExampleRepo" blocked \
+'on:
+  merge_group:
+  schedule:
+    - cron: "*/15 * * * *"
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # …and the lane's own four triggers together are clean.
+  expect "the merge-lane call on its own four triggers is clean" "" "ExampleRepo" blocked \
+'on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # …and RUNNER20 is a `-lane` rule: a gatekeeper on `-util` runs on a pull
+  # request by design.
+  expect "a -util job on pull_request is not RUNNER20" "" "ExampleRepo" blocked \
+'on: [pull_request]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
 
   # RUNNER19: the lane stays off the gatekeeper host. Forks blocked, so
   # RUNNER17 cannot be what fires. The JSON-list string form, so this is also
@@ -2904,7 +3166,7 @@ jobs:
       runs-on: [self-hosted, linux, gcp, OtherRepo-lane]'
 
   expect "a -lane job with services: is refused" "RUNNER15 RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
@@ -2913,7 +3175,7 @@ jobs:
       db: {image: "postgres:16"}
     steps: [{run: "true"}]'
 
-  expect "the merge-lane call on pull_request_target is refused" "RUNNER16" "ExampleRepo" blocked \
+  expect "the merge-lane call on pull_request_target is refused" "RUNNER16 RUNNER20" "ExampleRepo" blocked \
 'on: [pull_request_target]
 jobs:
   lane:
@@ -2925,7 +3187,7 @@ jobs:
   # A slot named inside an expression is still read: a `uses:` job has no
   # `runs-on` of its own, so nothing else would ever look at it.
   expect "a slot inside a with: expression is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3024,7 +3286,7 @@ jobs:
       runs-on: '"'"'["self-hosted", "ExampleRepo\u002dutil"]'"'"''
 
   expect "a -lane slot spelled with a JSON escape is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3060,7 +3322,7 @@ jobs:
       runs-on: ExampleRepo-lane'
 
   expect "a built -lane slot on another call is RUNNER18" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3069,7 +3331,7 @@ jobs:
 
   # Any input, not only `runs-on`, and inside a JSON object.
   expect "a -lane slot in another input is read" "RUNNER18" "ExampleRepo" blocked \
-'on: [push]
+'on: [workflow_dispatch]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
@@ -3480,6 +3742,42 @@ jobs:
     runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
     timeout-minutes: 5
     steps: [{run: "true"}]'
+
+  # RUNNER20 crosses a local call too (#1712): the callee declares only
+  # `workflow_call`, and runs the lane on its pull_request caller's trigger.
+  # The pair runs with forks allowed, so RUNNER17 joins it.
+  expect_pair "a -lane callee of a pull_request caller is refused" "RUNNER17 RUNNER20" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # --- the lane owner's resolution (#1712) ------------------------------------
+  # The flag wins, even empty (an explicit empty refuses, never falls back);
+  # without it the Actions-provided owner is read. Never a literal.
+  expect_owner() {
+    local name="$1" want="$2" env_owner="$3" given="$4" value="$5" got
+    got="$(GITHUB_REPOSITORY_OWNER="$env_owner" resolve_lane_owner "$given" "$value")"
+    if [ "$got" != "$want" ]; then
+      echo "FAIL $name: want owner [$want], got [$got]"
+      status=1
+    else
+      echo "ok   $name [$want]"
+    fi
+  }
+  expect_owner "the --lane-owner flag beats the environment" "Flag-Owner" "Env-Owner" 1 "Flag-Owner"
+  expect_owner "without the flag the Actions owner is read" "Env-Owner" "Env-Owner" 0 ""
+  expect_owner "an explicit empty --lane-owner does not fall back" "" "Env-Owner" 1 ""
+  expect_owner "no flag and no environment is no owner" "" "" 0 ""
 
   # The same pair, judged the way the usage line documents: repository-relative
   # paths. Reachability keyed the caller by the string it was handed and the
@@ -4459,7 +4757,7 @@ shared_infra_owner_verdict() {
 
 # shellcheck disable=SC2031
 main() {
-  local scope="" forks="allowed" run_selftest=0
+  local scope="" forks="allowed" run_selftest=0 lane_owner_given=0 lane_owner_flag=""
   local -a files=()
   local arg
 
@@ -4471,7 +4769,8 @@ main() {
       --max-timeout=*) MAX_TIMEOUT="${arg#--max-timeout=}" ;;
       --allow-dynamic-runner) ALLOW_DYNAMIC=1 ;;
       --shared-infra) SHARED_INFRA=1 ;;
-      -*)         echo "::error::[RUNNER0] unknown option: $arg"; return 1 ;;
+      --lane-owner=*) lane_owner_given=1; lane_owner_flag="${arg#--lane-owner=}" ;;
+      -*)       echo "::error::[RUNNER0] unknown option: $arg"; return 1 ;;
       *)          files+=("$arg") ;;
     esac
   done
@@ -4480,6 +4779,14 @@ main() {
     allowed|blocked) ;;
     *) echo "::error::[RUNNER0] --forks must be 'allowed' or 'blocked', got '$forks'"; return 1 ;;
   esac
+
+  # RUNNER18's owner (#1712). Empty is allowed and refuses every lane; a value
+  # that cannot be a GitHub owner is a typo, and a typo must not read as clean.
+  LANE_OWNER="$(resolve_lane_owner "$lane_owner_given" "$lane_owner_flag")"
+  if [ -n "$LANE_OWNER" ] && ! printf '%s' "$LANE_OWNER" | grep -cE '^[A-Za-z0-9][A-Za-z0-9-]*$' >/dev/null; then
+    echo "::error::[RUNNER0] the lane owner must be a GitHub owner name, got '$LANE_OWNER'"
+    return 1
+  fi
 
   if ! printf '%s' "$MAX_TIMEOUT" | grep -cE '^[1-9][0-9]*$' >/dev/null; then
     echo "::error::[RUNNER0] --max-timeout must be a positive integer, got '$MAX_TIMEOUT'"

@@ -120,6 +120,13 @@ gatekeeper host and a gatekeeper never lands on the lane host.
   between 14:11 and 14:27Z.
 - **Still never on either host:** `merge-lane-events`, `merge-lane-review-relay`,
   `branch-reaper-self`, and anything triggered by `pull_request_target`.
+- **Gate (`check-runner-policy.sh`, #1712):** a `-lane` job must be the merge-lane call
+  from the fleet owner's `ci-runner-infra`, pinned by a full commit SHA (RUNNER18; the
+  owner comes from `--lane-owner` or `GITHUB_REPOSITORY_OWNER`, never a literal, and an
+  unknown owner refuses every lane). It runs only in a workflow triggered by `workflow_run`,
+  `schedule`, `workflow_dispatch` or `workflow_call`, directly and through every local
+  caller; any other trigger (`pull_request`, `push`, `merge_group`, …) is refused (RUNNER20), and its
+  repository declares `--forks=blocked` exactly as a `-util` repository does (RUNNER17).
 - **Preconditions:** #1640 (repository tokens in `curl` argv) is fixed (#1692). #1694
   must also be fixed before any lane job moves: the host has to refuse every job that is
   not the merge-lane workflow from the default branch, because a label alone lets any
