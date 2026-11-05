@@ -86,6 +86,11 @@ fi
 # tip, so every code path past the first comparison would otherwise be dead on
 # the only repository it ever runs against.
 FLOATING_TAG="${FLOATING_TAG:-}"
+# The repositories bound to the shared utility host, whose LIVE fork-PR setting
+# is audited (#1704). A deployment fact, so it is an input and never a list in
+# this file: comma-, space- or newline-separated, bare names (the owner above)
+# or `owner/name`. Empty skips the check and says so in the report.
+UTILITY_HOST_REPOS="${UTILITY_HOST_REPOS:-}"
 
 # The preconditions for RUNNING the audit are asserted in the run section at the
 # bottom, not here, because everything between is function definitions and the
@@ -511,6 +516,55 @@ backlog_facts() {
   fi
 }
 
+# --- the utility host's fork posture (#1704) -----------------------------------
+
+# utility_repos_of <text> — one repository per line from a comma-, space- or
+# newline-separated list, blanks dropped, first occurrence kept.
+utility_repos_of() {
+  # `tr -d '\r'` explicitly: Git Bash's awk drops a CR on input and a Linux awk
+  # does not, so leaving it to the awk would make the result machine-dependent.
+  printf '%s\n' "${1:-}" | tr -d '\r' | awk '{ gsub(/[,\t ]+/, "\n"); print }' | awk 'NF && !seen[$0]++'
+}
+
+# fork_pr_facts <repo> — the LIVE "run workflows from fork pull requests"
+# setting: `true`, `false`, `public`, or `unreadable`. Never empty.
+#
+# THE BOOLEAN IS TYPE-CHECKED, NOT DEFAULTED. A 403 or 404 body has no such key,
+# and `.run_workflows_from_fork_pull_requests // false` would read a refusal as
+# "disabled" — a token without `Administration: read` reporting every repository
+# safe, the 2026-08-27 variables trap in its quietest form.
+#
+# A PUBLIC REPOSITORY ANSWERS 422 ("not allowed for public repositories"),
+# measured 2026-11-05 against this repository. That is not a read failure: it is
+# GitHub saying the setting does not exist there, because fork workflows cannot
+# be turned off on a public repository. Reported as its own value so the rule
+# can fail it for what it is. Any other refusal is `unreadable`.
+#
+# A name that is not a plain repository name is refused before it reaches a
+# URL: the list is operator input, and `..` in a path is not a repository.
+fork_pr_facts() {
+  local repo="$1" path body value status message
+  if ! printf '%s' "$repo" | grep -cE '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$' >/dev/null \
+     || printf '%s' "$repo" | grep -cE '(^|/)\.\.?($|/)' >/dev/null; then
+    printf 'unreadable'
+    return 0
+  fi
+  case "$repo" in */*) path="$repo" ;; *) path="$OWNER/$repo" ;; esac
+  body=$(api "repos/$path/actions/permissions/fork-pr-workflows-private-repos")
+  value=$(printf '%s' "$body" | jq -r 'if type=="object" and (.run_workflows_from_fork_pull_requests|type)=="boolean"
+                                       then (.run_workflows_from_fork_pull_requests|tostring) else empty end' 2>/dev/null | tr -d '\r')
+  case "$value" in
+    true|false) printf '%s' "$value"; return 0 ;;
+  esac
+  status=$(printf '%s' "$body" | jq -r 'if type=="object" then (.status // empty | tostring) else empty end' 2>/dev/null | tr -d '\r')
+  message=$(printf '%s' "$body" | jq -r 'if type=="object" then (.message // empty) else empty end' 2>/dev/null | tr -d '\r')
+  if [ "$status" = "422" ] && printf '%s' "$message" | grep -ciE 'public' >/dev/null; then
+    printf 'public'
+  else
+    printf 'unreadable'
+  fi
+}
+
 facts_for() {
   local repo="$1" tier="$2" want="$3"
   local lane guard reaper events relay workflows
@@ -681,6 +735,29 @@ while IFS=$'\t' read -r repo tier _reason; do
     esac
   done <<< "$findings"
 done < "$MANIFEST"
+
+# --- the utility host's fork posture (#1704) -----------------------------------
+#
+# Its own list, not the manifest's tiers: which repositories share the utility
+# host is a deployment fact the manifest does not hold. Unset is NOT silence —
+# a skipped check and a clean one must never render alike — but it is a note,
+# not a warning, because a fleet with no utility host has nothing to set.
+UTILITY_LIST=$(utility_repos_of "$UTILITY_HOST_REPOS")
+if [ -z "$UTILITY_LIST" ]; then
+  printf '%-22s %s\n' "-" "note:fork-pr-audit-skipped UTILITY_HOST_REPOS-is-unset"
+else
+  while IFS= read -r urepo; do
+    [ -z "$urepo" ] && continue
+    [ -n "$ONLY" ] && [ "${urepo##*/}" != "$ONLY" ] && continue
+    line=$(fork_pr_verdict "$(fork_pr_facts "$urepo")")
+    printf '%-22s %s\n' "${urepo##*/}" "$line"
+    case "$line" in
+      fail:*) FAILS+=1 ;;
+      warn:*) WARNS+=1 ;;
+      ok:*) OKS+=1 ;;
+    esac
+  done <<< "$UTILITY_LIST"
+fi
 
 # --- the manifest against reality ---------------------------------------------
 #

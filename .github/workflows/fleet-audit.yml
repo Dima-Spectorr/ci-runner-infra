@@ -100,6 +100,11 @@ jobs:
           # `0` disables the watchdog, so a variable nobody set, mistyped, or
           # tidied away leaves the check armed.
           BACKLOG_MAX_HOURS: ${{ vars.UNRELEASED_BACKLOG_MAX_HOURS }}
+          # The repositories bound to the shared utility host, whose LIVE
+          # fork-PR workflow setting is read daily (#1704). A deployment fact,
+          # so a variable and never a list in the script. Unset skips the check
+          # with a `note:` line in the report; nothing else changes.
+          UTILITY_HOST_REPOS: ${{ vars.UTILITY_HOST_REPOS }}
         run: |
           set -uo pipefail
           # `tee`, so the findings are in the job log even when the report step

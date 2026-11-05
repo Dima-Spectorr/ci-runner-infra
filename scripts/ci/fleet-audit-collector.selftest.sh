@@ -85,7 +85,9 @@ reset_fixture() {
 
 # The stub. Dispatch order matters: `/git/tags/` and `/commits/` both end in a
 # sha, and the bare repository path is a prefix of every other one, so it is
-# last.
+# last. Replaced by a second stub for the fork-posture cases near the end, which
+# is why shellcheck reads this one's body as unreachable.
+# shellcheck disable=SC2317
 api() {
   case "$1" in
     */git/ref/tags/*) printf '%s' "$F_REF" ;;
@@ -467,6 +469,109 @@ eq "$(with_agrees "$T_POOL" "$X")" 1 "a trailing comment on an input is not drif
 
 eq "$(with_agrees "" "$T_EVENTS")" "" "an unread lane file is unknown, not drift"
 eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknown, not drift"
+
+# --- the utility host's fork posture (#1704) -----------------------------------
+#
+# The bodies are the ones GitHub actually returns: the success shape and the
+# public-repository 422 were read live on 2026-11-05; the 403/404 shapes are
+# gh's error-document form, which `api` passes through on stdout.
+F_FORK=""
+FORK_PATH_FILE="${TMPDIR:-/tmp}/fleet-audit-collector-forkpath.$$"
+trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE"' EXIT
+api() {
+  case "$1" in
+    */actions/permissions/fork-pr-workflows-private-repos)
+      echo "$1" > "$FORK_PATH_FILE"
+      printf '%s' "$F_FORK" ;;
+    *) printf '' ;;
+  esac
+}
+fork_body() { # <run-workflows-value-json>
+  printf '{"run_workflows_from_fork_pull_requests":%s,"send_write_tokens_to_workflows":false,"send_secrets_and_variables":false,"require_approval_for_fork_pr_workflows":false}' "$1"
+}
+
+F_FORK=$(fork_body false)
+eq "$(fork_pr_facts svc-a)" "false" "a private repository with fork workflows off reads false"
+eq "$(cat "$FORK_PATH_FILE")" "repos/acct/svc-a/actions/permissions/fork-pr-workflows-private-repos" \
+   "a bare name is read under the audited owner"
+F_FORK=$(fork_body true)
+eq "$(fork_pr_facts svc-a)" "true" "fork workflows re-enabled reads true"
+: > "$FORK_PATH_FILE"
+eq "$(fork_pr_facts other/svc-b)" "true" "an owner/name entry is read as given"
+eq "$(cat "$FORK_PATH_FILE")" "repos/other/svc-b/actions/permissions/fork-pr-workflows-private-repos" \
+   "an owner/name entry is not prefixed with the audited owner"
+
+F_FORK='{"message":"Fork PR workflow settings is not allowed for public repositories.","documentation_url":"https://docs.github.com/rest/actions/permissions#get-private-repo-fork-pr-workflow-settings-for-a-repository","status":"422"}'
+eq "$(fork_pr_facts svc-a)" "public" "the public-repository 422 is its own value"
+
+# THE TRAPS. A refusal body has no boolean, and each of these must come back
+# `unreadable` — never `false`, which the rule reports as compliant.
+F_FORK='{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest","status":"403"}'
+eq "$(fork_pr_facts svc-a)" "unreadable" "a 403 (no Administration: read) is unreadable, not false"
+F_FORK='{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+eq "$(fork_pr_facts svc-a)" "unreadable" "a 404 (App not installed) is unreadable, not false"
+F_FORK='{"message":"Resource not accessible to public integrations","status":"403"}'
+eq "$(fork_pr_facts svc-a)" "unreadable" "a refusal that merely mentions public is not the 422 answer"
+F_FORK='{"message":"Validation Failed","status":"422"}'
+eq "$(fork_pr_facts svc-a)" "unreadable" "a 422 that is not the public-repository answer is unreadable"
+F_FORK=""
+eq "$(fork_pr_facts svc-a)" "unreadable" "an empty body is unreadable, not false"
+F_FORK=$(fork_body '"false"')
+eq "$(fork_pr_facts svc-a)" "unreadable" "a string where the boolean belongs is unreadable"
+F_FORK=$(fork_body null)
+eq "$(fork_pr_facts svc-a)" "unreadable" "a null setting is unreadable, not false"
+
+# Operator input never reaches a URL unless it is a plain repository name.
+F_FORK=$(fork_body false)
+: > "$FORK_PATH_FILE"
+eq "$(fork_pr_facts '../../user')" "unreadable" "a path-traversal entry is refused"
+eq "$(fork_pr_facts 'a/b/c')" "unreadable" "an entry with two slashes is refused"
+eq "$(fork_pr_facts 'acct/..')" "unreadable" "a dot-dot repository component is refused"
+eq "$(wc -c < "$FORK_PATH_FILE" | tr -d ' ')" "0" "a refused entry makes no API call"
+
+# The list parser: every separator an operator might type into a variable.
+eq "$(utility_repos_of "svc-a, svc-b
+svc-c	svc-a  other/svc-d" | tr '\n' ' ')" "svc-a svc-b svc-c other/svc-d " \
+   "commas, spaces, tabs and newlines all separate; duplicates and blanks drop"
+eq "$(utility_repos_of "")" "" "an empty list yields nothing"
+eq "$(utility_repos_of "$(printf 'svc-a\r\nsvc-b\r\n')" | tr '\n' ' ')" "svc-a svc-b " \
+   "a CRLF-terminated variable leaves no carriage return in a name"
+
+# The run section, end to end, against a fake `gh` and an empty manifest: the
+# one place the list, the collector, the rule and the tally meet. One
+# repository is named so the account-listing half stays out of it.
+FAKE="${TMPDIR:-/tmp}/fleet-audit-fakegh.$$"
+EMPTY_MANIFEST="$FAKE/repos.tsv"
+mkdir -p "$FAKE"
+trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE"; rm -rf "$FAKE"' EXIT
+: > "$EMPTY_MANIFEST"
+# shellcheck disable=SC2016  # the fake's text is expanded by the fake, not here
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case "$*" in *fork-pr-workflows-private-repos*) printf "%s" "$FAKE_FORK_BODY" ;; *) exit 1 ;; esac' > "$FAKE/gh"
+chmod +x "$FAKE/gh"
+run_audit() { # <utility-list> <fork-body> <only>
+  env -u FLEET_AUDIT_LIB PATH="$FAKE:$PATH" FLEET_OWNER=acct FLEET_MANIFEST="$EMPTY_MANIFEST" \
+    UTILITY_HOST_REPOS="$1" FAKE_FORK_BODY="$2" bash "$HERE/fleet-audit.sh" "$3" 2>/dev/null
+  echo "exit=$?"
+}
+OUT=$(run_audit "" "$(fork_body true)" svc-a)
+eq "$(printf '%s\n' "$OUT" | grep -c 'note:fork-pr-audit-skipped UTILITY_HOST_REPOS-is-unset')" 1 \
+   "an unset list is reported as a skipped check, not silence"
+eq "$(printf '%s\n' "$OUT" | grep -c 'fork-pr-workflows')" 0 "an unset list reads no repository"
+eq "$(printf '%s\n' "$OUT" | tail -1)" "exit=0" "a skipped check does not fail the audit"
+OUT=$(run_audit "svc-a,svc-b" "$(fork_body true)" svc-a)
+eq "$(printf '%s\n' "$OUT" | grep -cE '^svc-a +fail:fork-pr-workflows-enabled ')" 1 \
+   "a utility-host repository with fork workflows on is reported as a failure"
+eq "$(printf '%s\n' "$OUT" | grep -c '^svc-b ')" 0 "the one-repository argument narrows the fork check too"
+eq "$(printf '%s\n' "$OUT" | grep -c 'note:fork-pr-audit-skipped')" 0 "a set list is not reported as skipped"
+eq "$(printf '%s\n' "$OUT" | tail -1)" "exit=1" "a fork-PR failure fails the audit"
+OUT=$(run_audit "svc-a" '{"message":"Not Found","status":"404"}' svc-a)
+eq "$(printf '%s\n' "$OUT" | grep -cE '^svc-a +warn:fork-pr-setting-unreadable ')" 1 \
+   "an unreadable setting reaches the report as a warning"
+eq "$(printf '%s\n' "$OUT" | tail -1)" "exit=0" "an unreadable setting warns without failing the audit"
+OUT=$(run_audit "svc-a" "$(fork_body false)" svc-a)
+eq "$(printf '%s\n' "$OUT" | grep -cE '^svc-a +ok:fork-pr-workflows-disabled$')" 1 \
+   "a compliant utility-host repository is reported, not silent"
 
 # --- the two guards around the collector ---------------------------------------
 #
