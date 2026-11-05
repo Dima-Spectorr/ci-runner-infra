@@ -429,6 +429,16 @@ mutate "the merge-lane call is never recognised" \
 mutate "a merge-lane.yml in any repository counts as the fleet's" \
   's@\[^/\]+/ci-runner-infra/@[^/]+/[^/]+/@'
 
+# A host-added label read as a scope again (#1703): `runs-on: [self-hosted,
+# background]` silences RUNNER1 and can reach a `-util` slot that RUNNER15-17
+# never judged. One case per label, so each fixture is seen to fire alone.
+mutate "background counts as a scope label again" \
+  's@|background|ci-unheld|@|ci-unheld|@'
+mutate "ci-unheld counts as a scope label again" \
+  's@|ci-unheld|host-@|host-@'
+mutate "a host- affinity pin counts as a scope label again" \
+  "s@|host-\\[a-z0-9-\\]+'\$@'@"
+
 }
 
 # --- the worker entry point ---------------------------------------------------
@@ -604,8 +614,9 @@ CASES="$(case_list | wc -l)"
 # asks for: the six cases mutated code that no longer exists, so keeping the
 # floor would have failed the suite for the absence of rules this repository
 # decided to delete. Raised to 52 by the twenty-seven utility-host cases
-# (`-util` and `-lane`, #1635).
-FLOOR=52
+# (`-util` and `-lane`, #1635). Ratcheted to 65, the count the list actually
+# yields, with the three host-label cases (#1703) — it had drifted ten below.
+FLOOR=65
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

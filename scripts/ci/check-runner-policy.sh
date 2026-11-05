@@ -254,7 +254,15 @@ err() { local id="$1"; shift; echo "::error::[$id] $*"; fail=1; }
 # and `Linux` versus `linux` is a difference this gate must not read as a scope.
 # `X64`/`ARM64` are added by the agent itself; `gcp`/`aws`/`azure` name the
 # provider a pool runs on, which several pools share.
-GENERIC='self-hosted|linux|windows|macos|x64|arm64|arm|gcp|aws|azure|on-prem'
+#
+# `background`, `ci-unheld` and `host-<instance>` are added by the HOST, not the
+# pool (host-startup.sh slot_labels): the first two on slots of every pool and
+# every utility host, the third naming one machine — and a utility host's
+# machine serves several repositories. None names a repository, so none scopes
+# a job to one. Read as scope labels they silenced RUNNER1 for
+# `runs-on: [self-hosted, background]`, which GitHub may hand to a `-util`
+# slot without the job ever naming `-util`, so RUNNER15-17 never asked (#1703).
+GENERIC='self-hosted|linux|windows|macos|x64|arm64|arm|gcp|aws|azure|on-prem|background|ci-unheld|host-[a-z0-9-]+'
 
 # The one platform label that names a WINDOWS pool, for RUNNER8. It is a subset
 # of GENERIC on purpose and must stay one: GENERIC answers "does this label
@@ -2703,6 +2711,40 @@ jobs:
   gate:
     if: github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # #1703: the labels a HOST adds to its slots scope nothing. Each of these can
+  # land on a `-util` slot without naming it, so RUNNER16 cannot fire — RUNNER1
+  # is the only thing standing between them and the co-tenanted host. Unscoped
+  # (no --scope), the run that reached the bypass; guarded, so RUNNER4 is quiet.
+  expect "background is not a scope label" "RUNNER1" "" blocked \
+'on:
+  pull_request_target:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, background]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  expect "a host- affinity pin is not a scope label" "RUNNER1" "" blocked \
+'on:
+  pull_request_target:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, Host-ci-util-a1b2]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  expect "ci-unheld is not a scope label" "RUNNER1" "" blocked \
+'on:
+  pull_request_target:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, ci-unheld]
     timeout-minutes: 5
     steps: [{run: "true"}]'
 
