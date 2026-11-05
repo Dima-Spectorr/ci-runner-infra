@@ -418,9 +418,12 @@ mutate "the RUNNER20 diagnostic never emitted" \
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "RUNNER20 judged on the -util host instead" \
   's@if \[ "$lane_host" -eq 1 \] && \[ "$has_nonlane" -eq 1 \]; then@if [ "$util_host" -eq 1 ] \&\& [ "$has_nonlane" -eq 1 ]; then@'
+# Empties the seed rather than the append: the fixpoint loop sets changed=1
+# after the append, so neutering only the append never terminates (the shard
+# hung to its timeout). An empty seed matches no caller and the loop exits.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "RUNNER20 never crosses a local call" \
-  's@REACHABLE_NONLANE="$REACHABLE_NONLANE$target"@:@'
+  's@REACHABLE_NONLANE="$nl_seed"@REACHABLE_NONLANE=""@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
