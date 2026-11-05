@@ -1067,7 +1067,7 @@ naming the pool it stopped paging for. Take it out as soon as the fix lands. The
 log-based egress policy is unaffected — it keys on `gce_instance` and carries no
 pool label, so there is nothing to exclude on.
 
-Two of the seventeen watch the
+Two of the eighteen watch the
 cache: *snapshot going stale* (`--cache-stale-hours`, 48 by default — set it
 below the pool's `cache_snapshot_max_age_hours`, or the first notice anyone gets
 is every host starting cold) and *hydrate failing on a configured pool*, which

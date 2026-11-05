@@ -2829,7 +2829,7 @@ has_utility_isolation() { # <file>
   matches "$code" 'for d in "\$SLOT_ROOT/\$idx" "\$SLOT_ROOT/\.reset/\$idx" "\$SLOT_STATE/\$idx" "\$CACHE_SLOTS/\$idx" "\$SLOT_HOME_BASE/\$u"; do' || return 1
   # the loop records its runner on a utility host, so a rebind can withdraw it
   matches "$code" 'mv -f "\$SLOT_BINDING_DIR/\$idx\.runner\.tmp" "\$SLOT_BINDING_DIR/\$idx\.runner"' || return 1
-  matches "$code" 'SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR$' || return 1
+  matches "$code" 'SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR SLOT_ROOT$' || return 1
   # ci-cache-seed=off skips every shared cache
   matches "$code" '^  if \[ "\$CACHE_SEED" = off \]; then$' || return 1
   # a utility host with no per-slot repositories never boots
@@ -2865,7 +2865,7 @@ mutate "utility host publishes the band"     's@^  \[ "\$UTILITY" = true \] || c
 mutate "utility host DNATs the band"         's@^  elif \[ -n "\$addr" \]; then$@  fi; if [ -n "$addr" ]; then@' has_utility_isolation
 mutate "slots provisioned before the wipe"   '/bind_slot "\$i" "\$(slot_repo "\$i")" || die/d' has_utility_isolation
 mutate "the cache seeded anyway"             's@^  if \[ "\$CACHE_SEED" = off \]; then$@  if false; then@' has_utility_isolation
-mutate "the runner id never recorded"        's@SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR$@SLOT_REPOS SLOT_LABEL_SETS@' has_utility_isolation
+mutate "the runner id never recorded"        's@SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR SLOT_ROOT$@SLOT_REPOS SLOT_LABEL_SETS SLOT_ROOT@' has_utility_isolation
 
 # --- no comment in an UNQUOTED heredoc may spell a live backtick --------------
 #

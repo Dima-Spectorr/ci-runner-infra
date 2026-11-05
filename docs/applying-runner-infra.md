@@ -229,13 +229,14 @@ non-zero saying so.
 cannot stop a fleet from receiving runner configuration. That is the right
 trade, and it means the exit code is for a human running the script by hand —
 it will not turn anything red. Until the fleet audit counts policies per project
-(#979), the check is manual and it is a **count, not a glance**: seventeen is
-the expected number of `CI runners / *` policies in a project since #1403. Three
-of them are log-based: *egress refused*, *hosts kept on an unverifiable
-guest-attribute read* and *a slot failed its reset* (`ci_slot_reset_failures`,
-over the hosts' `ci-slot-lifecycle` log). So a project missing this grant syncs
-fourteen and defers all three, and a project bootstrapped by hand before #978
-may show thirteen.
+(#979), the check is manual and it is a **count, not a glance**: eighteen is
+the expected number of `CI runners / *` policies in a project since #1676
+(seventeen from #1403 until then). Four of them are log-based: *egress refused*,
+*hosts kept on an unverifiable guest-attribute read*, *a slot failed its reset*
+(`ci_slot_reset_failures`) and *runners stop seconds after registering*
+(`ci_runner_fast_exits`), the last two over the hosts' `ci-slot-lifecycle` log.
+So a project missing this grant syncs fourteen and defers all four, and a
+project bootstrapped by hand before #978 may show thirteen.
 
 The channel half is easy to miss, and missing it is worse than over-granting:
 `monitoring.viewer` (already in the loop above) can *read* channels, so a project
@@ -689,6 +690,107 @@ List what is available before picking the next pin:
 ```bash
 gcloud compute images list --project=<project> --filter="family=ci-runner-host" --sort-by=~creationTimestamp --format="table(name,creationTimestamp,status)"
 ```
+
+### Rolling a new runner version out
+
+The image bakes the actions/runner agent with `--disableupdate`, so a host runs
+exactly the version its image was built with. GitHub deprecates old versions.
+After that it accepts the registration and then refuses the agent's first
+message. On 2026-11-05 that happened to v2.336.0. Every slot of every pool
+registered, stopped about 3 s later, and registered again. The loop used up the
+merge App's hourly API budget. The only record of why was each slot's
+`/opt/ci/slots/<n>/_diag/Runner_*.log`. The steps below replace that scramble
+with a routine. Only step 3 is an operator's; the rest, and the alert, are automatic.
+
+1. **Detect (automatic, daily).** `.github/workflows/runner-version.yml` runs
+   `scripts/ci/runner-version-watch.sh`. The script compares the latest
+   actions/runner release with this repository's three pins: the
+   `runner_version` defaults in `packer/ci-host-image.pkr.hcl` and
+   `packer/ci-host-image-win.pkr.hcl`, and `_RUNNER_VERSION` in
+   `cloudbuild.yaml`. It also checks the image each pool root in
+   `fleet/image-pins.tsv` actually boots. The deadline counts from the
+   **oldest** release newer than the pin, not from the latest one, and the grace
+   is 14 days.
+
+   | Outcome | What the script reports |
+   |---|---|
+   | Pin is behind, inside the grace | `warn:` |
+   | Pin is past the grace (`at-risk`) | `fail:` |
+   | The answer cannot be read | `fail:` |
+
+   A failing run keeps one standing issue open, titled *Runner version check: a
+   pool is at risk of losing its runners*. A clean run closes it.
+
+2. **Bump (automatic).** The same run keeps ONE PR open on
+   `automation/runner-version`, titled `fix(image): bake runner <new> (was
+   <old>)`. The PR changes exactly the three pin lines, and
+   `scripts/ci/runner-version.selftest.sh` proves that on the real files. A
+   newer release rewrites the same PR instead of opening a second one. When the
+   PR merges, the `ci-host-image-ci-runner-infra` trigger builds
+   `ci-runner-host-g<sha>`. As described above, no pool changes yet. A
+   `fix(image):` merge does not move `VERSION`; that still happens only through
+   a `chore(release)` PR.
+
+3. **Copy and pin (operator).** Once the build has finished, run:
+
+   ```bash
+   scripts/ci/propagate-host-image.sh ci-runner-host-g<sha> <build project>
+   ```
+
+   The script only prints a plan until you add `--apply`. For each root in
+   `fleet/image-pins.tsv`, it does two things:
+
+   - It copies the image into the pool project that the root's `host_image`
+     names, with the label `copied-from=<build project>`. It skips an image that
+     is already there.
+   - It opens one pin-bump PR that swaps only the image name.
+
+   This step stays human because a copy needs `compute.images.create` in every
+   pool project, and the PR needs write access to every root. Some of those
+   projects are in other organizations. One automation identity holding both
+   could change what every pool boots, so you run it with your own `gcloud`
+   account and `gh` login.
+
+4. **Apply (automatic once the PR merges).** Each root applies on its hourly
+   schedule; trigger it by hand only if the change is urgent. The apply moves
+   the instance **template** to the new image, and no host yet.
+
+5. **Roll the hosts (automatic, on the controller).** Each pool's controller
+   compares every host's template with the MIG's. It recycles stale hosts
+   make-before-break (`recycle_decision`, `scripts/ci/recycle-decision.selftest.sh`):
+
+   - A busy host is cordoned, finishes its running jobs, and is then retired.
+   - An idle host is retired at once.
+   - The MIG builds the replacement from the new template.
+   - At most `recycle_max_unavailable` hosts are mid-recycle at a time. The
+     consumer roots set it to one host in five, and at least one.
+   - A host whose template cannot be read is never recycled.
+
+   A bad image therefore shows up on the first host or two, not the whole pool.
+   To watch it, look at the controller's `ci_recycle_verdicts` metric and its
+   `retire:` lines. A new host's slots should stay registered for more than a
+   minute; the fast-exit alert below pages if they do not. To stop a rollout,
+   revert the pin PR. The next apply moves the template back, and the
+   controller recycles the hosts onto it the same way.
+
+**When it goes wrong anyway.** The slot loop now notices an agent that stops
+within 60 s without taking a job and was not deregistered by a drain or cordon.
+It then does three things:
+
+- **Backs off:** it waits before registering again. The wait starts at 30 s and
+  doubles up to 15 min, plus jitter, so a refused fleet cannot spend the App's
+  API budget.
+- **Logs it** under `ci-slot-loop`: `slot <n>: runner <id> stopped <s>s after it
+  started without taking a job -- registering again in <w>s`.
+- **Names a deprecated runner:** if the slot's `_diag` log carries GitHub's
+  deprecation message, it adds `slot <n>: GitHub refused runner <id> as a
+  deprecated version -- the image must be rebuilt with a current runner`. It
+  never copies the `_diag` text itself, because a job can write to that file.
+
+Both lines feed the log metric `ci_runner_fast_exits`. The policy *CI runners /
+runners stop seconds after registering* pages when one host logs more than 3 of
+them in 10 minutes. `scripts/ci/alert-runner-fast-exit.selftest.sh` pins both
+sentences against the filter and runs the backoff.
 
 ## What "applied" does and does not mean
 

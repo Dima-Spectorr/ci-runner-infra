@@ -1,0 +1,22 @@
+# WHERE THE FLEET PINS ITS HOST IMAGE. One row per pinned image variable.
+#
+# Read by scripts/ci/runner-version-watch.sh, daily, to answer the question the
+# 2026-11-05 outage turned on: which runner version is each pool ACTUALLY
+# booting? This repository's own pin can be current while every pool still
+# boots an older image. A pool pins an exact image name in its root's tfvars,
+# never a family. The name `ci-runner-host-g<sha>` (or `-vX-Y-Z`) names the
+# ci-runner-infra commit that built it, and the runner version is read from that
+# commit's cloudbuild.yaml.
+#
+# Columns, TAB-separated:
+#   repo      repository under this repository's owner that holds the root
+#   branch    its default branch (not always main, see fleet/repos.tsv)
+#   path      the tfvars file
+#   variable  the variable holding the Linux image (Windows images carry a
+#             contract version, not a build ref, so they are not listed here)
+#
+# The legacy per-repository roots (Atlas, Specaria-Platform's own ci-runners)
+# were folded into these two shared roots and are not listed. Add a row
+# when a new root pins a host image.
+mot-ci-runners	main	terraform/terraform.tfvars	host_image
+specaria-ci-runners	main	terraform/terraform.tfvars	host_image

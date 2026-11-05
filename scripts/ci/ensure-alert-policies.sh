@@ -708,6 +708,24 @@ EOF
   "notificationChannels": [ "$channel" ] }
 EOF
     ;;
+    # Runners that GitHub refuses (#1676). On 2026-11-05 every agent of every
+    # pool registered and stopped about 3s later, because the baked runner
+    # version was deprecated; the only record was each slot's own
+    # _diag/Runner_*.log. The slot loop now says it, under ci-slot-loop, and
+    # backs off. One early stop is noise (a deregistration race); four from one
+    # host in ten minutes is every slot of it being turned away.
+    runnerfastexit) cat <<EOF
+{ "displayName": "CI runners / runners stop seconds after registering (GitHub refusing them?)",
+  "combiner": "OR",
+  "documentation": { "mimeType": "text/markdown", "content":
+    "A host's slots keep registering a runner that stops within a minute without taking a job. The slot loop backs off (30s doubling to 15 min) so a refused fleet does not spend the App installation's hourly API budget, but no job runs on that host.\n\nRead the lines: in Cloud Logging, log ci-slot-lifecycle, jsonPayload.identifier=ci-slot-loop, grouped by labels.host and labels.pool. Two sentences feed this metric:\n\n- **stopped Ns after it started without taking a job** -- the agent exited early.\n- **GitHub refused runner N as a deprecated version** -- the slot's _diag/Runner_*.log carries GitHub's deprecation message. The image bakes a runner GitHub no longer serves: rebuild it with a current runner and roll the hosts (docs/applying-runner-infra.md, 'Rolling a new runner version out'). The daily runner-version workflow should have warned first; check its standing issue.\n\nWithout the second line, read /opt/ci/slots/<n>/_diag/Runner_*.log on the host: a revoked App key, a removed runner group, or a label GitHub rejects all look the same from here." },
+  "conditions": [ { "displayName": "ci_runner_fast_exits > 3 in 10m",
+    "conditionThreshold": { "comparison": "COMPARISON_GT", "thresholdValue": 3.0, "duration": "0s",
+      "filter": "metric.type=\"logging.googleapis.com/user/ci_runner_fast_exits\" AND resource.type=\"gce_instance\"",
+      "aggregations": [ { "alignmentPeriod": "600s", "perSeriesAligner": "ALIGN_SUM" } ] } } ],
+  "notificationChannels": [ "$channel" ] }
+EOF
+    ;;
   esac
 }
 
@@ -827,6 +845,14 @@ ensure_log_metric ci_unverified_host_keeps \
 ensure_log_metric ci_slot_reset_failures \
   "Slot resets that failed closed or condemned a slot, from the hosts' ci-slot-lifecycle log: a socket that is not the slot daemon's, a slot refused as clean, a slot taken out of service." \
   'logName:"logs/ci-slot-lifecycle" AND ((jsonPayload.identifier="ci-slot-reset" AND jsonPayload.message=~"^slot [0-9]+: its daemon is running but [^ ]+ is not the socket it listens on -- a job moved or replaced it, so no container was reclaimed and the slot is not clean$") OR (jsonPayload.identifier="ci-slot-reset" AND jsonPayload.message=~"^slot [0-9]+: [^ ]+ reads as foreign$") OR (jsonPayload.identifier="ci-slot-reset" AND jsonPayload.message=~"^slot [0-9]+: could not resolve the uid of [^ ]+ -- refusing to call this slot clean$") OR (jsonPayload.identifier="ci-slot-reset" AND jsonPayload.message=~"^slot [0-9]+: [0-9]+ process[(]es[)] of the last job would not die -- refusing to call this slot clean$") OR (jsonPayload.identifier="ci-slot-loop" AND jsonPayload.message=~"^slot [0-9]+: [0-9]+ consecutive failures to reach a clean state — taking it out of service rather than letting it keep winning jobs it will burn$"))'
+
+# The slot loop's fast-exit lines (#1676, fast_exit in host-startup.sh), held
+# to the same rule: whole sentences, anchored, under ci-slot-loop, numbers only
+# in the open fields. alert-runner-fast-exit.selftest.sh pins both against the
+# `say` that writes them.
+ensure_log_metric ci_runner_fast_exits \
+  "Runners that stopped within a minute of registering without taking a job, and runners GitHub refused as a deprecated version, from the hosts' ci-slot-lifecycle log." \
+  'logName:"logs/ci-slot-lifecycle" AND ((jsonPayload.identifier="ci-slot-loop" AND jsonPayload.message=~"^slot [0-9]+: runner [0-9]+ stopped [0-9]+s after it started without taking a job -- registering again in [0-9]+s$") OR (jsonPayload.identifier="ci-slot-loop" AND jsonPayload.message=~"^slot [0-9]+: GitHub refused runner [0-9]+ as a deprecated version -- the image must be rebuilt with a current runner$"))'
 
 # ── metric descriptors ────────────────────────────────────────────────────────
 # An alert policy cannot be created against a metric type Cloud Monitoring has
@@ -977,7 +1003,7 @@ no_such_metric() {
 }
 
 deferred=""
-for key in heartbeat blind idle heldpool queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied unverifiedkeep slotreset; do
+for key in heartbeat blind idle heldpool queue drain slowtick cachestale cachefail slotsmissing parked parkeddenied applystale hostvanished egressdenied unverifiedkeep slotreset runnerfastexit; do
   policy_json "$key" >"$tmp/p.json"
   # Neither of these ends in `| head -1`, and that is deliberate. This script
   # runs `set -euo pipefail`; under both options a reader that stops early sends
