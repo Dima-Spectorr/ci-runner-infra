@@ -518,3 +518,38 @@ fleet_verdict() {
   [ "$found" = "0" ] && echo "ok:compliant tier=$tier"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# fork_pr_verdict — the one finding for one utility-host repository's LIVE
+# fork pull-request workflow setting (#1704).
+#
+#   fork_pr_verdict <true|false|public|unreadable>
+#
+# WHY THE LIVE SETTING AND NOT THE DECLARATION. docs/adr-utility-host.md
+# requires every repository bound to the shared utility host to have fork
+# pull-request workflows disabled. RUNNER17 checks that a `-util` job DECLARES
+# `--forks=blocked`, which is reviewable, but a declaration is not the setting:
+# a repository admin can switch fork workflows back on in Settings, and nothing
+# in any pull request would ever show it.
+#
+# Exactly one line, always — an empty result must never read as a clean one:
+#   false       the healthy state
+#   true        `fail:` — fork code can reach the shared host
+#   public      `fail:` — GitHub has no off switch for fork workflows on a
+#               public repository (the endpoint answers 422), so the ADR's
+#               requirement cannot hold there at all; the repository must leave
+#               the utility host or go private
+#   (anything)  `warn:` — the read failed (403/404: the token lacks
+#               `Administration: read`, or the App is not installed there). An
+#               unknown, never a pass: the same rule fleet_verdict applies to
+#               every other fact it could not read.
+# ---------------------------------------------------------------------------
+fork_pr_verdict() {
+  case "${1:-}" in
+    false) echo "ok:fork-pr-workflows-disabled" ;;
+    true) echo "fail:fork-pr-workflows-enabled utility-host-repo-must-disable-run-workflows-from-fork-pull-requests" ;;
+    public) echo "fail:utility-host-repo-is-public fork-pr-workflows-cannot-be-disabled-leave-the-utility-host-or-go-private" ;;
+    *) echo "warn:fork-pr-setting-unreadable cannot-read-grant-Administration-read setting=${1:-<empty>}" ;;
+  esac
+  return 0
+}

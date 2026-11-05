@@ -222,7 +222,7 @@ and an assertion on exit status would have passed against all three.
 
 Daily at 05:41 UTC, after the reaper, plus `workflow_dispatch`.
 
-Three things the operator can set, two of them required:
+Four things the operator can set, two of them required:
 
 - **`MERGE_LANE_ENABLED`** must be `true`, and `MERGE_APP_ID` /
   `MERGE_APP_PRIVATE_KEY` must exist. Reading another repository needs the App
@@ -236,6 +236,34 @@ Three things the operator can set, two of them required:
   watchdog armed at 72 hours; `0` turns it off. See the section above for why
   an empty value is not an off switch and why `0` also silences the
   unreadable-tag finding.
+- **`UTILITY_HOST_REPOS`** — optional. The repositories bound to the shared
+  utility host, comma-, space- or newline-separated, bare names or
+  `owner/name`. See the next section. Unset prints
+  `note:fork-pr-audit-skipped UTILITY_HOST_REPOS-is-unset` and checks nothing.
+
+### Utility-host repositories keep fork pull-request workflows off (#1704)
+
+[docs/adr-utility-host.md](adr-utility-host.md) requires every repository bound
+to the shared utility host to have fork pull-request workflows disabled.
+`RUNNER17` checks that a `-util` job *declares* `--forks=blocked`; a declaration
+is not the setting, and a repository admin can switch it back on in Settings
+with nothing in any pull request showing it. So the audit reads the live
+setting daily — `GET repos/{owner}/{repo}/actions/permissions/fork-pr-workflows-private-repos`
+— for each repository in `UTILITY_HOST_REPOS`:
+
+| Answer | Finding |
+|---|---|
+| `run_workflows_from_fork_pull_requests: false` | `ok:fork-pr-workflows-disabled` |
+| `run_workflows_from_fork_pull_requests: true` | `fail:fork-pr-workflows-enabled` — the run goes red |
+| `422` "not allowed for public repositories" | `fail:utility-host-repo-is-public` — a public repository has no off switch for fork workflows, so it cannot meet the ADR; take it off the utility host or make it private |
+| `403`, `404`, or any body without the boolean | `warn:fork-pr-setting-unreadable cannot-read-grant-Administration-read` |
+
+The boolean is type-checked rather than defaulted: a refusal body has no such
+key, and reading its absence as `false` would report every repository safe
+under a token that cannot see the setting. The endpoint needs
+`Administration: read`, the same grant the runner count below needs; a `404`
+also means the App is not installed on that repository. The one-repository
+argument narrows this check too.
 
 The token is minted **owner-wide** (`owner:` on `create-github-app-token`). The
 default installation token is scoped to the repository the workflow runs in,
@@ -247,7 +275,8 @@ All three read-only, and the secrets one reads only the **names** — the Action
 secrets API never returns a value to anyone. Without the first two the audit
 cannot tell you whether a lane is armed; without the third it cannot see a
 single self-hosted runner, so the whole pool-health half of the report is
-inert.
+inert, and every utility-host repository reports
+`warn:fork-pr-setting-unreadable`.
 
 It matters more than it sounds, because of how those two endpoints refuse: a
 token without the scope gets a `403` whose body is as empty as the answer for a

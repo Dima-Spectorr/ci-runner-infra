@@ -404,5 +404,33 @@ else
   surface_says no 'customer/scripts/notes.txt'
 fi
 
+# --- the utility host's live fork posture (#1704) ------------------------------
+#
+# EXACT lines, not substrings: `ok:` and `fail:` share the words
+# `fork-pr-workflows`, so a substring match could pass on the wrong arm.
+fork_is() { # <setting> <expected-line> <description>
+  local got
+  got=$(fork_pr_verdict "$1")
+  if [ "$got" = "$2" ]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$3" "$2" "$got"
+  fi
+}
+fork_is false "ok:fork-pr-workflows-disabled" "fork workflows off is compliant"
+fork_is true "fail:fork-pr-workflows-enabled utility-host-repo-must-disable-run-workflows-from-fork-pull-requests" \
+  "fork workflows re-enabled on a utility-host repository fails"
+fork_is public "fail:utility-host-repo-is-public fork-pr-workflows-cannot-be-disabled-leave-the-utility-host-or-go-private" \
+  "a public utility-host repository fails: it has no off switch"
+fork_is unreadable "warn:fork-pr-setting-unreadable cannot-read-grant-Administration-read setting=unreadable" \
+  "a refused read is a distinct warning, never a pass"
+# THE QUIET ONES. A caller that hands over nothing, or a value nobody planned
+# for, is an unknown — and must never take the `ok:` arm.
+fork_is "" "warn:fork-pr-setting-unreadable cannot-read-grant-Administration-read setting=<empty>" \
+  "an empty setting is unreadable, not compliant"
+fork_is FALSE "warn:fork-pr-setting-unreadable cannot-read-grant-Administration-read setting=FALSE" \
+  "a value that is not exactly true or false is unreadable"
+
 printf 'fleet-audit-decision: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
