@@ -18,7 +18,7 @@
 # Patterns match the TEXT of the scripts, where `$idx` is literal characters.
 # shellcheck disable=SC2016
 # The stubs in run_fe are called from the eval'd fast_exit.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 
 set -uo pipefail
 
@@ -66,7 +66,7 @@ check_all() (
   thr=$(jq -r "$c.thresholdValue" "$d/p.json")
   # One early stop is a deregistration race; a refused host makes dozens.
   awk -v t="$thr" 'BEGIN { exit !(t >= 1 && t <= 10) }' || fail "threshold $thr is outside 1..10"
-  jq -r '.documentation.content' "$d/p.json" | grep -q 'Rolling a new runner version out' ||
+  jq -r '.documentation.content' "$d/p.json" | grep -c 'Rolling a new runner version out' >/dev/null ||
     fail "the policy's documentation does not point at the rollout section"
 
   # --- 2. the metric reads the shipper's log, under a tag the shipper sends ------

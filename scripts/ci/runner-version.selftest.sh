@@ -78,7 +78,7 @@ check_all() (
     # The Linux template's OTHER variables' defaults are untouched (the first
     # `default =` in the file belongs to a different variable).
     for f in packer/ci-host-image.pkr.hcl packer/ci-host-image-win.pkr.hcl; do
-      grep -n "$new" "$d/repo/$f" | grep -q 'default' || fail "$f: the new version is not on a default line"
+      grep -n "$new" "$d/repo/$f" | grep -c 'default' >/dev/null || fail "$f: the new version is not on a default line"
     done
   fi
 
@@ -116,7 +116,7 @@ check_all() (
     shift 2
     out=$(dec "$p" "$n")
     for w in "$@"; do
-      printf '%s\n' "$out" | grep -qx "$w" || fail "rv_decide $p: want '$w', got: $(printf '%s' "$out" | tr '\n' ' ')"
+      printf '%s\n' "$out" | grep -cx "$w" >/dev/null || fail "rv_decide $p: want '$w', got: $(printf '%s' "$out" | tr '\n' ' ')"
     done
   }
   # The outage itself: 2.336.0 had missed 2.337.0 for 71 days.
@@ -131,8 +131,8 @@ check_all() (
     fail "an unparseable release list does not read as unknown"
   # A release whose Windows zip is not attached yet is missed, never the target.
   out=$(printf '%s\n%s\n' "$RELEASES" "$(printf '2026-11-04T10:00:00Z\t2.339.0\t0')" | rv_decide 2.338.2 "$NOW" 14)
-  printf '%s\n' "$out" | grep -qx target=2.338.2 || fail "a release without both archives became the target"
-  printf '%s\n' "$out" | grep -qx missed=2.339.0 || fail "a release without both archives does not count as missed"
+  printf '%s\n' "$out" | grep -cx target=2.338.2 >/dev/null || fail "a release without both archives became the target"
+  printf '%s\n' "$out" | grep -cx missed=2.339.0 >/dev/null || fail "a release without both archives does not count as missed"
   # Input order must not matter.
   out=$(printf '%s\n' "$RELEASES" | sort | rv_decide 2.336.0 "$NOW" 14 | grep -E '^(target|missed)=' | tr '\n' ' ')
   [ "$out" = "target=2.338.2 missed=2.337.0 " ] || fail "rv_decide depends on input order: $out"
