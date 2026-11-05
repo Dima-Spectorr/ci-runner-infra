@@ -138,11 +138,12 @@ on:
       base-health-max-staleness-seconds:
         description: >-
           How old a base-health answer may be and still vouch for a tip that has
-          not answered yet. `0`, the default, means only the tip's own answer
-          counts -- the rule the gate shipped with.
+          not answered yet. 1800 (half an hour) by default since 2026-11-05;
+          `0` means only the tip's own answer counts -- the rule the gate
+          shipped with.
 
 
-          Set it on a base that moves faster than its health job answers. The
+          It matters on a base that moves faster than its health job answers. The
           grace above bounds the wait for ONE tip and nothing bounds the
           sequence: the clock is keyed to the tip's commit date, so every merge
           restarts it and the lane holds forever while the base moves the whole
@@ -162,23 +163,27 @@ on:
 
 
           A sane value is a small multiple of how long the health job takes.
-          Much larger and it is a fail-open with extra steps.
+          Much larger and it is a fail-open with extra steps. The default
+          covers health jobs of up to ~25 minutes, which is the whole fleet;
+          set it only for a slower one.
         required: false
-        default: 0
+        default: 1800
         type: number
       base-health-max-hops:
         description: >-
           How many commits back the staleness window above may walk to find an
-          answer, whatever its clock allows. 5 by default, 1 to 50.
+          answer, whatever its clock allows. 50 by default, 1 to 50.
 
 
-          Raise it on a base whose push CI tests one tip at a time while the
-          lane merges many PRs in between: the newest green answer is then
-          several commits back, and at five hops the walk stops short of it and
-          the lane halts on a base that answered green minutes ago. Each hop can
-          cost two check reads. Has no effect while the staleness window is 0.
+          A cost cap, not a safety bound: the clock above is the bound that
+          matters, and at the default it is the one that binds. A lower cap
+          ends the walk first on a base whose push CI tests one tip at a time
+          while the lane merges many PRs in between, and the lane halts on a
+          base that answered green minutes ago (entity-platform, 2026-11-05).
+          Each hop can cost two check reads. Has no effect while the staleness
+          window is 0.
         required: false
-        default: 5
+        default: 50
         type: number
       newer-incomplete-max-staleness-seconds:
         description: >-

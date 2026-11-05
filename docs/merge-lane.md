@@ -1759,23 +1759,28 @@ Two consequences worth stating plainly:
   with no `merge:ready` line above it, which is also exactly what an idle,
   healthy lane says. If a repository's lane has never merged anything, read the
   `lane:` notices, not the run conclusion.
-- **The fix for that is `base-health-max-staleness-seconds` (default `0`, off).**
-  Non-zero lets a green answer on a recent *ancestor* vouch for a tip that has
-  not answered yet, which is the question the gate actually asks — is the base
-  broken right now. Set it to a small multiple of how long the health job takes.
-  It is deliberately opt-in: one repository outrunning its health job is not a
-  reason to relax the gate on the twelve that have not.
+- **The fix for that is `base-health-max-staleness-seconds` (default `1800`;
+  `0` turns it off).** Non-zero lets a green answer on a recent *ancestor* vouch
+  for a tip that has not answered yet, which is the question the gate actually
+  asks — is the base broken right now. A sane value is a small multiple of how
+  long the health job takes; half an hour covers every health job in the fleet,
+  so a repository sets it only for a slower one. It was opt-in until 2026-11-05
+  (#1705): each repository that outran its health job found out by stalling, and
+  the two that did both chose 1800. Opt-in never made the others stricter — see
+  the last paragraph of this item — only slower.
 
   What it relaxes is narrow, and each bound is enforced by the self-test rather
   than by this paragraph. The window is consulted **only** when the tip reads
   `unanswered` — a tip that answered red still halts the pass. The walk stops at
   the first ancestor that answered *either way*, so a red ancestor halts the lane
   instead of being searched past for an older green one. It is bounded by age and
-  by `base-health-max-hops` (default five, at most 50). Raise the hop cap when
-  the base's push CI tests one tip at a time while the lane merges several pull
-  requests in between: the newest green answer is then further back than five
-  commits, and the walk gives up on a base that answered green minutes ago
-  (#1668). Note the age is the ancestor's *commit* date, so the window must also
+  by `base-health-max-hops` (default and maximum 50). The hop cap is a cost
+  cap, and the default keeps it from binding before the clock does. At five
+  (#1668), and then at fifteen on entity-platform (#1705), it ended the walk
+  first: a base whose push CI tests one tip at a time while the lane merges many
+  pull requests in between has its newest green answer ~20 commits back, and the
+  lane halted on a base that had answered green minutes ago. Lower it only to
+  save API calls. Note the age is the ancestor's *commit* date, so the window must also
   exceed the health job's duration plus the time between its answers. And it is **closed for the rest of any run in which the lane has
   merged**, because an ancestor's answer predates that merge by definition and
   must not speak for a tip the lane itself created — which is the whole point of
@@ -1862,7 +1867,7 @@ throughput argument is not enough to buy it back.
 |---|---|---|---|
 | 1 | Do nothing | no | The ceiling sits above the normal arrival rate, but it bites exactly when it hurts — once a backlog has already formed. |
 | 2 | **Make the health job itself faster** | **yes** | Gives up no safety at all: every merge still waits for a fresh green answer on the tip it is landing on. Only the answer arrives sooner. |
-| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | no, but available | Lets an *ancestor's* answer vouch for a tip nothing has answered for. Implemented, documented above, and deliberately **opt-in per repository** — one repository outrunning its health job is not a reason to relax the gate on the others. |
+| 3 | Bounded staleness (`base-health-max-staleness-seconds > 0`) | yes, fleet default since 2026-11-05 | Lets an *ancestor's* answer vouch for a tip nothing has answered for. Opt-in per repository until #1705; it replaces only the merge-unvouched fallback, so opting out was slower, not safer. |
 | 4 | Merge a batch, then health-check once | no | Largest gain, largest blast radius: a batch that breaks the base implicates several pull requests at once and makes bisection harder. That guarantee is the reason the gate exists, so spending it for cadence is the one trade this design refuses. |
 
 **What option 2 actually was, and the prediction it has to answer for.** The

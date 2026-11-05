@@ -389,7 +389,15 @@ BASE_HEALTH_GRACE="${BASE_HEALTH_GRACE:-900}"
 # vouched for — two branches green alone and broken together, which is the
 # Apigee-Portal incident the batch gate was added for. An ancestor's answer
 # predates that merge by definition, so it is not allowed to speak for it.
-BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
+#
+# HALF AN HOUR BY DEFAULT SINCE 2026-11-05, NO LONGER OPT-IN (#1705). It was 0
+# so that one repository outrunning its health job would not relax the gate on
+# the others. But the window replaces only the fail-open fallback above, so a
+# repository without it was not stricter, only slower: it waited out the grace
+# and then merged on no answer at all. The two repositories that needed it each
+# had to find that out by stalling, and both settled on 1800. `0` still turns
+# it off for a repository that asks.
+BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-1800}"
 
 # How far back the window will walk, whatever the clock allows. Each ancestor
 # costs two paginated check reads, so an unbounded walk on a base nothing has
@@ -402,10 +410,21 @@ BASE_HEALTH_MAX_STALENESS="${BASE_HEALTH_MAX_STALENESS:-0}"
 # group that keeps one pending run) and takes ~15 minutes while the lane merges
 # ~40 an hour, the newest green answer is routinely 8-12 commits back, the walk
 # stops at five, and the lane halts on a base that answered green minutes ago.
-# `base-health-max-hops` raises it per repository; capped at 50 because the
-# history read is one unpaginated page (`per_page` = hops + 1, at most 100) and
-# each hop may cost two check reads.
-BASE_HEALTH_MAX_HOPS="${BASE_HEALTH_MAX_HOPS:-5}"
+# Capped at 50 because the history read is one unpaginated page (`per_page` =
+# hops + 1, at most 100) and each hop may cost two check reads.
+#
+# FIFTY BY DEFAULT SINCE 2026-11-05, SO THE CLOCK IS THE BOUND THAT BINDS
+# (#1705). The age test is the honest bound; the hop cap is only a cost cap,
+# and at 5 (then 15 on entity-platform) it ended the walk first: that base's
+# push CI took ~23 minutes while the lane merged ~45 an hour, so the newest
+# green answer was ~20 commits back and the lane halted for ~15 minutes every
+# cycle with green pull requests waiting. Every repository that merges faster
+# than its health job answers would have had to rediscover its own number. The
+# cost is bounded by the clock anyway: a walk reads only the commits of the
+# last `BASE_HEALTH_MAX_STALENESS` seconds, stops at the first answer, runs
+# only while the tip is unanswered, and never after the run has merged. Measured 2026-11-05 on the fleet's one merge App
+# installation: ~900 of 5550 calls used per hour, and the deeper walk adds ~600.
+BASE_HEALTH_MAX_HOPS="${BASE_HEALTH_MAX_HOPS:-50}"
 if ! [[ "$BASE_HEALTH_MAX_HOPS" =~ ^[0-9]+$ ]] || [ "$BASE_HEALTH_MAX_HOPS" -lt 1 ] || [ "$BASE_HEALTH_MAX_HOPS" -gt 50 ]; then
   echo "lane: base-health-max-hops is '$BASE_HEALTH_MAX_HOPS', which is not a whole number from 1 to 50" >&2
   exit 1
