@@ -74,6 +74,16 @@ run "no_job_identity_cache_or_band" {
     error_message = "the utility host must carry no job identity, cache bucket or turbo bucket key"
   }
   assert {
+    # #1638: no turbo key at all, by prefix, so a key added later is caught too
+    condition     = length([for k in keys(google_compute_instance_template.host.metadata) : k if startswith(k, "ci-turbo-")]) == 0
+    error_message = "the utility host must carry no ci-turbo-* metadata key: the turbo cache serves every slot, so on this host it is cross-repository (#1638)"
+  }
+  assert {
+    # #1639: no pin hold, and the guest attribute it published is off with it
+    condition     = !contains(keys(google_compute_instance_template.host.metadata), "enable-guest-attributes")
+    error_message = "the utility host runs no pin hold, so it must not enable guest attributes (#1639)"
+  }
+  assert {
     condition     = length([for t in google_compute_instance_template.host.tags : t if startswith(t, "ci-shared-infra-")]) == 0
     error_message = "the utility host must carry no shared-infra band tag (ADR B3)"
   }
@@ -115,6 +125,153 @@ run "one_standard_host_never_spot" {
     condition     = google_compute_instance_group_manager.host.base_instance_name == "ci-utility"
     error_message = "base instance name must be the module name"
   }
+}
+
+# #1650: nothing reaches the host from outside, no project-wide SSH key logs in,
+# and the attached account is the one passed in, with the single scope.
+run "no_external_ip_no_project_ssh_one_scope" {
+  command = plan
+
+  assert {
+    condition     = length(google_compute_instance_template.host.network_interface) == 1 && length(google_compute_instance_template.host.network_interface[0].access_config) == 0
+    error_message = "the utility host must have one interface and no access_config (no external IP; egress through Cloud NAT)"
+  }
+  assert {
+    condition     = length(google_compute_instance_template.host.network_interface[0].ipv6_access_config) == 0
+    error_message = "the utility host must have no external IPv6 access config either"
+  }
+  assert {
+    condition     = google_compute_instance_template.host.metadata["block-project-ssh-keys"] == "true"
+    error_message = "block-project-ssh-keys must be \"true\" on the utility host"
+  }
+  assert {
+    condition     = length(google_compute_instance_template.host.service_account) == 1 && google_compute_instance_template.host.service_account[0].email == "host@stub-project.iam.gserviceaccount.com"
+    error_message = "the host must attach exactly the service_account_email it was given"
+  }
+  assert {
+    condition     = length(google_compute_instance_template.host.service_account[0].scopes) == 1 && contains(google_compute_instance_template.host.service_account[0].scopes, "https://www.googleapis.com/auth/cloud-platform")
+    error_message = "the host account must carry exactly the cloud-platform scope (IAM on the account is the boundary; no extra legacy scopes)"
+  }
+}
+
+run "refuses_controller_service_account" {
+  command = plan
+  variables {
+    service_account_email = "ci-runner-alpha-ctl@stub-project.iam.gserviceaccount.com"
+  }
+  expect_failures = [var.service_account_email]
+}
+
+run "refuses_default_compute_service_account" {
+  command = plan
+  variables {
+    service_account_email = "123456789-compute@developer.gserviceaccount.com"
+  }
+  expect_failures = [var.service_account_email]
+}
+
+run "accepts_a_ctl_lookalike_only_when_it_does_not_end_the_name" {
+  command = plan
+  variables {
+    service_account_email = "ci-ctl-reader-host@stub-project.iam.gserviceaccount.com"
+  }
+  assert {
+    condition     = google_compute_instance_template.host.service_account[0].email == "ci-ctl-reader-host@stub-project.iam.gserviceaccount.com"
+    error_message = "only a name ENDING in -ctl is a controller account"
+  }
+}
+
+run "refuses_shared_repo_label" {
+  command = plan
+  variables {
+    repos = { alpha = { slots = 1, labels = ["Alpha-Shared"] } }
+  }
+  expect_failures = [var.repos]
+}
+
+run "refuses_shared_runner_label" {
+  command = plan
+  variables {
+    runner_labels = ["linux", "gcp", "alpha-shared"]
+  }
+  expect_failures = [var.runner_labels]
+}
+
+# The lane host: a second instance whose slots answer `<Repo>-lane`.
+run "lane_suffix_threads_through_labels_and_runs_on" {
+  command = plan
+  variables {
+    name         = "ci-lane"
+    label_suffix = "lane"
+  }
+
+  assert {
+    condition     = google_compute_instance_template.host.metadata["ci-slot-labels"] == "Alpha-lane,extra;Alpha-lane,extra;beta-lane"
+    error_message = "ci-slot-labels must lead each slot with <Repo>-lane on a lane host"
+  }
+  assert {
+    condition     = join(",", output.runs_on["beta"]) == "self-hosted,linux,gcp,beta-lane"
+    error_message = "runs_on must give each repository its <Repo>-lane label set on a lane host"
+  }
+  assert {
+    condition     = !strcontains(google_compute_instance_template.host.metadata["ci-slot-labels"], "-util")
+    error_message = "a lane host must not answer any <Repo>-util label"
+  }
+  assert {
+    condition     = google_compute_instance_group_manager.host.base_instance_name == "ci-lane"
+    error_message = "the lane host keeps its own base name"
+  }
+}
+
+run "default_suffix_is_util" {
+  command = plan
+
+  assert {
+    condition     = !strcontains(google_compute_instance_template.host.metadata["ci-slot-labels"], "-lane")
+    error_message = "the gatekeeper host must not answer any <Repo>-lane label"
+  }
+}
+
+run "refuses_unknown_suffix" {
+  command = plan
+  variables {
+    label_suffix = "shared"
+  }
+  expect_failures = [var.label_suffix]
+}
+
+run "refuses_lane_host_on_the_gatekeeper_name" {
+  command = plan
+  variables {
+    label_suffix = "lane"
+  }
+  expect_failures = [google_compute_instance_template.host]
+}
+
+run "refuses_lane_label_on_the_gatekeeper_host" {
+  command = plan
+  variables {
+    repos = { alpha = { slots = 1, labels = ["alpha-lane"] } }
+  }
+  expect_failures = [var.repos]
+}
+
+run "refuses_util_label_on_the_lane_host" {
+  command = plan
+  variables {
+    name         = "ci-lane"
+    label_suffix = "lane"
+    repos        = { alpha = { slots = 1, labels = ["alpha-util"] } }
+  }
+  expect_failures = [var.repos]
+}
+
+run "refuses_lane_runner_label" {
+  command = plan
+  variables {
+    runner_labels = ["linux", "gcp", "x-lane"]
+  }
+  expect_failures = [var.runner_labels]
 }
 
 run "refuses_small_disk" {

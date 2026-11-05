@@ -6,8 +6,9 @@
 #   - no autoscaler and no controller: a zonal group of exactly one host;
 #   - no Spot: standard provisioning, live-migrated on host maintenance;
 #   - no job service account, no cache bucket, no turbo bucket, no shared port
-#     band: none of those keys is in the metadata, and the host reads an absent
-#     key as "off";
+#     band: none of those keys is in the metadata (a plan-time guard refuses
+#     them, #1638), and the host reads an absent key as "off";
+#   - no pin hold: `ci-utility=true` skips it on the host (#1639);
 #   - no IAM binding: the host account is passed in and only attached.
 
 locals {
@@ -53,9 +54,12 @@ locals {
     for r in local.repo_names : [for i in range(var.repos[r].slots) : r]
   ])
 
+  # `<Repo>-util` on the gatekeeper host, `<Repo>-lane` on the lane host.
+  scope_label = { for r in local.repo_names : r => "${r}-${var.label_suffix}" }
+
   slot_label_sets = flatten([
     for r in local.repo_names : [
-      for i in range(var.repos[r].slots) : join(",", distinct(concat(["${r}-util"], var.repos[r].labels)))
+      for i in range(var.repos[r].slots) : join(",", distinct(concat([local.scope_label[r]], var.repos[r].labels)))
     ]
   ])
 
@@ -69,7 +73,7 @@ locals {
   nominal_repo = local.repo_names[0]
 
   # Host-wide labels, joined into `ci-runner-labels`. `self-hosted` first, as on
-  # every pool; the per-slot `<Repo>-util` comes from ci-slot-labels, and the
+  # every pool; the per-slot `<Repo>-<label_suffix>` comes from ci-slot-labels, and the
   # host itself appends `host-<instance>` and `background`.
   runner_labels = join(",", distinct(concat(["self-hosted"], var.runner_labels)))
 
@@ -79,6 +83,57 @@ locals {
     component = "ci-runner-utility-host"
     pool      = var.name
   })
+
+  host_metadata = {
+    "startup-script" = local.host_startup
+
+    # No `enable-guest-attributes`: the pin hold was the only thing on a host
+    # that published one, and it is OFF here (host-startup.sh install_pin_hold,
+    # #1639). With no controller there is nobody to read it either.
+    "ci-host-os" = "linux"
+
+    "ci-github-owner"        = var.github_owner
+    "ci-github-repo"         = local.nominal_repo
+    "ci-app-id"              = var.github_app_id
+    "ci-app-installation-id" = var.github_app_installation_id
+    "ci-app-key-secret"      = var.github_app_private_key_secret
+    "ci-runner-labels"       = local.runner_labels
+    "ci-runner-group"        = var.runner_group
+    "ci-slots"               = tostring(local.total_slots)
+    "ci-pool"                = var.name
+    "ci-metric-prefix"       = var.metric_prefix
+
+    # No slot is reserved for pull-request work: with no autoscaler there is no
+    # headroom to give that job, so every slot also answers `background`.
+    "ci-interactive-slots" = "0"
+
+    # Declared empty so the key exists from boot; read by the slot loop's gate.
+    # Nothing sets it on this host (no controller), but a human cordon can.
+    "ci-cordon" = ""
+
+    # THE UTILITY KEYS (host-startup.sh, #1635/#1642). `ci-utility=true` is what
+    # turns on the per-slot repository binding and the co-tenancy hardening
+    # (B1 hidepid=2 and no container/service jobs, B2 inter-slot DROP, B3 no
+    # band, B4 rebind wipe, a private /dev/shm per slot unit, no pin hold). The
+    # host refuses to boot on a slot count that does not match either list.
+    "ci-utility"     = "true"
+    "ci-slot-repos"  = join(",", local.slot_repos)
+    "ci-slot-labels" = join(";", local.slot_label_sets)
+    # The image's dependency caches are built from ONE pool repository's
+    # lockfiles; seeding them here would hand that tree to every other slot.
+    "ci-cache-seed" = "off"
+
+    "block-project-ssh-keys" = "true"
+  }
+
+  # Keys this host must never carry (#1638 and ADR decision 2). The turbo cache
+  # listens on every slot's gateway, so on a multi-repository host it would be
+  # one repository reading another's build outputs; a job identity or a cache
+  # bucket is the same leak by another route. Guarded at plan time below.
+  forbidden_metadata = [
+    for k in keys(local.host_metadata) : k
+    if startswith(k, "ci-turbo-") || contains(["ci-job-service-account", "ci-cache-bucket", "ci-job-broker-py"], k)
+  ]
 }
 
 # --- host template ------------------------------------------------------------
@@ -121,49 +176,24 @@ resource "google_compute_instance_template" "host" {
     on_host_maintenance = "MIGRATE"
   }
 
-  metadata = {
-    "startup-script" = local.host_startup
-
-    # The pin hold publishes to guest attributes, as on every Linux pool host.
-    "enable-guest-attributes" = "TRUE"
-    "ci-host-os"              = "linux"
-
-    "ci-github-owner"        = var.github_owner
-    "ci-github-repo"         = local.nominal_repo
-    "ci-app-id"              = var.github_app_id
-    "ci-app-installation-id" = var.github_app_installation_id
-    "ci-app-key-secret"      = var.github_app_private_key_secret
-    "ci-runner-labels"       = local.runner_labels
-    "ci-runner-group"        = var.runner_group
-    "ci-slots"               = tostring(local.total_slots)
-    "ci-pool"                = var.name
-    "ci-metric-prefix"       = var.metric_prefix
-
-    # No slot is reserved for pull-request work: with no autoscaler there is no
-    # headroom to give that job, so every slot also answers `background`.
-    "ci-interactive-slots" = "0"
-
-    # Declared empty so the key exists from boot; read by the slot loop's gate.
-    # Nothing sets it on this host (no controller), but a human cordon can.
-    "ci-cordon" = ""
-
-    # THE UTILITY KEYS (host-startup.sh, #1635/#1642). `ci-utility=true` is what
-    # turns on the per-slot repository binding and the co-tenancy hardening
-    # (B1 hidepid=2 and no container/service jobs, B2 inter-slot DROP, B3 no
-    # band, B4 rebind wipe). The host refuses to boot on a slot count that does
-    # not match either list.
-    "ci-utility"     = "true"
-    "ci-slot-repos"  = join(",", local.slot_repos)
-    "ci-slot-labels" = join(";", local.slot_label_sets)
-    # The image's dependency caches are built from ONE pool repository's
-    # lockfiles; seeding them here would hand that tree to every other slot.
-    "ci-cache-seed" = "off"
-
-    "block-project-ssh-keys" = "true"
-  }
+  # locals.host_metadata, so the plan-time guard below can read the same map.
+  metadata = local.host_metadata
 
   lifecycle {
     create_before_destroy = true
+
+    precondition {
+      # The lane host is a SECOND instance beside the gatekeeper host; left on
+      # the default name it would collide with it (template prefix, MIG name,
+      # base instance name) in the same project.
+      condition     = var.label_suffix == "util" || var.name != "ci-utility"
+      error_message = "label_suffix = \"lane\" with the default name \"ci-utility\": the lane host needs its own name (e.g. \"ci-lane\"), distinct from the gatekeeper host and every pool base name."
+    }
+
+    precondition {
+      condition     = length(local.forbidden_metadata) == 0
+      error_message = "the utility host's metadata carries ${join(", ", local.forbidden_metadata)}. A turbo cache, cache bucket or job identity on a host whose slots serve different repositories is one repository reaching another's data (#1638, docs/adr-utility-host.md decision 2)."
+    }
 
     precondition {
       condition     = startswith(var.zone, "${var.region}-")

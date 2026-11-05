@@ -35,5 +35,5 @@ output "slot_repos" {
 
 output "runs_on" {
   description = "Per repository, the `runs-on` label list a workflow uses to send a job to this host."
-  value       = { for r in local.repo_names : r => distinct(concat(["self-hosted"], var.runner_labels, ["${r}-util"])) }
+  value       = { for r in local.repo_names : r => distinct(concat(["self-hosted"], var.runner_labels, [local.scope_label[r]])) }
 }
