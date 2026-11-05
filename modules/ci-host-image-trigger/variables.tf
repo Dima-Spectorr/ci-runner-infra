@@ -190,6 +190,8 @@ variable "included_files" {
     "scripts/ci/image-vuln-verdict.sh",
     "docs/image-vuln-ignores.txt",
     "docs/image-vuln-offdistro.txt",
+    # The baked gh (#441): its version and sha256 pin live in this script.
+    "scripts/ci/ensure-gh.sh",
   ]
   description = "Globs whose change rebuilds the image. Scoped tightly on purpose: this build takes about an hour, and firing it on every merge to a repository that is mostly documentation and shell would spend the day rebuilding an identical image. Broad `scripts/**` is still NOT included — only the individual files a `file` provisioner uploads into the build, which is what `packer_upload_paths_are_watched` in `scripts/ci/image-guard.selftest.sh` keeps this list honest about. Widen it when that set grows: a file the build reads but the trigger does not watch means the fix for a red build cannot cause the rebuild that clears it."
 }
