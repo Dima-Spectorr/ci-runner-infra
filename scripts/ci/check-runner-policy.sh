@@ -17,7 +17,9 @@
 #
 #     RUNNER1  a fleet-reachable `runs-on` also names a label that SCOPES it to
 #              one repository.
-#     RUNNER2  and, with `--scope=<label>`, it must be THAT label.
+#     RUNNER2  and, with `--scope=<label>`, it must be THAT label — or the
+#              same repository's utility-host label, `<label>-util` or
+#              `<label>-lane`.
 #     RUNNER3  every job declares `timeout-minutes`.
 #     RUNNER4  a workflow reachable by fork code keeps that code off the pool.
 #     RUNNER5  the runner is selected dynamically — UNDECIDED, not passed.
@@ -44,6 +46,18 @@
 #              published anchor looks like from the caller's side.
 #     RUNNER11 a WINDOWS fleet job does not name `localhost` on a
 #              shared-infrastructure port — there is nothing listening there.
+#
+#   And, for a job on a UTILITY HOST — a label ending `-util` (gatekeepers) or
+#   `-lane` (the lane-only host), in `runs-on` or, for a `uses:` job, in
+#   `with: runs-on:` (docs/adr-utility-host.md), where one machine serves
+#   several repositories:
+#
+#     RUNNER15 the job declares no `container:` and no `services:` (#1643).
+#     RUNNER16 the workflow is not triggered by `pull_request_target`.
+#     RUNNER17 a `-util` job: the run declares `--forks=blocked` (#1649).
+#     RUNNER18 a `-lane` job IS the call to the fleet's merge-lane workflow.
+#     RUNNER19 the merge-lane call is not routed to a `-util` label.
+#   (RUNNER12-14 are retired numbers and are not reused.)
 #
 # WHAT COUNTS AS REACHING THE FLEET
 #   `self-hosted` is a LABEL, not a requirement. GitHub routes a job to any
@@ -132,6 +146,43 @@
 #   this fleet either, and it does run containers. Only a fleet-reachable job
 #   naming the `windows` platform label is refused.
 #
+# WHY A UTILITY-HOST LABEL GETS RULES OF ITS OWN
+#   A pool host serves ONE repository. A utility host serves several, one slot
+#   per repository, each slot registered with `<Repo>-util` — or `<Repo>-lane`
+#   on the lane-only host (docs/adr-utility-host.md §3). So each is a repository
+#   scope like `<Repo>` — RUNNER1 already reads it as one, and RUNNER2 accepts
+#   it beside the declared scope, never another repository's, including when a
+#   `uses:` job hands it to its callee as `with: runs-on:` — but the host behind
+#   it is co-tenanted, and things that are tolerable on a pool host are not:
+#
+#   - RUNNER15, `container:`/`services:`. The utility host hardens `/proc`
+#     (hidepid=2) so one slot cannot read another repository's token out of a
+#     process argv; a job container is a second process namespace the hardening
+#     does not reach, and the runner's container hook cannot refuse it on the
+#     host (#1643). This gate is where it is refused.
+#   - RUNNER16, `pull_request_target`. That trigger runs with the BASE
+#     repository's secrets on a pull request anyone may open; the ADR keeps
+#     every such workflow hosted (§6). Refused on the label, not the job's fork
+#     guard: a co-tenanted host is the wrong place for it whatever the `if:`.
+#   - RUNNER17, the fork posture. The ADR requires every repository bound to
+#     the utility host to have fork pull-request workflows disabled. That
+#     setting lives in GitHub, not in YAML, so what this gate can enforce is the
+#     DECLARATION — `--forks=blocked`, in the consuming workflow where it is
+#     reviewable — which is the same posture RUNNER4 already reads. A fork
+#     guard on the job does not answer it: the requirement is on the
+#     repository, and one unguarded job later is all it takes. Asked of `-util`
+#     only: RUNNER18 already keeps everything but the merge lane — which runs
+#     default-branch code on `workflow_run` — off a `-lane` host.
+#   - RUNNER18, a `-lane` host runs the merge-lane call and nothing else: the
+#     job must `uses:` the fleet's `merge-lane.yml` (remote, or local in this
+#     repository). Anything else belongs on `-util` or the pool.
+#   - RUNNER19, the converse: the merge lane carries the merge App key, so its
+#     call is never routed to the shared gatekeeper host.
+#
+#   A utility host also holds no shared stack, so RUNNER9 does not ask a
+#   `-util`/`-lane` job to pin to the anchor: pinning it would move it back onto
+#   the pool, which is the opposite of what the label says.
+#
 #
 # WHY REACHABILITY CROSSES A LOCAL `uses:` CALL
 #   A `pull_request` workflow that calls `./.github/workflows/build.yml` runs
@@ -213,6 +264,18 @@ GENERIC='self-hosted|linux|windows|macos|x64|arm64|arm|gcp|aws|azure|on-prem'
 # only job is to fail if this line ever grows.
 WINDOWS_LABEL='windows'
 
+# The suffixes a utility-host slot registers under (docs/adr-utility-host.md):
+# `<Repo>-util` for gatekeeper jobs, `<Repo>-lane` for a lane-only utility host
+# that runs the merge-lane call and nothing else. Matched case-insensitively at
+# the END of a label.
+UTIL_SUFFIX='-util'
+LANE_SUFFIX='-lane'
+
+# The one job a `-lane` label may carry: the call to the fleet's merge-lane
+# reusable workflow — remote (`<owner>/ci-runner-infra/…@<ref>`) or, in this
+# repository, local. Matched against the `uses:` target the reader reports.
+MERGE_LANE_CALL='^([^/]+/ci-runner-infra/|\./)\.github/workflows/merge-lane\.ya?ml(@.*)?$'
+
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
 # gate would report PASS over files it never opened. It installs nothing: a
@@ -257,6 +320,8 @@ ensure_yaml() {
 #   #FORKGUARD\t<id>                 `head.repo.fork` decides this job
 #   #CONTAINER\t<id>                 the job declares `container:`
 #   #SERVICES\t<id>                  the job declares `services:`
+#   #WITHRUNSON\t<id>\t<label>        one literal label a `uses:` job passes as
+#                                    `with: runs-on:` (the merge lane's input)
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -783,6 +848,31 @@ for job_id, job in jobs.items():
                 for kind, ref in dict.fromkeys(refs):
                     out("#WITH", vid, w_name, kind, ref)
 
+        # The pool a `uses:` job hands its callee through `with: runs-on:`, for
+        # the utility-host rules (RUNNER2's `-util`/`-lane` arm, RUNNER18,
+        # RUNNER19). The merge lane takes its pool that way — a `type: string`
+        # input holding one label or a JSON list — so a caller routed to
+        # `<Repo>-lane` names the label HERE and nowhere else. Literal values
+        # only: an expression is RUNNER5's subject, not a label this can read.
+        if isinstance(with_block, dict) and "runs-on" in with_block:
+            w_runs = with_block["runs-on"]
+            w_labels = []
+            if isinstance(w_runs, list):
+                w_labels = w_runs
+            elif isinstance(w_runs, str) and "${{" not in w_runs:
+                w_text = w_runs.strip()
+                if w_text.startswith("["):
+                    try:
+                        parsed = json.loads(w_text)
+                    except ValueError:
+                        parsed = []
+                    w_labels = parsed if isinstance(parsed, list) else []
+                elif w_text:
+                    w_labels = [w_text]
+            for w_label in w_labels:
+                if isinstance(w_label, str) and w_label.strip():
+                    out("#WITHRUNSON", vid, w_label.strip())
+
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
         # `runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}` is the whole
@@ -1236,6 +1326,12 @@ check_file() {
      [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
     has_pr=1
   fi
+  # RUNNER16 asks about this trigger alone: it runs with the base repository's
+  # secrets on a pull request anyone may open.
+  local has_prtarget=0
+  if [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
+    has_prtarget=1
+  fi
   # Kept before reachability widens `has_pr` below. RUNNER9 needs the narrow
   # answer — "does this file open a pull-request run of its own?" — because a
   # callee that runs on a pull request ONLY as a callee has its pool chosen by
@@ -1269,6 +1365,7 @@ check_file() {
     local job_base="${job%%~leg*}"
 
     local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
+    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 call_target
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     # "Every literal label is a GitHub-hosted image" is the reader's answer, not
     # a second opinion computed here — see `#HOSTEDONLY`.
@@ -1291,6 +1388,24 @@ check_file() {
     done <<EOF
 $labels
 EOF
+
+    # The utility-host question (RUNNER15-19): is the other end a co-tenanted
+    # utility host — by the job's own `runs-on`, or, for a `uses:` job, by the
+    # pool it hands its callee in `with: runs-on:`. A suffix and nothing more;
+    # the repository part is RUNNER2's business. `--`: each pattern starts with
+    # a dash, which grep would otherwise take for options.
+    with_labels="$(printf '%s\n' "$records" | sed -n "s/^#WITHRUNSON\t${job_re}\t//p")"
+    if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${UTIL_SUFFIX}\$")" -gt 0 ]; then
+      util_host=1
+    fi
+    if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${LANE_SUFFIX}\$")" -gt 0 ]; then
+      lane_host=1
+    fi
+    { [ "$util_host" -eq 1 ] || [ "$lane_host" -eq 1 ]; } && co_tenant=1
+    call_target="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p; s/^#CALLS\t${job_re}\t//p" | head -1)"
+    if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL" >/dev/null; then
+      merge_lane_call=1
+    fi
 
     # `self-hosted` is a label, not a requirement. GitHub routes a job to any
     # runner carrying a SUPERSET of what `runs-on` names, so `runs-on: Atlas`
@@ -1358,9 +1473,13 @@ EOF
       fi
 
       # RUNNER2 — the stronger form, for a consumer that names its own pool.
+      # Its own utility-host slots are its own scope too (`<scope>-util`,
+      # `<scope>-lane`; docs/adr-utility-host.md); another repository's are
+      # not, exactly as another repository's pool label is not. Fixed strings,
+      # so a scope with a regex metacharacter in it is matched as written.
       if [ -n "$scope" ] && [ "$has_expr" -eq 0 ] && [ "$has_group" -eq 0 ]; then
-        if [ "$(printf '%s\n' "$labels" | grep -cix -- "$scope")" -eq 0 ]; then
-          err RUNNER2 "$rel: job '$job' is self-hosted but does not carry the declared scope label '$scope'"
+        if [ "$(printf '%s\n' "$labels" | grep -cixF -e "$scope" -e "${scope}${UTIL_SUFFIX}" -e "${scope}${LANE_SUFFIX}")" -eq 0 ]; then
+          err RUNNER2 "$rel: job '$job' is self-hosted but does not carry the declared scope label '$scope' (or its utility-host label '${scope}${UTIL_SUFFIX}' / '${scope}${LANE_SUFFIX}')"
         fi
       fi
 
@@ -1394,6 +1513,47 @@ EOF
          { [ "$ALLOW_DYNAMIC" -eq 1 ] || dynamic_runner_declared "$file" "$job_base"; } &&
          ! linux_pool_proven "$file" "$records" "$job" "$job_base" </dev/null; then
         err RUNNER8 "$rel: job '$job' selects its runner dynamically and declares container: or services: — this gate cannot tell whether that pool is Windows, which has NO container runtime (prove it is Linux: resolve runs-on from the anchor's needs.<owner>.outputs.runs-on, or declare '# linux-pool($job_base): <why the pool is Linux>' beside the job)"
+      fi
+    fi
+
+    # RUNNER2/15-19 — the co-tenanted utility hosts. See "WHY A UTILITY-HOST
+    # LABEL GETS RULES OF ITS OWN" in the header. Outside the self-hosted block
+    # on purpose: a `uses:` job names no `runs-on` of its own, and the merge
+    # lane is exactly such a job — its pool arrives as `with: runs-on:`.
+    if [ "$co_tenant" -eq 1 ]; then
+      # RUNNER2's half for a `uses:` job: every utility label it hands its
+      # callee is this repository's own. (A job's own `runs-on` was judged by
+      # RUNNER2 above.)
+      local foreign_util=""
+      if [ -n "$scope" ] && [ -n "$with_labels" ]; then
+        foreign_util="$(printf '%s\n' "$with_labels" | grep -iE -- "(${UTIL_SUFFIX}|${LANE_SUFFIX})\$" |
+          grep -vixF -e "${scope}${UTIL_SUFFIX}" -e "${scope}${LANE_SUFFIX}")"
+      fi
+      if [ -n "$foreign_util" ]; then
+        err RUNNER2 "$rel: job '$job' hands its callee a utility-host label that is not this repository's ('${scope}${UTIL_SUFFIX}' / '${scope}${LANE_SUFFIX}'): with: runs-on: [$(printf '%s' "$with_labels" | tr '\n' ' ')]"
+      fi
+      # Written services-first on purpose: RUNNER8's spelling is the target
+      # of the mutation suite's cases 5-6, and sharing it would let a RUNNER15
+      # fixture catch a RUNNER8 regression (or the reverse).
+      if [ "$has_services" -eq 1 ] || [ "$has_container" -eq 1 ]; then
+        local rule15_keys=""
+        [ "$has_container" -eq 1 ] && rule15_keys="container:"
+        [ "$has_services" -eq 1 ] && rule15_keys="${rule15_keys:+$rule15_keys and }services:"
+        err RUNNER15 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX} / *${LANE_SUFFIX}) and declares $rule15_keys — the utility host is shared by several repositories, and a job container is a process namespace its /proc hardening does not reach (keep this job on its pool label or a hosted image, or drop the container; #1643)"
+      fi
+      if [ "$has_prtarget" -eq 1 ]; then
+        err RUNNER16 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX} / *${LANE_SUFFIX}) in a workflow triggered by pull_request_target — that trigger runs with the base repository's secrets on a pull request anyone may open, and docs/adr-utility-host.md keeps every such workflow hosted"
+      fi
+      if [ "$util_host" -eq 1 ] && [ "$forks" != "blocked" ]; then
+        err RUNNER17 "$rel: job '$job' targets a utility-host label (*${UTIL_SUFFIX}) but the run does not declare --forks=blocked — every repository bound to the utility host must have fork pull-request workflows disabled (docs/adr-utility-host.md), and that is declared here, where it is reviewable (#1649)"
+      fi
+      # RUNNER18 — the lane host runs the merge lane and nothing else.
+      if [ "$lane_host" -eq 1 ] && [ "$merge_lane_call" -eq 0 ]; then
+        err RUNNER18 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) but is not the call to the fleet's merge-lane reusable workflow — that host exists for the merge lane alone (use the -util label for a gatekeeper job, or the pool label)"
+      fi
+      # RUNNER19 — and the merge lane stays off the gatekeeper host.
+      if [ "$util_host" -eq 1 ] && [ "$merge_lane_call" -eq 1 ]; then
+        err RUNNER19 "$rel: job '$job' routes the merge-lane call to a gatekeeper utility-host label (*${UTIL_SUFFIX}) — the lane carries the merge App key and stays off the shared gatekeeper host (use the lane-host label, *${LANE_SUFFIX})"
       fi
     fi
 
@@ -1527,8 +1687,12 @@ EOF
         # Windows is exempt by design, not by omission — rule 1's exception.
         # A Windows job reaches the stack across the band (RUNNER11 checks it
         # reaches it correctly), so it is a second host on purpose.
+        #
+        # A utility-host job is exempt for the same reason: it is a second host
+        # by its label, holds no stack (RUNNER15), and pinning it to the anchor
+        # would move it back onto the pool.
         if [ "$windows_pool" -eq 0 ] && [ "$pins_to_anchor" -eq 0 ] && [ "$is_anchor" -eq 0 ] &&
-           [ "$pins_to_caller" -eq 0 ]; then
+           [ "$pins_to_caller" -eq 0 ] && [ "$co_tenant" -eq 0 ]; then
           if ! shared_infra_marker "$file" exempt "$job_base"; then
             err RUNNER9 "$rel: job '$job' is self-hosted on a pull_request workflow and names its pool directly instead of resolving it from the anchor job's output — GitHub may place it on a different host than the rest of this run, where the run's shared stack does not exist (use runs-on: \${{ fromJSON(needs.<anchor>.outputs.runs-on) }}; in a called workflow, take the array as a REQUIRED workflow_call input and resolve runs-on from it; or declare '# shared-infra-exempt($job_base, #<issue>): <reason>')"
           fi
@@ -2294,6 +2458,282 @@ jobs:
     timeout-minutes: 30
     steps: [{run: "true"}]'
 
+  # --- the utility host (docs/adr-utility-host.md) ----------------------------
+  # The main flow: a gatekeeper job moved to the repository's own `-util` slot,
+  # on a pull request, in a repository that declares forks blocked. Clean —
+  # RUNNER2 accepts `<scope>-util`, and RUNNER4 is answered by the posture.
+  # Written `Example.Repo` so a regex reading of the scope (`.` = any char)
+  # would ALSO be exercised by the `ExampleXRepo-util` fixture below.
+  expect "a gatekeeper on its own -util slot" "" "Example.Repo" blocked \
+'on: [pull_request, push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, Example.Repo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # Case-insensitively, as every label test here is: GitHub does not
+  # distinguish `-UTIL` from `-util`, so neither may this gate.
+  expect "the -util suffix is matched case-insensitively" "RUNNER15" "Example.Repo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, Example.Repo-UTIL]
+    timeout-minutes: 5
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]'
+
+  # Another repository's utility slot is refused exactly as another
+  # repository's pool label is. RUNNER1 stays quiet — it IS a scope label, just
+  # not this repository's.
+  expect "another repository's -util label is not this scope" "RUNNER2" "Example.Repo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, OtherRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # The scope is matched as a FIXED string: `.` in the declared scope is a dot.
+  expect "the scope is not read as a regex for the -util form" "RUNNER2" "Example.Repo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleXRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # Only the exact `-util` suffix. A label that merely CONTAINS the scope is
+  # another scope — `ExampleRepo-utility` is not this repository's slot, nor a
+  # utility host at all: with forks allowed, an unanchored suffix match would
+  # add RUNNER17 here.
+  expect "a longer suffix is not the -util form" "RUNNER2" "ExampleRepo" allowed \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-utility]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # RUNNER15 (#1643): no job container on a co-tenanted host. One fixture per
+  # key, so each half of the condition is pinned by a fixture of its own.
+  expect "a -util job with container: is refused" "RUNNER15" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    container: {image: "node:22"}
+    steps: [{run: "true"}]'
+
+  expect "a -util job with services: is refused" "RUNNER15" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]'
+
+  # …and only on the utility host. The same job on the repository's POOL label
+  # is how the Linux pool is meant to be used — the rule is scoped to the
+  # label, as RUNNER8 is.
+  expect "container: on the pool label is still clean" "" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 5
+    container: {image: "node:22"}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]'
+
+  # RUNNER16: pull_request_target stays hosted, fork guard or not. The guard
+  # silences RUNNER4 here, so RUNNER16 is the only id left to fire.
+  expect "a -util job on pull_request_target is refused" "RUNNER16" "ExampleRepo" blocked \
+'on:
+  pull_request_target:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and the same trigger on the repository's pool label is RUNNER16-clean
+  # (RUNNER4 owns that case, and forks=blocked answers it).
+  expect "pull_request_target on the pool label is not RUNNER16" "" "ExampleRepo" blocked \
+'on:
+  pull_request_target:
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # RUNNER17 (#1649): a repository bound to the utility host declares forks
+  # blocked. On a push-only workflow, so RUNNER4 cannot be what fires: the
+  # requirement is on the repository, not on this one trigger.
+  expect "a -util job without --forks=blocked is refused" "RUNNER17" "ExampleRepo" allowed \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # A fork guard answers RUNNER4 and not RUNNER17.
+  expect "a fork guard does not answer the utility-host fork posture" "RUNNER17" "ExampleRepo" allowed \
+'on: [pull_request]
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and the pool label with forks allowed and a guard stays clean: RUNNER17
+  # is scoped to the utility host.
+  expect "forks allowed on the pool label is not RUNNER17" "" "ExampleRepo" allowed \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # A `uses:` job that hands a LOCAL reusable workflow the `-util` label is a
+  # gatekeeper like any other: clean with forks blocked.
+  expect "a reusable handed the -util label is a gatekeeper" "" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ExampleRepo-util'
+
+  # --- the lane-only host: `<Repo>-lane` runs the merge lane and nothing else -
+  # The main flow: the merge-lane call, remote and declared, handed its own
+  # `-lane` slot as the input's JSON-list string. Forks ALLOWED on purpose:
+  # RUNNER17 is a `-util` rule, and a lane host runs default-branch code only.
+  expect "the merge-lane call on its own -lane slot" "" "ExampleRepo" allowed \
+'on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo-lane"]'"'"''
+
+  # The local call (this repository's own lane), single-label form.
+  expect "the local merge-lane call on -lane, one label" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # RUNNER18: a gatekeeper on the lane host. RUNNER2 accepts `<scope>-lane`, so
+  # RUNNER18 is the only id — and RUNNER2 joins it if that acceptance regresses.
+  expect "a step job on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # Case-insensitively, as `-util` is.
+  expect "the -lane suffix is matched case-insensitively" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-LANE]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # Only the exact suffix: `-lanes` is another scope, not a lane host.
+  expect "a longer suffix is not the -lane form" "RUNNER2" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-lanes]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  expect "another reusable workflow on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # A file NAMED merge-lane.yml in some other repository is not the fleet's.
+  expect "a look-alike merge-lane from another repository is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(someone/other-infra/.github/workflows/merge-lane.yml, #1635): look-alike
+    uses: someone/other-infra/.github/workflows/merge-lane.yml@v1
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # RUNNER19: the lane stays off the gatekeeper host. Forks blocked, so
+  # RUNNER17 cannot be what fires. The JSON-list string form, so this is also
+  # the fixture that fails if that form stops being parsed.
+  expect "the merge-lane call on -util is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo-util"]'"'"''
+
+  # RUNNER2's `with:` arm, read from a YAML list as well as a string.
+  expect "another repository's -lane label in with: is refused" "RUNNER2" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: [self-hosted, linux, gcp, OtherRepo-lane]'
+
+  expect "a -lane job with services: is refused" "RUNNER15 RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-lane]
+    timeout-minutes: 5
+    services:
+      db: {image: "postgres:16"}
+    steps: [{run: "true"}]'
+
+  expect "the merge-lane call on pull_request_target is refused" "RUNNER16" "ExampleRepo" blocked \
+'on: [pull_request_target]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # An expression in `with: runs-on:` names no label this can read: no
+  # utility-host rule fires on it (RUNNER18 included).
+  expect "an expression in with: runs-on: is not read as a label" "" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ vars.LANE_LABEL || '"'"'ExampleRepo-lane'"'"' }}'
+
   expect "runner group is undecidable, not clean" "RUNNER5" "" blocked \
 'on: [push]
 jobs:
@@ -2796,6 +3236,30 @@ jobs:
   lint:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # The same file with `lint` moved to the utility host: a second host BY ITS
+  # LABEL, holding no stack, so RUNNER9 does not ask it to pin to the anchor —
+  # pinning would move it back onto the pool (docs/adr-utility-host.md).
+  expect_si "a -util job is not asked to pin to the anchor" "" \
+'on: [pull_request]
+jobs:
+  anchor:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 30
+    outputs:
+      runs-on: ${{ steps.pin.outputs.runs-on }}
+    services:
+      db: {image: "postgres:16"}
+    steps: [{id: pin, run: "true"}]
+  test:
+    needs: [anchor]
+    runs-on: ${{ fromJSON(needs.anchor.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps: [{run: "true"}]
+  lint:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
     steps: [{run: "true"}]'
 
   # The fleet's fork-routing idiom wraps the resolution rather than replacing

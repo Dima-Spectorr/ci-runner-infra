@@ -293,6 +293,111 @@ mutate "host and band port in separate keys no longer read (S2R#2153)" \
 mutate "a required input pins whatever the caller passes (#380)" \
   's@caller_passes_anchor "$abs_in" "$in_name" 0 </dev/null && pins_to_caller=1@pins_to_caller=1@'
 
+# --- the utility hosts (#1635, #1643, #1649) -----------------------------------
+# Each reverts one element of the `-util`/`-lane` arms. Every sed program below
+# names text that occurs ONCE in the gate (RUNNER15's condition is written
+# services-first so it never shares RUNNER8's spelling, which cases 5-6 edit).
+# Unnumbered on purpose: the count is asserted by FLOOR, not by these comments.
+
+# RUNNER2 forgets a utility-host form: the main flow — a gatekeeper on its own
+# `-util` slot, a step job on `-lane` reading as RUNNER18 alone — goes red.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER2 no longer accepts <scope>-util" \
+  's@ -e "${scope}${UTIL_SUFFIX}" -e "${scope}${LANE_SUFFIX}")" -eq 0@ -e "${scope}${LANE_SUFFIX}")" -eq 0@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER2 no longer accepts <scope>-lane" \
+  's@ -e "${scope}${UTIL_SUFFIX}" -e "${scope}${LANE_SUFFIX}")" -eq 0@ -e "${scope}${UTIL_SUFFIX}")" -eq 0@'
+
+# The scope matched as a regex: `Example.Repo` then accepts `ExampleXRepo-util`,
+# another repository's slot.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER2 reads the scope as a regex" \
+  's@grep -cixF -e "$scope"@grep -cixE -e "$scope"@'
+
+# RUNNER2's `with:` arm never reports: a merge-lane call handed another
+# repository's `-lane` slot reads clean.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER2 no longer judges with: runs-on:" \
+  's@if \[ -n "$foreign_util" \]; then@if false; then@'
+
+# A suffix matched case-sensitively (`-UTIL`/`-LANE` escape every rule), or no
+# longer anchored (`-utility`/`-lanes` become utility hosts).
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the -util suffix matched case-sensitively" \
+  's@grep -ciE -- "${UTIL_SUFFIX}\\$"@grep -cE -- "${UTIL_SUFFIX}\\$"@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the -util suffix no longer anchored at the end" \
+  's@grep -ciE -- "${UTIL_SUFFIX}\\$"@grep -ciE -- "${UTIL_SUFFIX}"@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the -lane suffix matched case-sensitively" \
+  's@grep -ciE -- "${LANE_SUFFIX}\\$"@grep -cE -- "${LANE_SUFFIX}\\$"@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the -lane suffix no longer anchored at the end" \
+  's@grep -ciE -- "${LANE_SUFFIX}\\$"@grep -ciE -- "${LANE_SUFFIX}"@'
+
+# The reader stops handing over `with: runs-on:`, or one of its three shapes.
+mutate "the reader no longer reports with: runs-on: labels" \
+  's@out("#WITHRUNSON", vid, w_label.strip())@pass@'
+mutate "with: runs-on: as a YAML list no longer read" \
+  's@^                w_labels = w_runs$@                w_labels = []@'
+mutate "with: runs-on: as a JSON-list string no longer read" \
+  's@w_labels = parsed if isinstance(parsed, list) else \[\]@w_labels = []@'
+mutate "with: runs-on: as one label no longer read" \
+  's@w_labels = \[w_text\]@w_labels = []@'
+
+# One half of RUNNER15's disjunction dropped.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER15 no longer reads container:" \
+  's@\[ "$has_services" -eq 1 \] || \[ "$has_container" -eq 1 \]@[ "$has_services" -eq 1 ]@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER15 no longer reads services:" \
+  's@\[ "$has_services" -eq 1 \] || \[ "$has_container" -eq 1 \]@[ "$has_container" -eq 1 ]@'
+
+# Each finding computed and never reported.
+mutate "the RUNNER15 diagnostic never emitted" \
+  's@ err RUNNER15 @ : RUNNER15 @'
+mutate "the RUNNER16 diagnostic never emitted" \
+  's@ err RUNNER16 @ : RUNNER16 @'
+mutate "the RUNNER17 diagnostic never emitted" \
+  's@ err RUNNER17 @ : RUNNER17 @'
+mutate "the RUNNER18 diagnostic never emitted" \
+  's@ err RUNNER18 @ : RUNNER18 @'
+mutate "the RUNNER19 diagnostic never emitted" \
+  's@ err RUNNER19 @ : RUNNER19 @'
+
+# RUNNER17 satisfied by any posture, or widened from `-util` to `-lane`.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER17 ignores the declared fork posture" \
+  's@ && \[ "$forks" != "blocked" \]; then@; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER17 asked of a -lane job too" \
+  's@if \[ "$util_host" -eq 1 \] && \[ "$forks"@if [ "$forks"@'
+
+# The utility-host arms widened to every job: a pool job with `container:` —
+# how the Linux pool is meant to be used — goes red.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the utility-host arms fire on every job" \
+  's@if \[ "$co_tenant" -eq 1 \]; then@if true; then@'
+
+# RUNNER9 asks a utility-host job to pin to the anchor again.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER9 no longer exempts a utility-host job" \
+  's@ && \[ "$co_tenant" -eq 0 \]; then@; then@'
+
+# The pull_request_target fact never set: RUNNER16 has nothing to read.
+mutate "RUNNER16 never learns the trigger" \
+  's@^    has_prtarget=1$@    has_prtarget=0@'
+
+# RUNNER18 refuses the merge lane itself, never recognises it, or recognises a
+# file of that name in ANY repository.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER18 no longer excuses the merge-lane call" \
+  's@if \[ "$lane_host" -eq 1 \] && \[ "$merge_lane_call" -eq 0 \]; then@if [ "$lane_host" -eq 1 ]; then@'
+mutate "the merge-lane call is never recognised" \
+  's@^      merge_lane_call=1$@      merge_lane_call=0@'
+mutate "a merge-lane.yml in any repository counts as the fleet's" \
+  's@\[^/\]+/ci-runner-infra/@[^/]+/[^/]+/@'
+
 }
 
 # --- the worker entry point ---------------------------------------------------
@@ -467,8 +572,9 @@ CASES="$(case_list | wc -l)"
 # mutations with them. Lowered deliberately, which is what the paragraph above
 # asks for: the six cases mutated code that no longer exists, so keeping the
 # floor would have failed the suite for the absence of rules this repository
-# decided to delete.
-FLOOR=25
+# decided to delete. Raised to 52 by the twenty-seven utility-host cases
+# (`-util` and `-lane`, #1635).
+FLOOR=52
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
