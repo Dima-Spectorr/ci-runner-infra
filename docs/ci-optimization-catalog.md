@@ -738,7 +738,10 @@ Four design choices, each against a specific way this kind of gate dies:
   **enforced by identity**, not by count. The `(id, package)` pairs the image
   carries live in `docs/image-vuln-offdistro.txt` (seeded 2026-08-26 from build
   `1057f771`: 117 pairs behind 273 findings), and a pair not in that file is a
-  red build with a pull request as the review. A count would have been useless
+  red build with a pull request as the review. A line recorded under pressure
+  carries `expires=YYYY-MM-DD` after the package; past that date the gate fails
+  VULN3 naming the line, so an unreviewed exception cannot become permanent by
+  being forgotten (#1682). A count would have been useless
   here — it moves whenever the vulnerability database does — whereas a new pair
   is a new statement about this image. Attributing a vendored module to the
   distro binary that already patched it still needs a scanner that understands

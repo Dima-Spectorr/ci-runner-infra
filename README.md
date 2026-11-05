@@ -267,7 +267,10 @@ blocking findings, and every one of the 273 was a match of exactly that kind.
 They are still counted and named, as `off-distro`, and their **population is
 enforced by identity**: the `(id, package)` pairs the image is known to carry
 live in `docs/image-vuln-offdistro.txt`, seeded from a real scan, and a pair in
-a later scan that is not in that file is a red build. So the gap this narrowing
+a later scan that is not in that file is a red build. A line may carry
+`expires=YYYY-MM-DD` right after the package: past that date it no longer
+covers its pair, and a scan still carrying it fails VULN3 naming the expired
+line (#1682). So the gap this narrowing
 leaves — a genuinely vulnerable module vendored into an image binary — is
 bounded by *growth* rather than left open, without restoring a gate that goes
 red on every backport. Pruning a line that stopped appearing never fails a

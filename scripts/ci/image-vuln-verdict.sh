@@ -20,7 +20,8 @@
 #            finding it was hiding is reported alongside it
 #     VULN3  an off-distro finding this image has not seen before — blocking,
 #            once the baseline is seeded (see WHY THE OFF-DISTRO POPULATION IS
-#            TRACKED)
+#            TRACKED) — or one whose baseline line carries an `expires=` date
+#            that has passed, named by its line (#1682)
 #     VULN0  the report could not be read, or matched nothing at all —
 #            reported as a failure, never as a clean image
 #
@@ -327,6 +328,8 @@ run() {
 
   known=""
   baseline_state="absent"
+  # "<id> <package>" -> "line N expired on DATE: <line>", for the VULN3 message.
+  local -A expired_line=()
   if [ -n "$BASELINE" ] && [ -f "$BASELINE" ]; then
     # A line the reader half-understands is worse than no baseline: it would
     # silently accept a pair nobody recorded. One field is the shape a truncated
@@ -334,20 +337,47 @@ run() {
     # package. The reason column is OPTIONAL here, unlike the ignore file — this
     # records what the image contains, not a decision to tolerate it, and forcing
     # 273 seeded lines to each carry prose would produce 273 lines of nothing.
-    local lineno=0 line f1 f2
+    #
+    # EXPIRY (#1682). An optional `expires=YYYY-MM-DD` as the THIRD field, right
+    # after the package, makes the line an exception with a deadline rather than
+    # a permanent record. Past that date the line no longer covers its pair, so a
+    # scan that still carries it fails as VULN3 naming the expired line — the same
+    # rule as the ignore file: re-affirming is a pull request with a new date.
+    # Positional and not searched for, so a note that merely MENTIONS "expires="
+    # in its prose changes nothing. Live through its own date, like an ignore. A
+    # malformed date is VULN0: a deadline the gate half-read is no deadline.
+    local lineno=0 entries=0 line f1 f2 f3 exp
     while IFS= read -r line || [ -n "$line" ]; do
       lineno=$((lineno + 1))
       case "$line" in ''|'#'*) continue ;; esac
-      read -r f1 f2 _ <<< "$line"
+      f3=""
+      read -r f1 f2 f3 _ <<< "$line"
       if [ -z "$f2" ]; then
-        echo "::error::[VULN0] $BASELINE line $lineno is not '<id> <package> [reason]': $line" >&2
+        echo "::error::[VULN0] $BASELINE line $lineno is not '<id> <package> [expires=YYYY-MM-DD] [reason]': $line" >&2
         return 2
       fi
+      entries=$((entries + 1))
+      case "$f3" in
+        expires=*)
+          exp="${f3#expires=}"
+          if ! [[ "$exp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::[VULN0] $BASELINE line $lineno has an expiry that is not expires=YYYY-MM-DD: $line" >&2
+            return 2
+          fi
+          if [[ "$TODAY" > "$exp" ]]; then
+            expired_line["$f1 $f2"]="line $lineno expired on $exp: $line"
+            continue
+          fi
+          ;;
+      esac
       known="$known$f1 $f2
 "
     done < "$BASELINE"
     known="$(printf '%s' "$known" | sort -u)"
-    [ -n "$known" ] && baseline_state="seeded" || baseline_state="unseeded"
+    # Seeded is decided by ENTRIES, not by what survived expiry: a file whose
+    # every line has expired must still enforce, or letting the dates pass would
+    # quietly flip the gate to OBSERVE — the opposite of what an expiry is for.
+    [ "$entries" -gt 0 ] && baseline_state="seeded" || baseline_state="unseeded"
   fi
 
   # `comm` and not a loop with grep: an id is a substring of nothing here, but a
@@ -372,11 +402,25 @@ run() {
     echo "off-distro tracking: commit the block below to that file to start enforcing; after that, a pair not in it is a red build and a pull request is the review."
     printf '%s\n' "$seen" | grep -v '^$' | sed 's/^/    /' || true
   else
-    echo "off-distro tracking: ENFORCE — ${n_new} new pair(s), ${n_stale} baseline entry(ies) no longer seen"
+    echo "off-distro tracking: ENFORCE — ${n_new} new pair(s), ${n_stale} baseline entry(ies) no longer seen, ${#expired_line[@]} expired exception(s)"
     while IFS= read -r line; do
       [ -n "$line" ] || continue
+      # An expired exception is named as such, with its line, rather than as a
+      # pair "not in the baseline": the reader has to find and act on THAT line,
+      # and "never seen before" would send them looking for a new binary.
+      if [ -n "${expired_line[$line]+x}" ]; then
+        echo "::error::[VULN3] off-distro exception expired: $BASELINE ${expired_line[$line]} — the image still carries $line. Upgrade whatever brings it in, or re-affirm the line with a new expires= date and a written conclusion in a pull request."
+        continue
+      fi
       echo "::error::[VULN3] off-distro finding not in the baseline: $line — a module vendored into an image binary that this image has not carried before. Review it, then add it to $BASELINE in a pull request, or remove whatever brought it in."
     done <<< "$new_pairs"
+    # An expired line whose pair is gone is the outcome the deadline asked for:
+    # reported for pruning, never blocking — the stale-entry rule below.
+    local k
+    for k in "${!expired_line[@]}"; do
+      printf '%s\n' "$seen" | grep -qxF -- "$k" && continue
+      echo "  expired exception no longer seen (prune it): $BASELINE ${expired_line[$k]}"
+    done
     # Reported, never blocking: a pair that stopped appearing is good news, and
     # failing the build over an unpruned line would teach people to empty the
     # file — which turns enforcement back off without anybody deciding to.
@@ -570,6 +614,51 @@ selftest() {
   printf 'GHSA-x\n' > "$tmp/base-short.txt"
   check "a baseline line with no package fails the gate" 2 "VULN0" \
     --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-short.txt" --today 2026-01-01
+
+  # ── per-line expiry (#1682) ────────────────────────────────────────────────
+  # Each fixture carries a SECOND, permanent line for an unrelated pair, so the
+  # file stays seeded whatever the expiry does — these assert the expiry and not
+  # the seeded/unseeded switch, which has its own case below.
+  printf 'CVE-OTHER other-pkg permanent\nGHSA-x golang.org/x/crypto expires=2026-05-31 reviewed, upgrade pending\n' > "$tmp/base-exp.txt"
+
+  # Past the date: the line stops covering the pair, the build goes red, and the
+  # error names the LINE so the reader knows which entry to act on.
+  check "an expired baseline exception blocks" 1 "VULN3] off-distro exception expired" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-06-01
+  check "…and names the expired line and its date" 1 "line 2 expired on 2026-05-31" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-06-01
+  check "…and counts it as blocking" 1 "1 blocking" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-06-01
+
+  # Before the date, and ON it, the exception holds — dated the 31st means good
+  # through the 31st, the same reading as the ignore file.
+  check "an unexpired baseline exception still covers its pair" 0 "0 new pair(s), 1 baseline entry(ies) no longer seen, 0 expired exception(s)" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-05-01
+  check "a baseline exception is live on its expiry date" 0 "0 new pair(s), 1 baseline entry(ies) no longer seen, 0 expired exception(s)" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-05-31
+
+  # No token: exactly as before, at any date — including a note whose PROSE
+  # mentions an expiry, which is not the positional token and changes nothing.
+  printf 'CVE-OTHER other-pkg permanent\nGHSA-x golang.org/x/crypto note: expires=2020-01-01 is prose here\n' > "$tmp/base-notoken.txt"
+  check "a baseline line with no expiry token never expires" 0 "0 new pair(s), 1 baseline entry(ies) no longer seen, 0 expired exception(s)" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-notoken.txt" --today 2099-01-01
+
+  # A file whose ONLY line has expired still enforces. If expiry emptied the
+  # known set into OBSERVE mode, letting the dates pass would switch the gate off.
+  printf 'GHSA-x golang.org/x/crypto expires=2026-05-31\n' > "$tmp/base-allexp.txt"
+  check "a baseline whose every line expired still enforces" 1 "VULN3] off-distro exception expired" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-allexp.txt" --today 2026-06-01
+
+  # An expired line whose pair is gone is the outcome the date asked for:
+  # reported for pruning, not blocking.
+  printf 'GHSA-x golang.org/x/crypto permanent\nCVE-GONE gone-pkg expires=2026-05-31\n' > "$tmp/base-expgone.txt"
+  check "an expired exception no longer seen is reported, not blocking" 0 "expired exception no longer seen" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-expgone.txt" --today 2026-06-01
+
+  # A malformed date fails rather than being read as no expiry.
+  printf 'GHSA-x golang.org/x/crypto expires=2026-5-31\n' > "$tmp/base-baddate.txt"
+  check "a malformed expiry fails the gate" 2 "VULN0.*expires=YYYY-MM-DD" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-baddate.txt" --today 2026-01-01
 
   # THE SHIPPED FILE IS SEEDED. Every fixture above supplies its own baseline,
   # which is what makes them stable — and it also means all of them would keep
