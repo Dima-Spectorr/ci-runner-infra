@@ -320,30 +320,56 @@ mutate "RUNNER2 reads the scope as a regex" \
 mutate "RUNNER2 no longer judges with: runs-on:" \
   's@if \[ -n "$foreign_util" \]; then@if false; then@'
 
-# A suffix matched case-sensitively (`-UTIL`/`-LANE` escape every rule), or no
-# longer anchored (`-utility`/`-lanes` become utility hosts).
+# A slot matched case-sensitively (`-UTIL`/`-LANE` escape every rule), or no
+# longer whole (`-utility`/`-lanes` become utility hosts). The scoped branch:
+# every consumer runs the gate with `--scope`.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "the -util suffix matched case-sensitively" \
-  's@grep -ciE -- "${UTIL_SUFFIX}\\$"@grep -cE -- "${UTIL_SUFFIX}\\$"@'
+mutate "the -util slot matched case-sensitively" \
+  's@grep -cixF -- "${scope}${UTIL_SUFFIX}"@grep -cxF -- "${scope}${UTIL_SUFFIX}"@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "the -util suffix no longer anchored at the end" \
-  's@grep -ciE -- "${UTIL_SUFFIX}\\$"@grep -ciE -- "${UTIL_SUFFIX}"@'
+mutate "the -util slot no longer matched whole" \
+  's@grep -cixF -- "${scope}${UTIL_SUFFIX}"@grep -ciF -- "${scope}${UTIL_SUFFIX}"@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "the -lane suffix matched case-sensitively" \
-  's@grep -ciE -- "${LANE_SUFFIX}\\$"@grep -cE -- "${LANE_SUFFIX}\\$"@'
+mutate "the -lane slot matched case-sensitively" \
+  's@grep -cixF -- "${scope}${LANE_SUFFIX}"@grep -cxF -- "${scope}${LANE_SUFFIX}"@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "the -lane suffix no longer anchored at the end" \
-  's@grep -ciE -- "${LANE_SUFFIX}\\$"@grep -ciE -- "${LANE_SUFFIX}"@'
+mutate "the -lane slot no longer matched whole" \
+  's@grep -cixF -- "${scope}${LANE_SUFFIX}"@grep -ciF -- "${scope}${LANE_SUFFIX}"@'
 
-# The reader stops handing over `with: runs-on:`, or one of its three shapes.
-mutate "the reader no longer reports with: runs-on: labels" \
-  's@out("#WITHRUNSON", vid, w_label.strip())@pass@'
-mutate "with: runs-on: as a YAML list no longer read" \
-  's@^                w_labels = w_runs$@                w_labels = []@'
-mutate "with: runs-on: as a JSON-list string no longer read" \
-  's@w_labels = parsed if isinstance(parsed, list) else \[\]@w_labels = []@'
-mutate "with: runs-on: as one label no longer read" \
-  's@w_labels = \[w_text\]@w_labels = []@'
+# The reader stops handing over `with:` slots, or one of the shapes they
+# hide in (the #1635 review's bypass was an expression literal).
+mutate "the reader no longer reports with: slots" \
+  's@out("#WITHRUNSON", vid, w_label)@pass@'
+mutate "a with: YAML list no longer read" \
+  's@for item in value:@for item in value[:0]:@'
+mutate "a JSON string no longer decoded" \
+  's@yield from w_strings(decoded)@pass@'
+mutate "a backslash in the lane runs-on no longer undecidable" \
+  's@ or "\\\\" in w_runs_on_text@@'
+mutate "only the last runs-on key is judged" \
+  's@for w_runs_on in w_runs_on_values:@for w_runs_on in w_runs_on_values[-1:]:@'
+mutate "the runs-on input name read case-sensitively" \
+  's@str(w_key).lower() == "runs-on"@w_key == "runs-on"@'
+mutate "only the runs-on input is read" \
+  's@for w_value in with_block.values():@for w_value in [with_block.get("runs-on")]:@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a slot inside an expression no longer read" \
+  's@for m in SLOT_TOKEN.finditer(w_text):@for m in ([] if "${{" in w_text else SLOT_TOKEN.finditer(w_text)):@'
+
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a slot built by an expression no longer read" \
+  's@if "${{" in w_text:@if False:@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed merge-lane runs-on no longer refused" \
+  's@elif \[ "$lane_runs_on_expr" -eq 1 \]; then@elif false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed YAML-list runs-on no longer flagged" \
+  's@w_runs_on_text = w_runs_on if isinstance(w_runs_on, str) else json.dumps(w_runs_on, ensure_ascii=False)@w_runs_on_text = w_runs_on if isinstance(w_runs_on, str) else ""@'
+
+# RUNNER16 stops crossing a local call (#1696).
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER16 no longer reads a pull_request_target caller" \
+  's@if \[ "$has_prtarget" -eq 0 \] && printf@if false \&\& printf@'
 
 # One half of RUNNER15's disjunction dropped.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally

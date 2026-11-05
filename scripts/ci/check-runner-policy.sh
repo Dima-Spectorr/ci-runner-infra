@@ -56,7 +56,8 @@
 #     RUNNER16 the workflow is not triggered by `pull_request_target`.
 #     RUNNER17 a `-util` job: the run declares `--forks=blocked` (#1649).
 #     RUNNER18 a `-lane` job IS the call to the fleet's merge-lane workflow.
-#     RUNNER19 the merge-lane call is not routed to a `-util` label.
+#     RUNNER19 the merge-lane call is not routed to a `-util` label, and its
+#              `with: runs-on:` is literal (a computed pool is undecidable).
 #   (RUNNER12-14 are retired numbers and are not reused.)
 #
 # WHAT COUNTS AS REACHING THE FLEET
@@ -174,8 +175,8 @@
 #     only: RUNNER18 already keeps everything but the merge lane — which runs
 #     default-branch code on `workflow_run` — off a `-lane` host.
 #   - RUNNER18, a `-lane` host runs the merge-lane call and nothing else: the
-#     job must `uses:` the fleet's `merge-lane.yml` (remote, or local in this
-#     repository). Anything else belongs on `-util` or the pool.
+#     job must `uses:` the fleet's REMOTE `merge-lane.yml` — a consumer's own
+#     `./…merge-lane.yml` is its own steps. Anything else belongs on `-util` or the pool.
 #   - RUNNER19, the converse: the merge lane carries the merge App key, so its
 #     call is never routed to the shared gatekeeper host.
 #
@@ -272,9 +273,13 @@ UTIL_SUFFIX='-util'
 LANE_SUFFIX='-lane'
 
 # The one job a `-lane` label may carry: the call to the fleet's merge-lane
-# reusable workflow — remote (`<owner>/ci-runner-infra/…@<ref>`) or, in this
-# repository, local. Matched against the `uses:` target the reader reports.
-MERGE_LANE_CALL='^([^/]+/ci-runner-infra/|\./)\.github/workflows/merge-lane\.ya?ml(@.*)?$'
+# reusable workflow, remote only (`<owner>/ci-runner-infra/…@<ref>`). Matched
+# against the `uses:` target the reader reports. Not `./`: the gate runs in
+# every consumer, where `./.github/workflows/merge-lane.yml` is that
+# repository's own file with whatever steps it likes. The owner part stays
+# open; a remote callee still needs a reviewed `remote-reusable-allowed`
+# marker (RUNNER7), which is where a look-alike owner is caught.
+MERGE_LANE_CALL='^[^/]+/ci-runner-infra/\.github/workflows/merge-lane\.ya?ml(@.*)?$'
 
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
@@ -320,8 +325,11 @@ ensure_yaml() {
 #   #FORKGUARD\t<id>                 `head.repo.fork` decides this job
 #   #CONTAINER\t<id>                 the job declares `container:`
 #   #SERVICES\t<id>                  the job declares `services:`
-#   #WITHRUNSON\t<id>\t<label>        one literal label a `uses:` job passes as
-#                                    `with: runs-on:` (the merge lane's input)
+#   #WITHRUNSON\t<id>\t<label>        one slot-shaped label a `uses:` job passes
+#                                    in any `with:` value, literal or expression
+#   #WITHDYNSLOT	<id>	<util|lane>   a `with:` expression that builds a slot
+#                                    (`${{ x }}-util`, `format('{0}-lane', …)`)
+#   #WITHEXPR	<id>                  the `with: runs-on:` value is computed
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -427,6 +435,15 @@ LITERAL_ALT = re.compile(r"(?:&&|\|\|)\s*'([^']*)'")
 # ever read. Deliberately not the mirror rule "a literal FOLLOWED by an
 # operator" — that one also matches the `'main'` in `x == 'main' && …`.
 LITERAL_FIRST = re.compile(r"\$\{\{\s*'([^']*)'")
+# A utility-host slot label anywhere in a `with:` value: `<Repo>-util` or
+# `<Repo>-lane`, case-insensitive, as a whole token (not `-utility`, not
+# `-lane-x`). Fail-closed on purpose — a word that only looks like a slot
+# costs a finding a reviewer can read; a missed slot costs the merge key.
+SLOT_TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_.][A-Za-z0-9_.-]*-(?:[Uu][Tt][Ii][Ll]|[Ll][Aa][Nn][Ee])(?![A-Za-z0-9_.-])")
+# The same suffix with no repository part in front of it, for a value that
+# carries an expression: `${{ github.event.repository.name }}-util` and
+# `format('{0}-util', …)` build a slot SLOT_TOKEN cannot see whole.
+DYN_SLOT = re.compile(r"-([Uu][Tt][Ii][Ll]|[Ll][Aa][Nn][Ee])(?![A-Za-z0-9_.-])")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -848,30 +865,83 @@ for job_id, job in jobs.items():
                 for kind, ref in dict.fromkeys(refs):
                     out("#WITH", vid, w_name, kind, ref)
 
-        # The pool a `uses:` job hands its callee through `with: runs-on:`, for
-        # the utility-host rules (RUNNER2's `-util`/`-lane` arm, RUNNER18,
-        # RUNNER19). The merge lane takes its pool that way — a `type: string`
-        # input holding one label or a JSON list — so a caller routed to
-        # `<Repo>-lane` names the label HERE and nowhere else. Literal values
-        # only: an expression is RUNNER5's subject, not a label this can read.
-        if isinstance(with_block, dict) and "runs-on" in with_block:
-            w_runs = with_block["runs-on"]
-            w_labels = []
-            if isinstance(w_runs, list):
-                w_labels = w_runs
-            elif isinstance(w_runs, str) and "${{" not in w_runs:
-                w_text = w_runs.strip()
-                if w_text.startswith("["):
-                    try:
-                        parsed = json.loads(w_text)
-                    except ValueError:
-                        parsed = []
-                    w_labels = parsed if isinstance(parsed, list) else []
-                elif w_text:
-                    w_labels = [w_text]
-            for w_label in w_labels:
-                if isinstance(w_label, str) and w_label.strip():
-                    out("#WITHRUNSON", vid, w_label.strip())
+        # The pool a `uses:` job hands its callee through `with:`, for the
+        # utility-host rules (RUNNER2's `-util`/`-lane` arm, RUNNER18,
+        # RUNNER19). The merge lane takes its pool through `runs-on` — a
+        # `type: string` input holding one label or a JSON list — so a caller
+        # routed to `<Repo>-lane` names the label HERE and nowhere else.
+        #
+        # Read fail-closed: EVERY input, and every slot-shaped token anywhere
+        # in its text — inside an expression (`${{ 'X-util' }}`), a JSON list
+        # or object, or a YAML list. A `uses:` job has no `runs-on` of its own,
+        # so an expression here never reaches RUNNER5, and a callee in another
+        # repository is never read at all: reading only literal `runs-on`
+        # values let `${{ 'X-util' }}` put the merge lane on the gatekeeper
+        # host with the gate reporting clean (#1635 security review).
+        if isinstance(with_block, dict):
+            # Every string the callee may end up reading: the raw text, and —
+            # for a JSON list or object in a string, which the callee hands to
+            # `fromJSON` — every string it DECODES to. Reading only the raw
+            # text let `["ExampleRepo\u002dutil"]` decode to a slot the gate
+            # never saw (#1635 re-review).
+            def w_strings(value):
+                if isinstance(value, str):
+                    yield value
+                    stripped = value.strip()
+                    if stripped[:1] in ("[", "{"):
+                        try:
+                            decoded = json.loads(stripped)
+                        except ValueError:
+                            decoded = None
+                        if decoded is not None and not isinstance(decoded, str):
+                            yield from w_strings(decoded)
+                elif isinstance(value, list):
+                    for item in value:
+                        yield from w_strings(item)
+                elif isinstance(value, dict):
+                    for key, item in value.items():
+                        yield from w_strings(str(key))
+                        yield from w_strings(item)
+                elif value is not None:
+                    yield json.dumps(value)
+            w_seen = []
+            for w_value in with_block.values():
+                for w_text in w_strings(w_value):
+                    for m in SLOT_TOKEN.finditer(w_text):
+                        if m.group(0) not in w_seen:
+                            w_seen.append(m.group(0))
+            for w_label in w_seen:
+                out("#WITHRUNSON", vid, w_label)
+            # A slot BUILT at run time has no whole token to read. Any value
+            # with an expression and a slot suffix counts as that host
+            # (fail-closed), and a computed `runs-on` is flagged so the merge
+            # lane, whose pool is decidable only here, can refuse it.
+            w_dyn = []
+            for w_value in with_block.values():
+                w_text = w_value if isinstance(w_value, str) else json.dumps(w_value)
+                if "${{" in w_text:
+                    for m in DYN_SLOT.finditer(w_text):
+                        kind = m.group(1).lower()
+                        if kind not in w_dyn:
+                            w_dyn.append(kind)
+            for kind in w_dyn:
+                out("#WITHDYNSLOT", vid, kind)
+            # The input name without regard to case: `RUNS-ON:` must not be a
+            # way around the check below.
+            # EVERY such key is judged, not the last one: `RUNS-ON:` computed
+            # beside a literal `runs-on:` must not hide behind it.
+            w_runs_on_values = [w_value for w_key, w_value in with_block.items() if str(w_key).lower() == "runs-on"]
+            # Every shape, not only a string: a YAML list item can carry the
+            # expression just as well (`- ${{ vars.LANE_POOL }}`). A backslash
+            # is an escape the callee's `fromJSON` decodes, so it is as
+            # undecidable here as an expression.
+            for w_runs_on in w_runs_on_values:
+                if w_runs_on is None:
+                    continue
+                w_runs_on_text = w_runs_on if isinstance(w_runs_on, str) else json.dumps(w_runs_on, ensure_ascii=False)
+                if "${{" in w_runs_on_text or "\\" in w_runs_on_text:
+                    out("#WITHEXPR", vid)
+                    break
 
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
@@ -983,6 +1053,11 @@ REACHABLE_PR=""
 # REACHABLE_PR, a guarded callee was invisible: two `services:` owners inside it
 # were two stacks in one run, and the gate said nothing.
 REACHABLE_PR_ANY=""
+
+# Files a `pull_request_target` workflow reaches through ANY local `uses:`
+# call, guarded or not (#1696). RUNNER16 asks it: a callee declares only
+# `workflow_call`, yet runs with its caller's base-repository secrets.
+REACHABLE_PRTARGET=""
 # A `timeout-minutes` at or above this bounds nothing GitHub was not already
 # bounding. Overridable downwards by a consumer whose queue expires sooner.
 MAX_TIMEOUT=360
@@ -1332,6 +1407,10 @@ check_file() {
   if [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
     has_prtarget=1
   fi
+  # …or reached from one (#1696): a callee runs with its caller's trigger.
+  if [ "$has_prtarget" -eq 0 ] && printf '%s\n' "$REACHABLE_PRTARGET" | grep -cxF -- "$(abs_path "$file")" >/dev/null; then
+    has_prtarget=1
+  fi
   # Kept before reachability widens `has_pr` below. RUNNER9 needs the narrow
   # answer — "does this file open a pull-request run of its own?" — because a
   # callee that runs on a pull request ONLY as a callee has its pool chosen by
@@ -1365,7 +1444,7 @@ check_file() {
     local job_base="${job%%~leg*}"
 
     local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
-    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 call_target
+    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 call_target lane_runs_on_expr=0
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     # "Every literal label is a GitHub-hosted image" is the reader's answer, not
     # a second opinion computed here — see `#HOSTEDONLY`.
@@ -1395,16 +1474,47 @@ EOF
     # the repository part is RUNNER2's business. `--`: each pattern starts with
     # a dash, which grep would otherwise take for options.
     with_labels="$(printf '%s\n' "$records" | sed -n "s/^#WITHRUNSON\t${job_re}\t//p")"
-    if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${UTIL_SUFFIX}\$")" -gt 0 ]; then
+    # With `--scope`, only THIS repository's slots are a utility host: a pool
+    # label of its own that happens to end in `-util` (`Common-Util`) is not.
+    # Another repository's slot is RUNNER2's refusal, and GitHub never hands
+    # it this repository's job anyway (slots register per repository).
+    if [ -n "$scope" ]; then
+      if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -cixF -- "${scope}${UTIL_SUFFIX}")" -gt 0 ]; then
+        util_host=1
+      fi
+      if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -cixF -- "${scope}${LANE_SUFFIX}")" -gt 0 ]; then
+        lane_host=1
+      fi
+    else
+      if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${UTIL_SUFFIX}\$")" -gt 0 ]; then
+        util_host=1
+      fi
+      if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${LANE_SUFFIX}\$")" -gt 0 ]; then
+        lane_host=1
+      fi
+    fi
+    # A slot built by an expression (`${{ … }}-util`) is that host whatever
+    # the scope: the repository part is unknowable here, so fail closed.
+    if printf '%s
+' "$records" | grep -qE "^#WITHDYNSLOT	${job_re}	util\$"; then
       util_host=1
     fi
-    if [ "$(printf '%s\n%s\n' "$labels" "$with_labels" | grep -ciE -- "${LANE_SUFFIX}\$")" -gt 0 ]; then
+    if printf '%s
+' "$records" | grep -qE "^#WITHDYNSLOT	${job_re}	lane\$"; then
       lane_host=1
     fi
     { [ "$util_host" -eq 1 ] || [ "$lane_host" -eq 1 ]; } && co_tenant=1
     call_target="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p; s/^#CALLS\t${job_re}\t//p" | head -1)"
     if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL" >/dev/null; then
       merge_lane_call=1
+      # The lane's pool can be read nowhere but here (its callee lives in
+      # another repository), so a computed `runs-on` is undecidable: refused
+      # below as RUNNER19 rather than trusted (#1635 re-review).
+      if printf '%s
+' "$records" | grep -qE "^#WITHEXPR	${job_re}\$"; then
+        lane_runs_on_expr=1
+        co_tenant=1
+      fi
     fi
 
     # `self-hosted` is a label, not a requirement. GitHub routes a job to any
@@ -1520,10 +1630,13 @@ EOF
     # LABEL GETS RULES OF ITS OWN" in the header. Outside the self-hosted block
     # on purpose: a `uses:` job names no `runs-on` of its own, and the merge
     # lane is exactly such a job — its pool arrives as `with: runs-on:`.
-    if [ "$co_tenant" -eq 1 ]; then
-      # RUNNER2's half for a `uses:` job: every utility label it hands its
-      # callee is this repository's own. (A job's own `runs-on` was judged by
-      # RUNNER2 above.)
+    #
+    # RUNNER2's half for a `uses:` job: every utility label it hands its
+    # callee is this repository's own. (A job's own `runs-on` was judged by
+    # RUNNER2 above.) Judged whether or not co_tenant is set: with `--scope`
+    # only this repository's own slot sets it, so a job handing ONLY another
+    # repository's slot would never be read (#1635 re-review).
+    if [ -n "$with_labels" ]; then
       local foreign_util=""
       if [ -n "$scope" ] && [ -n "$with_labels" ]; then
         foreign_util="$(printf '%s\n' "$with_labels" | grep -iE -- "(${UTIL_SUFFIX}|${LANE_SUFFIX})\$" |
@@ -1532,6 +1645,8 @@ EOF
       if [ -n "$foreign_util" ]; then
         err RUNNER2 "$rel: job '$job' hands its callee a utility-host label that is not this repository's ('${scope}${UTIL_SUFFIX}' / '${scope}${LANE_SUFFIX}'): with: runs-on: [$(printf '%s' "$with_labels" | tr '\n' ' ')]"
       fi
+    fi
+    if [ "$co_tenant" -eq 1 ]; then
       # Written services-first on purpose: RUNNER8's spelling is the target
       # of the mutation suite's cases 5-6, and sharing it would let a RUNNER15
       # fixture catch a RUNNER8 regression (or the reverse).
@@ -1554,6 +1669,8 @@ EOF
       # RUNNER19 — and the merge lane stays off the gatekeeper host.
       if [ "$util_host" -eq 1 ] && [ "$merge_lane_call" -eq 1 ]; then
         err RUNNER19 "$rel: job '$job' routes the merge-lane call to a gatekeeper utility-host label (*${UTIL_SUFFIX}) — the lane carries the merge App key and stays off the shared gatekeeper host (use the lane-host label, *${LANE_SUFFIX})"
+      elif [ "$lane_runs_on_expr" -eq 1 ]; then
+        err RUNNER19 "$rel: job '$job' hands the merge-lane call a computed runs-on — its pool is decidable only here, and a value built at run time could put the merge App key on the shared gatekeeper host (*${UTIL_SUFFIX}); write the label literally (a string or a JSON list)"
       fi
     fi
 
@@ -1829,7 +1946,7 @@ EOF
 # which this gate does not have; that limitation is named in RUNNER7 rather than
 # assumed away.
 compute_reachable() {
-  local f records seed="" edges="" caller target changed=1 line _cjob
+  local f records seed="" prt_seed="" edges="" caller target changed=1 line _cjob
   # Reset, because RUNNER10 reads it and the self-test drives the pass more than
   # once in a single process: edges left over from the previous fixture would be
   # counted against the next one's owners.
@@ -1849,6 +1966,9 @@ compute_reachable() {
     if [ "$(printf '%s\n' "$records" | grep -c '^#PR$')" -gt 0 ] ||
        [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
       seed="$seed$f"$'\n'
+    fi
+    if [ "$(printf '%s\n' "$records" | grep -c '^#PRTARGET$')" -gt 0 ]; then
+      prt_seed="$prt_seed$f"$'\n'
     fi
     # An edge carries its CALLER JOB, because a guard on the calling job is a
     # guard on everything that job reaches: `if: …fork == false` on the `uses:`
@@ -1904,6 +2024,22 @@ EOF
       printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$caller" >/dev/null || continue
       printf '%s\n' "$REACHABLE_PR_ANY" | grep -cxF -- "$target" >/dev/null && continue
       REACHABLE_PR_ANY="$REACHABLE_PR_ANY$target"$'\n'
+      changed=1
+    done <<EOF
+$CALL_EDGES
+EOF
+  done
+
+  # …and once more from the pull_request_target files alone, for RUNNER16.
+  REACHABLE_PRTARGET="$prt_seed"
+  changed=1
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while IFS=$'\t' read -r target caller _cjob; do
+      [ -n "${caller:-}" ] || continue
+      printf '%s\n' "$REACHABLE_PRTARGET" | grep -cxF -- "$caller" >/dev/null || continue
+      printf '%s\n' "$REACHABLE_PRTARGET" | grep -cxF -- "$target" >/dev/null && continue
+      REACHABLE_PRTARGET="$REACHABLE_PRTARGET$target"$'\n'
       changed=1
     done <<EOF
 $CALL_EDGES
@@ -2631,8 +2767,19 @@ jobs:
     with:
       runs-on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo-lane"]'"'"''
 
-  # The local call (this repository's own lane), single-label form.
-  expect "the local merge-lane call on -lane, one label" "" "ExampleRepo" blocked \
+  # Single-label form.
+  expect "the merge-lane call on -lane, one label" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo-lane'
+
+  # A consumer's OWN merge-lane.yml is that repository's file, with any steps:
+  # not the fleet's lane.
+  expect "a local merge-lane.yml on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:
   lane:
@@ -2693,7 +2840,8 @@ jobs:
 'on: [workflow_dispatch]
 jobs:
   lane:
-    uses: ./.github/workflows/merge-lane.yml
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
     with:
       runs-on: '"'"'["self-hosted", "linux", "gcp", "ExampleRepo-util"]'"'"''
 
@@ -2720,19 +2868,145 @@ jobs:
 'on: [pull_request_target]
 jobs:
   lane:
-    uses: ./.github/workflows/merge-lane.yml
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
     with:
       runs-on: ExampleRepo-lane'
 
-  # An expression in `with: runs-on:` names no label this can read: no
-  # utility-host rule fires on it (RUNNER18 included).
-  expect "an expression in with: runs-on: is not read as a label" "" "ExampleRepo" blocked \
+  # A slot named inside an expression is still read: a `uses:` job has no
+  # `runs-on` of its own, so nothing else would ever look at it.
+  expect "a slot inside a with: expression is read" "RUNNER18" "ExampleRepo" blocked \
 'on: [push]
 jobs:
   gate:
     uses: ./.github/workflows/build.yml
     with:
       runs-on: ${{ vars.LANE_LABEL || '"'"'ExampleRepo-lane'"'"' }}'
+
+  # The review's bypass: the fleet merge lane routed to -util through an
+  # expression literal.
+  expect "the merge lane on -util through an expression is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ '"'"'ExampleRepo-util'"'"' }}'
+
+  # A slot BUILT at run time has no whole token to read (#1635 re-review).
+  expect "a -util slot built from the repository name is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ github.event.repository.name }}-util'
+
+  expect "a -util slot built with format() is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ format('"'"'{0}-util'"'"', github.event.repository.name) }}'
+
+  # A variable or a join names no suffix at all: the lane's pool is
+  # decidable only in the caller, so a computed one is refused outright.
+  expect "the merge lane on a variable runs-on is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ vars.LANE_POOL }}'
+
+  expect "the merge lane on a computed YAML-list runs-on is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on:
+        - self-hosted
+        - ${{ vars.LANE_POOL }}'
+
+  # A JSON escape the callee's fromJSON decodes, and an input name in
+  # another case (#1635 re-review).
+  expect "a -util slot spelled with a JSON escape is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: '"'"'["self-hosted", "ExampleRepo\u002dutil"]'"'"''
+
+  expect "a -lane slot spelled with a JSON escape is read" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: '"'"'["self-hosted", "ExampleRepo\u002dlane"]'"'"''
+
+  expect "a backslash in the lane runs-on is undecidable" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ExampleRepo\u002dlane'
+
+  expect "a computed RUNS-ON in another case is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      RUNS-ON: ${{ vars.LANE_POOL }}'
+
+  expect "a computed RUNS-ON beside a literal runs-on is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      RUNS-ON: ${{ vars.LANE_POOL }}
+      runs-on: ExampleRepo-lane'
+
+  expect "a built -lane slot on another call is RUNNER18" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ github.event.repository.name }}-lane'
+
+  # Any input, not only `runs-on`, and inside a JSON object.
+  expect "a -lane slot in another input is read" "RUNNER18" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      pool: '"'"'{"labels": ["self-hosted", "ExampleRepo-lane"]}'"'"''
+
+  # With --scope, a repository's own pool label that ends in -util is its pool.
+  expect "a pool label ending in -util is not the utility host" "" "Common-Util" allowed \
+'on: [push]
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, Common-Util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
 
   expect "runner group is undecidable, not clean" "RUNNER5" "" blocked \
 'on: [push]
@@ -3094,6 +3368,40 @@ jobs:
     if: github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 30
+    steps: [{run: "true"}]'
+
+  # RUNNER16 crosses a local call (#1696): the callee declares only
+  # `workflow_call`, but runs with its pull_request_target caller's secrets.
+  # Guarded, so RUNNER4 is not what fires; forks allowed, so RUNNER17 does.
+  expect_pair "a -util callee of a pull_request_target caller is refused" "RUNNER16 RUNNER17" \
+'on:
+  pull_request_target:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and a plain pull_request caller is not that trigger.
+  expect_pair "a -util callee of a pull_request caller is not RUNNER16" "RUNNER17" \
+'on:
+  pull_request:
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml' \
+'on:
+  workflow_call:
+jobs:
+  gate:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: [self-hosted, linux, gcp, ExampleRepo-util]
+    timeout-minutes: 5
     steps: [{run: "true"}]'
 
   # The same pair, judged the way the usage line documents: repository-relative
