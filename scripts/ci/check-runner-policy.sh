@@ -280,6 +280,9 @@ LANE_SUFFIX='-lane'
 # open; a remote callee still needs a reviewed `remote-reusable-allowed`
 # marker (RUNNER7), which is where a look-alike owner is caught.
 MERGE_LANE_CALL='^[^/]+/ci-runner-infra/\.github/workflows/merge-lane\.ya?ml(@.*)?$'
+# Any merge-lane call, local included: arms RUNNER19 (never on `-util`, never
+# a computed runs-on). A local lane may still carry the merge App key.
+MERGE_LANE_CALL_ANY='^([^/]+/ci-runner-infra/|\./)\.github/workflows/merge-lane\.ya?ml(@.*)?$'
 
 # --- the parser is a hard dependency, not a nice-to-have ---------------------
 # Conditional, it would be worse than useless: on a runner without PyYAML the
@@ -1444,7 +1447,7 @@ check_file() {
     local job_base="${job%%~leg*}"
 
     local labels self_hosted=0 scoped=0 hosted_only=0 windows_pool=0 label
-    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 call_target lane_runs_on_expr=0
+    local util_host=0 lane_host=0 co_tenant=0 with_labels merge_lane_call=0 merge_lane_any=0 call_target lane_runs_on_expr=0
     labels="$(printf '%s\n' "$records" | sed -n "s/^#LABEL\t${job_re}\t//p")"
     # "Every literal label is a GitHub-hosted image" is the reader's answer, not
     # a second opinion computed here — see `#HOSTEDONLY`.
@@ -1495,23 +1498,27 @@ EOF
     fi
     # A slot built by an expression (`${{ … }}-util`) is that host whatever
     # the scope: the repository part is unknowable here, so fail closed.
-    if printf '%s
-' "$records" | grep -qE "^#WITHDYNSLOT	${job_re}	util\$"; then
+    # `grep -c`, never `-q`: an early exit SIGPIPEs printf on a large record
+    # set, and `pipefail` would turn the match into a miss (fail open).
+    if [ "$(printf '%s\n' "$records" | grep -cE "^#WITHDYNSLOT	${job_re}	util\$")" -gt 0 ]; then
       util_host=1
     fi
-    if printf '%s
-' "$records" | grep -qE "^#WITHDYNSLOT	${job_re}	lane\$"; then
+    if [ "$(printf '%s\n' "$records" | grep -cE "^#WITHDYNSLOT	${job_re}	lane\$")" -gt 0 ]; then
       lane_host=1
     fi
     { [ "$util_host" -eq 1 ] || [ "$lane_host" -eq 1 ]; } && co_tenant=1
     call_target="$(printf '%s\n' "$records" | sed -n "s/^#REMOTECALL\t${job_re}\t//p; s/^#CALLS\t${job_re}\t//p" | head -1)"
     if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL" >/dev/null; then
       merge_lane_call=1
+    fi
+    # RUNNER18 admits only the remote lane; RUNNER19 is armed for a local
+    # `./…/merge-lane.yml` too, so a local lane is never routed to `-util`.
+    if [ -n "$call_target" ] && printf '%s' "$call_target" | grep -cE -- "$MERGE_LANE_CALL_ANY" >/dev/null; then
+      merge_lane_any=1
       # The lane's pool can be read nowhere but here (its callee lives in
       # another repository), so a computed `runs-on` is undecidable: refused
       # below as RUNNER19 rather than trusted (#1635 re-review).
-      if printf '%s
-' "$records" | grep -qE "^#WITHEXPR	${job_re}\$"; then
+      if [ "$(printf '%s\n' "$records" | grep -cE "^#WITHEXPR	${job_re}\$")" -gt 0 ]; then
         lane_runs_on_expr=1
         co_tenant=1
       fi
@@ -1667,7 +1674,7 @@ EOF
         err RUNNER18 "$rel: job '$job' targets a lane-host label (*${LANE_SUFFIX}) but is not the call to the fleet's merge-lane reusable workflow — that host exists for the merge lane alone (use the -util label for a gatekeeper job, or the pool label)"
       fi
       # RUNNER19 — and the merge lane stays off the gatekeeper host.
-      if [ "$util_host" -eq 1 ] && [ "$merge_lane_call" -eq 1 ]; then
+      if [ "$util_host" -eq 1 ] && [ "$merge_lane_any" -eq 1 ]; then
         err RUNNER19 "$rel: job '$job' routes the merge-lane call to a gatekeeper utility-host label (*${UTIL_SUFFIX}) — the lane carries the merge App key and stays off the shared gatekeeper host (use the lane-host label, *${LANE_SUFFIX})"
       elif [ "$lane_runs_on_expr" -eq 1 ]; then
         err RUNNER19 "$rel: job '$job' hands the merge-lane call a computed runs-on — its pool is decidable only here, and a value built at run time could put the merge App key on the shared gatekeeper host (*${UTIL_SUFFIX}); write the label literally (a string or a JSON list)"
@@ -2915,6 +2922,24 @@ jobs:
 
   # A variable or a join names no suffix at all: the lane's pool is
   # decidable only in the caller, so a computed one is refused outright.
+  # A LOCAL lane may carry the merge key too: RUNNER19 still keeps it off
+  # the gatekeeper host and off a computed runs-on.
+  expect "a local merge-lane.yml on -util is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: ExampleRepo-util'
+
+  expect "a local merge-lane.yml on a computed runs-on is refused" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    uses: ./.github/workflows/merge-lane.yml
+    with:
+      runs-on: ${{ vars.LANE_POOL }}'
+
   expect "the merge lane on a variable runs-on is refused" "RUNNER19" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:

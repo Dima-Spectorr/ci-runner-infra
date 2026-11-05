@@ -362,6 +362,11 @@ mutate "a slot built by an expression no longer read" \
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "a computed merge-lane runs-on no longer refused" \
   's@elif \[ "$lane_runs_on_expr" -eq 1 \]; then@elif false; then@'
+mutate "a local merge-lane call no longer arms RUNNER19" \
+  's@|\\./)\\.github/workflows/merge-lane@)\\.github/workflows/merge-lane@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER19 judged on the remote lane only" \
+  's@\[ "$merge_lane_any" -eq 1 \]; then@[ "$merge_lane_call" -eq 1 ]; then@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "a computed YAML-list runs-on no longer flagged" \
   's@w_runs_on_text = w_runs_on if isinstance(w_runs_on, str) else json.dumps(w_runs_on, ensure_ascii=False)@w_runs_on_text = w_runs_on if isinstance(w_runs_on, str) else ""@'
