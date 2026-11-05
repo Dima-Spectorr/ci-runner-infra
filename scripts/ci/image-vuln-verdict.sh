@@ -418,7 +418,7 @@ run() {
     # reported for pruning, never blocking — the stale-entry rule below.
     local k
     for k in "${!expired_line[@]}"; do
-      printf '%s\n' "$seen" | grep -qxF -- "$k" && continue
+      printf '%s\n' "$seen" | grep -cxF -- "$k" >/dev/null && continue
       echo "  expired exception no longer seen (prune it): $BASELINE ${expired_line[$k]}"
     done
     # Reported, never blocking: a pair that stopped appearing is good news, and
@@ -661,7 +661,7 @@ selftest() {
   # and under pipefail `run | grep` would be false whatever grep found.
   local exp_out
   exp_out="$(run --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-exp.txt" --today 2026-06-01 2>&1)"
-  if printf '%s\n' "$exp_out" | grep -q "expired exception no longer seen"; then
+  if printf '%s\n' "$exp_out" | grep -c "expired exception no longer seen" >/dev/null; then
     echo "FAIL an expired pair still in the scan is not offered for pruning"
     status=1
   else
