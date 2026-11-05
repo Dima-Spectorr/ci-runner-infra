@@ -2890,6 +2890,16 @@ jobs:
     with:
       runs-on: ${{ vars.LANE_LABEL || '"'"'ExampleRepo-lane'"'"' }}'
 
+  # The slot's NAME inside an expression is read too, not only its suffix:
+  # another repository's slot there is RUNNER2.
+  expect "a foreign slot inside a with: expression is RUNNER2" "RUNNER2" "ExampleRepo" blocked \
+'on: [push]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ vars.GATE_LABEL || '"'"'OtherRepo-util'"'"' }}'
+
   # The review's bypass: the fleet merge lane routed to -util through an
   # expression literal.
   expect "the merge lane on -util through an expression is refused" "RUNNER19" "ExampleRepo" blocked \
