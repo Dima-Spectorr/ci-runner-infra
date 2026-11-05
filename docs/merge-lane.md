@@ -2045,9 +2045,10 @@ configured directory per pass, made only when a candidate actually claims a
 number. Empty (the default) turns all of it off. A dry run never reaches the
 merge call, so it does not exercise the hold.
 
-### The pool images do not ship `gh`
+### Older pool images do not ship `gh`
 
-GitHub-hosted images carry the CLI; the fleet's self-hosted images do not. That
+GitHub-hosted images carry the CLI. The fleet's self-hosted images did not until
+#441, and a host on an image built before that still does not. That
 matters more than a missing tool usually does, because the lane reads **every**
 fact through `gh api ... || true` — so a missing binary reads as *no facts
 available*, the lane concludes there is nothing to merge, and the job goes
@@ -2065,9 +2066,11 @@ Two things fix it, and both are in the workflow already:
   in the driver means *looked, found nothing*; that one means *could not look at
   all*, and the two must never render identically.
 
-Baking `gh` into the pool image would make the first of those a no-op. Until
-then, do not remove the step: a lane that cannot read is the one failure mode
-this design cannot tolerate quietly.
+The host image now bakes `gh` into `/usr/local/bin` by running that same script
+at build time (#441). On a current host the step is therefore a no-op. Keep it
+anyway: pools pin an image, a host on an older pin still needs the download, and
+a lane that cannot read is the one failure mode this design cannot tolerate
+quietly.
 
 ## Landing it: three steps, not one
 

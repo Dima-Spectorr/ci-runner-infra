@@ -461,6 +461,32 @@ build {
     execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
   }
 
+  # 4b. The GitHub CLI.
+  #
+  #    Every merge-lane, reaper and guard job needs `gh`, and until now each one
+  #    downloaded it at job time through scripts/ci/ensure-gh.sh. On 2026-11-05
+  #    about 170 jobs started at once on freshly booted hosts, and dropped
+  #    connections failed some of them before any check ran (#1683). Baking it
+  #    in turns that script into a no-op on its first line (#441). The install
+  #    runs the SAME script, so the version and the sha256 pin have one owner.
+  #    It goes to /usr/local/bin once, at build time, so slots never write a
+  #    shared path.
+  provisioner "file" {
+    source      = "../scripts/ci/ensure-gh.sh"
+    destination = "/tmp/ensure-gh.sh"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "RUNNER_TEMP=/tmp/ensure-gh bash /tmp/ensure-gh.sh",
+      "install -m 0755 /tmp/ensure-gh/bin/gh /usr/local/bin/gh",
+      "rm -rf /tmp/ensure-gh /tmp/ensure-gh.sh",
+      "/usr/local/bin/gh --version",
+    ]
+    execute_command = "sudo -E bash -c '{{ .Vars }} {{ .Path }}'"
+  }
+
   # 5. The runner account and the agent itself.
   #
   #    Baked UNCONFIGURED: the tarball is extracted here, and each host copies
@@ -696,7 +722,7 @@ build {
   provisioner "shell" {
     inline = [
       "set -eux",
-      "for b in node npm pwsh python3 git jq curl unzip rsync openssl docker psql; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
+      "for b in node npm pwsh python3 git jq curl unzip rsync openssl docker psql gh; do sudo -u runner -i command -v $b >/dev/null || { echo \"MISSING from runner PATH: $b\"; exit 1; }; done",
       "sudo -u runner -i node --version",
       # pip is a MODULE, not a binary on PATH — `command -v pip3` can succeed on
       # a host where `python3 -m pip` (what workflows actually write) does not.

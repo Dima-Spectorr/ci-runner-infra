@@ -9,12 +9,12 @@
 # nothing to merge, and the job went green. Seven repositories reported a
 # healthy lane that could not have merged anything.
 #
-# Installing at job time rather than baking it into the image is deliberate for
-# now: baking it in means a Terraform apply plus recreating every host in every
-# pool one at a time, and until that lands a consumer's lane would work or not
-# depending on which host it happened to get. This makes the dependency
-# explicit and identical everywhere. Bake it into the image later and this
-# script becomes a no-op on the first line, which is exactly what should happen.
+# The host image now bakes gh into /usr/local/bin by running THIS script at
+# build time (packer step 4b, #441), so on a current pool host it exits on its
+# first check. The job-time download remains for hosts still on an older image
+# and for GitHub-hosted runners without gh. The version and digest below are
+# the single pin for both. Changing them rebuilds the image, because the image
+# trigger watches this file.
 #
 # PINNED BY DIGEST, NOT BY TAG. The lane holds an App token with write access to
 # every repository in the fleet, so an unpinned download here would be a far
