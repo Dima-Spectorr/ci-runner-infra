@@ -144,6 +144,9 @@ cat >"$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 url="${*: -1}"
 printf '%s\n' "$url" >>"$CASE/urls"
+# argv and stdin, so a case can prove the token went to stdin (#1640).
+printf '%s\n' "$*" >>"$CASE/argv"
+cat >>"$CASE/stdin"
 case "$url" in
   */contents/*)
     [ -f "$CASE/caller.yml" ] || exit 22
@@ -162,17 +165,18 @@ chmod +x "$WORK/bin/curl"
 PIN_A=2c2e32da5dae9d4efd5a07f1b17d45ae836953fc
 PIN_B=760c59e02d4384fe4ef50d1b1ca7c1fd8a98c163
 HERE=1111111111111111111111111111111111111111
+TOKEN=ghs_selftest-token-1640
 
 # run_case <name> <repo> <impl-ref> <workflow-ref>  (caller.yml/tags prepared in $CASE)
 run_case() {
   local repo="$2" impl_ref="$3" wf_ref="$4"
   : >"$CASE/out"
   (
-    export PATH="$WORK/bin:$PATH" CASE READ_TOKEN=t GITHUB_API_URL=https://api.example
+    export PATH="$WORK/bin:$PATH" CASE READ_TOKEN="$TOKEN" GITHUB_API_URL=https://api.example
     export GITHUB_REPOSITORY="$repo" GITHUB_WORKFLOW_REF="$wf_ref" GITHUB_WORKFLOW_SHA="$HERE"
     export GITHUB_OUTPUT="$CASE/out" IMPLEMENTATION_REPOSITORY=Example-Org/ci-runner-infra
     export IMPLEMENTATION_REF="$impl_ref" CALLEE_PATH="$CALLEE_PATH"
-    bash "$BLOCK"
+    bash "$BLOCK" </dev/null # the stub curl reads stdin
   ) >"$CASE/log" 2>&1
   echo $? >"$CASE/rc"
 }
@@ -212,6 +216,16 @@ run_case "" "$CONSUMER" "" "$WF"
 expect_sha "a sha pin runs that sha (a commented-out uses: line is not a pin)" "$PIN_A"
 if grep -q "/repos/$CONSUMER/contents/.github/workflows/$WFNAME?ref=$HERE" "$CASE/urls"; then ok; else
   bad "the caller's workflow must be read at GITHUB_WORKFLOW_SHA, the commit that ran — asked for: $(tr '\n' ' ' <"$CASE/urls")"
+fi
+# The token must reach curl on stdin, never in argv: argv is world-readable
+# through /proc/<pid>/cmdline, which on a multi-repository host is another
+# repository's job (#1640). Both halves, so a stub that saw no call at all
+# cannot pass the argv half vacuously.
+if [ -s "$CASE/argv" ] && ! grep -qF "$TOKEN" "$CASE/argv"; then ok; else
+  bad "the token must not appear in curl's argv (#1640); argv: $(tr '\n' ' ' <"$CASE/argv" 2>/dev/null)"
+fi
+if grep -qF "Authorization: Bearer $TOKEN" "$CASE/stdin" 2>/dev/null; then ok; else
+  bad "the token must reach curl on stdin as a -K config header (#1640)"
 fi
 
 # 2. A tag pin resolves through the API to its commit.
