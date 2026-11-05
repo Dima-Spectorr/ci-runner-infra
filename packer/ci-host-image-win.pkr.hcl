@@ -140,7 +140,7 @@ variable "runner_version" {
   # is deprecated" — the pool looks healthy while every slot is offline. It
   # matters more here: --disableupdate means the host never self-heals, and a
   # Windows host takes K slots down at once rather than one short-lived VM.
-  default = "2.336.0"
+  default = "2.338.2"
 }
 
 variable "source_image_family" {
