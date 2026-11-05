@@ -2127,6 +2127,8 @@ withdraw_backs_off() { # <file>
     date() { echo "$t"; }
     # shellcheck disable=SC2317,SC2329  # called by the eval'd withdraw_idle
     delete_runner() { calls=$((calls + 1)); return "$answer"; }
+    # shellcheck disable=SC2317,SC2329  # no rate-limit pause in this test (#1672)
+    rate_limit_left() { printf 0; }
     withdraw_idle 7 && exit 1                        # GitHub refuses
     [ "$calls" = 1 ] || exit 1
     t=1030; withdraw_idle 7 && exit 1                # inside the minute: no call
@@ -3182,6 +3184,109 @@ mutate "the in-flight wait is unbounded" \
   's@while dpkg_busy && \[ "\$waited" -lt "\$DPKG_LOCK_WAIT_SECONDS" \]; do@while dpkg_busy; do@' apt_auto_upgrades_off_behaves
 mutate "apt's periodic config not zeroed" \
   's@APT::Periodic::Unattended-Upgrade "0";@APT::Periodic::Unattended-Upgrade "1";@' apt_auto_upgrades_off_behaves
+
+# --- GitHub rate-limit pause (#1672) -------------------------------------------
+#
+# rate_limit_note / rate_limit_left are extracted and RUN against header dumps
+# shaped like GitHub's answers, with the clock pinned, so what is asserted is
+# the pause each answer actually produces. Then the wiring: both mints record a
+# refusal, both generated scripts carry the helpers, and the slot loop reads the
+# pause before it mints.
+rate_limit_pause_behaves() { # <file>
+  local f="$1" fns root code okk=0
+  fns=$(for n in rate_limit_note rate_limit_left; do extract_fn "$f" "$n"; done)
+  case "$fns" in *'rate_limit_note() {'*'rate_limit_left() {'*) : ;; *) return 1 ;; esac
+  root=$(mktemp -d) || return 1
+  # shellcheck disable=SC2329  # stubs are called by the eval'd bodies
+  run() (
+    # shellcheck disable=SC2034  # read by the eval'd bodies
+    GH_RATE_FILE="$root/until"
+    log() { :; }
+    date() { printf '%s\n' "${T_NOW:-1000000}"; }
+    eval "$fns"
+    "$@"
+  )
+  left() { T_NOW="${1:-1000000}" run rate_limit_left; }
+  # PRIMARY LIMIT SPENT: paused until x-ratelimit-reset.
+  printf 'HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1001200\r\n\r\n' >"$root/primary"
+  run rate_limit_note 403 "$root/primary" "API rate limit exceeded for installation ID 1" || okk=1
+  [ "$(left)" = 1200 ] || okk=1
+  # ONLY EVER LATER: a shorter answer does not shorten the pause.
+  printf 'HTTP/2 429\r\nretry-after: 40\r\n\r\n' >"$root/short"
+  run rate_limit_note 429 "$root/short" "" || okk=1
+  [ "$(left)" = 1200 ] || okk=1
+  # OVER: the pause ends at its time, and a file that does not parse is none.
+  [ "$(left 1001200)" = 0 ] || okk=1
+  rm -f "$root/until"
+  # RETRY-AFTER wins over the budget headers.
+  printf 'HTTP/2 403\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1003000\r\nRetry-After: 90\r\n\r\n' >"$root/after"
+  run rate_limit_note 403 "$root/after" "You have exceeded a secondary rate limit" || okk=1
+  [ "$(left)" = 90 ] || okk=1
+  rm -f "$root/until"
+  # SECONDARY LIMIT WITH NO HEADER: the message alone pauses 60s.
+  printf 'HTTP/2 403\r\n\r\n' >"$root/bare"
+  run rate_limit_note 403 "$root/bare" "You have exceeded a secondary rate limit. Please wait" || okk=1
+  [ "$(left)" = 60 ] || okk=1
+  rm -f "$root/until"
+  # BOUNDS: a reset in the past still waits 30s; one days away waits 65 min.
+  printf 'x-ratelimit-remaining: 0\r\nx-ratelimit-reset: 999000\r\n' >"$root/past"
+  run rate_limit_note 403 "$root/past" "" || okk=1
+  [ "$(left)" = 30 ] || okk=1
+  rm -f "$root/until"
+  printf 'x-ratelimit-remaining: 0\r\nx-ratelimit-reset: 9999999\r\n' >"$root/far"
+  run rate_limit_note 403 "$root/far" "" || okk=1
+  [ "$(left)" = 3900 ] || okk=1
+  rm -f "$root/until"
+  # NOT A RATE LIMIT: a permission 403 with budget left, or a 500, pauses nothing.
+  printf 'x-ratelimit-remaining: 4000\r\nx-ratelimit-reset: 1001200\r\n' >"$root/perm"
+  run rate_limit_note 403 "$root/perm" "Resource not accessible by integration" && okk=1
+  run rate_limit_note 500 "$root/primary" "API rate limit exceeded" && okk=1
+  run rate_limit_note 403 /dev/null "Bad credentials" && okk=1
+  [ ! -e "$root/until" ] || okk=1
+  [ "$(left)" = 0 ] || okk=1
+  printf 'garbage\n' >"$root/until"
+  [ "$(left)" = 0 ] || okk=1
+  rm -rf -- "$root"
+  [ "$okk" = 0 ] || return 1
+
+  code=$(code_of "$f")
+  # both mints dump the headers and hand a 403/429 to the note
+  counts "$code" 'curl "\$\{CURL_TIMEOUTS\[@\]\}" -sS -X POST -D "\$hdr" -w' 2 || return 1
+  counts "$code" '403 \| 429\) rate_limit_note "\$code" "\$hdr" "\$msg"' 2 || return 1
+  # both generated scripts carry the helpers and the file they share
+  matches "$code" '^    declare -f rate_limit_note rate_limit_left$' || return 1
+  matches "$code" 'declare -f log safe_for_log gh_token rate_limit_note rate_limit_left$' || return 1
+  counts "$code" '[[:space:]]GH_RATE_FILE$' 2 || return 1
+  # the loop reads the pause BEFORE it mints, sleeps in short steps, jitters
+  matches "$code" '^  rl=\$\(rate_limit_left\)$' || return 1
+  matches "$code" '^  if \[ "\$rl" -gt 0 \]; then$' || return 1
+  matches "$code" 'if \[ "\$rl" -gt 15 \]; then sleep 15; else sleep \$\(\(rl \+ RANDOM % 60\)\); fi' || return 1
+  [ "$(printf '%s\n' "$code" | grep -nE '^  rl=\$\(rate_limit_left\)$' | cut -d: -f1)" -lt \
+    "$(printf '%s\n' "$code" | grep -nE 'id=\$\(mint_jit "\$idx"' | cut -d: -f1)" ] || return 1
+  # an idle withdraw does not spend the budget while paused
+  matches "$code" '^  \[ "\$\(rate_limit_left\)" = 0 \] \|\| return 1$' || return 1
+  return 0
+}
+
+if rate_limit_pause_behaves "$SCRIPT"; then
+  ok
+else
+  bad "a slot does not pause on GitHub's rate limit -- every slot retries a spent App installation every 30s, the limit never recovers and no runner registers for the hour (#1672)"
+fi
+
+mutate "the reset header ignored"        's@until=\$reset$@until=$((now + 60))@' rate_limit_pause_behaves
+mutate "retry-after ignored"             's@^    until=\$((now + after))$@    until=$((now + 60))@' rate_limit_pause_behaves
+mutate "the pause can shorten"           's@\[ "\$until" -gt \$((now + cur)) \] || return 0@true@' rate_limit_pause_behaves
+mutate "no lower bound"                  's@|| until=\$((now + 30))@|| :@' rate_limit_pause_behaves
+mutate "no upper bound"                  's@|| until=\$((now + 3900))@|| :@' rate_limit_pause_behaves
+mutate "every 403 is a rate limit"       's@\*) until=\$((now + 60)) ;; \*) return 1 ;; esac@*) until=$((now + 60)) ;; *) until=$((now + 60)) ;; esac@' rate_limit_pause_behaves
+mutate "a 500 is a rate limit"           's@^  case "\$code" in 403 | 429) ;; \*) return 1 ;; esac$@  :@' rate_limit_pause_behaves
+mutate "the loop never reads the pause"  's@^  if \[ "\$rl" -gt 0 \]; then$@  if false; then@' rate_limit_pause_behaves
+mutate "the loop sleeps without jitter"  's@sleep \$((rl + RANDOM % 60))@sleep "$rl"@' rate_limit_pause_behaves
+mutate "a mint records nothing"          '0,/403 | 429) rate_limit_note/s@403 | 429) rate_limit_note@403 | 429) false@' rate_limit_pause_behaves
+mutate "the slot loop lacks the helpers" 's@^    declare -f rate_limit_note rate_limit_left$@    :@' rate_limit_pause_behaves
+mutate "an idle withdraw ignores the pause" 's@^  \[ "\$(rate_limit_left)" = 0 \] || return 1$@  :@' rate_limit_pause_behaves
+mutate "the loop is not told where the pause lives" 's@^    declare -p GH_RATE_FILE$@    :@' rate_limit_pause_behaves
 
 printf 'host-startup self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
