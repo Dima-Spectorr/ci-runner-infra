@@ -219,7 +219,12 @@ jobs:
           }
           api=${GITHUB_API_URL:-https://api.github.com}
           fetch() { # <accept> <url>
-            curl -sSfL --retry 3 --retry-delay 2 -H "Authorization: Bearer $READ_TOKEN" -H "Accept: $1" "$2"
+            # The token reaches curl on stdin (-K -), never in argv: argv is
+            # readable through /proc/<pid>/cmdline, and on a host shared by
+            # several repositories that is another repository's job (#1640).
+            # printf is a builtin, so the token is in no process's argv.
+            printf 'header = "Authorization: Bearer %s"\n' "$READ_TOKEN" |
+              curl -sSfL --retry 3 --retry-delay 2 -K - -H "Accept: $1" "$2"
           }
           ref=$IMPLEMENTATION_REF
           from="input implementation-ref"
