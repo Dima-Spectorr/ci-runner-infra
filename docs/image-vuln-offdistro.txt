@@ -261,3 +261,41 @@ GO-2026-4337 stdlib
 
 # ── other vendored modules ───────────────────────────────────────────────────
 GHSA-p77j-4mvh-x3m3 google.golang.org/grpc
+
+# ── 2026-11-05: first build with runner 2.338.2 (ci-runner-infra#1676) ───────
+# 33 pairs the grype feed added since the 2026-09-19 image; build 638046f4.
+# Recorded to restore the fleet after a deprecated runner took every pool down;
+# not yet reviewed pair by pair (review: #1678).
+CVE-2026-100075 linux-kernel
+CVE-2026-111497 node
+CVE-2026-115557 python
+CVE-2026-63808 linux-kernel
+CVE-2026-63830 linux-kernel
+CVE-2026-63886 linux-kernel
+CVE-2026-63887 linux-kernel
+CVE-2026-63888 linux-kernel
+CVE-2026-63912 linux-kernel
+CVE-2026-63922 linux-kernel
+CVE-2026-63924 linux-kernel
+CVE-2026-63938 linux-kernel
+CVE-2026-63939 linux-kernel
+CVE-2026-63940 linux-kernel
+CVE-2026-63992 linux-kernel
+CVE-2026-63993 linux-kernel
+CVE-2026-63994 linux-kernel
+CVE-2026-64000 linux-kernel
+CVE-2026-64007 linux-kernel
+CVE-2026-64018 linux-kernel
+CVE-2026-64024 linux-kernel
+CVE-2026-64025 linux-kernel
+CVE-2026-64033 linux-kernel
+CVE-2026-64034 linux-kernel
+CVE-2026-64035 linux-kernel
+CVE-2026-64037 linux-kernel
+CVE-2026-98432 linux-kernel
+GHSA-5xjx-3w67-w9x9 pypa/gh-action-pypi-publish
+GHSA-6q48-6c7w-9gw2 certifi
+GHSA-ffc3-869f-jxw9 pyjwt
+GO-2026-6604 stdlib
+GO-2026-6612 golang.org/x/net
+GO-2026-6612 stdlib
