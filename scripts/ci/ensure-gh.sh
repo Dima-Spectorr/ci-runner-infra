@@ -53,7 +53,10 @@ tarball="gh_${GH_VERSION}_linux_${arch}.tar.gz"
 url="https://github.com/cli/cli/releases/download/v${GH_VERSION}/${tarball}"
 
 echo "ensure-gh: not on PATH — installing ${GH_VERSION} (${arch})"
-curl -sSfL --retry 3 --retry-delay 2 -o "$tmp/$tarball" "$url"
+# --retry-all-errors: a plain --retry skips a dropped connection (curl 56,
+# "Connection reset by peer"), which is exactly what a pool full of freshly
+# booted hosts downloading this at once produced on 2026-11-05 (#1683).
+curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 -o "$tmp/$tarball" "$url"
 
 got="$(sha256sum "$tmp/$tarball" | cut -d' ' -f1)"
 if [ "$got" != "$want" ]; then
