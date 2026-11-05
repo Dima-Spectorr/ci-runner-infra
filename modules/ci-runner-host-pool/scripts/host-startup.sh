@@ -352,7 +352,8 @@ LABELS="${LABELS:+$LABELS,}$HOST_LABEL"
 # rather than trust its text.
 #
 # On a utility host (#1635) a slot also carries its own entry of ci-slot-labels
-# -- `<Repo>-util`, which is what that repository's jobs ask for. Absent on a
+# -- `<Repo>-util` (or `<Repo>-lane` on the lane host), which is what that
+# repository's jobs ask for. The host reads no suffix itself. Absent on a
 # pool host, where nothing is added.
 slot_labels() { # <idx> [unheld:0|1]
   local out="$LABELS" extra=""
@@ -979,6 +980,9 @@ install_job_hooks() {
   # the hook then reads the runner's own environment at job time. Expanding
   # it here would bake in the empty value this boot has.
   renew='sudo -n /opt/ci/job-hooks/pin-hold.sh renew --run "${GITHUB_RUN_ID:-}" >/dev/null 2>&1 || true'
+  # A UTILITY host (#1639) has no pin hold at all (install_pin_hold), so there
+  # is nothing to renew and no sudoers rule that would let the hook try.
+  [ "$UTILITY" != true ] || renew=': # no pin hold on a utility host (#1639)'
   cat >/opt/ci/job-hooks/job-started.sh <<EOF
 #!/usr/bin/env bash
 # Installed by host-startup.sh. Runs as the slot user. See install_job_hooks().
@@ -2529,6 +2533,17 @@ install_pin_hold() {
   # which run holds the host it is on — and no job may write it.
   chmod 0755 "$PIN_DIR" || return 1
 
+  # A UTILITY host (#1639) gets no pin hold. Its slots serve different
+  # repositories, with no controller and no shared stack to keep a run on, and
+  # the hold's run-status check mints its token for the host's nominal $REPO --
+  # the wrong repository for every other slot. The directory stays, empty and
+  # root-owned, so the slot loop reads it as "no hold" exactly as on a fresh
+  # pool host.
+  if [ "$UTILITY" = true ]; then
+    disable_pin_hold || return 1
+    return 0
+  fi
+
   cat >/opt/ci/job-hooks/pin-hold.sh <<EOF
 #!/usr/bin/env bash
 # Installed by host-startup.sh. Runs as root. See install_pin_hold().
@@ -2825,6 +2840,20 @@ EOF
   install_pin_hold_sudoers || return 1
   install_pin_run_status || return 1
   install_pin_sweep || return 1
+}
+
+# disable_pin_hold -- a UTILITY host's side of install_pin_hold (#1639): no
+# helper, no shim, no sudoers drop-in, no run-status check, no sweep. Removed
+# rather than merely not written, so nothing an earlier boot or the image left
+# behind still grants a slot root on pin-hold.sh. Fails CLOSED: a sudoers rule
+# that is still there after this is a utility host that must not register.
+disable_pin_hold() {
+  systemctl disable --now ci-pin-sweep.timer >>/var/log/ci-host.log 2>&1 || true
+  rm -f -- /etc/sudoers.d/ci-pin-hold /usr/local/bin/ci-pin-hold \
+    /opt/ci/job-hooks/pin-hold.sh /opt/ci/job-hooks/pin-run-status.sh \
+    /opt/ci/job-hooks/pin-sweep.sh || return 1
+  [ ! -e /etc/sudoers.d/ci-pin-hold ] || return 1
+  log "no pin hold on a utility host -- its slots serve different repositories (#1639)"
 }
 
 install_pin_hold_sudoers() {
@@ -7098,7 +7127,7 @@ harden_proc_utility() {
 }
 
 # utility_unit_dropin <dropin-dir> <runner|dockerd> -- on a utility host (#1635),
-# hide /proc in the unit as well (each unit has its own mount namespace, so the
+# give the unit a private /dev/shm (#1637) and hide /proc in the unit as well (each unit has its own mount namespace, so the
 # setting must be on both sides; see install_dockerd_unit). The agent also loses
 # the shared-infrastructure band, which a utility host does not publish
 # (setup_slot_networking). On a pool host the drop-in is REMOVED, so a pool unit
@@ -7113,6 +7142,12 @@ utility_unit_dropin() { # <dropin-dir> <runner|dockerd>
   {
     printf '[Service]\n'
     printf 'ProtectProc=invisible\n'
+    # A /dev/shm of the unit's own (#1637). PrivateTmp covers /tmp and
+    # /var/tmp only; the host's /dev/shm is one world-writable tmpfs every
+    # slot shares, so a file one repository's job leaves there is readable by
+    # the next repository's job on a sibling slot. Mode 1777 as the host's is,
+    # so the slot user can still write it, and nosuid,nodev as the host's is.
+    printf 'TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev\n'
     if [ "$2" = runner ]; then
       printf 'UnsetEnvironment=CI_SHARED_INFRA_ADDR CI_SHARED_INFRA_PORT_MIN CI_SHARED_INFRA_PORT_MAX\n'
     fi

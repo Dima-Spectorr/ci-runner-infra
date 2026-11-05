@@ -88,13 +88,46 @@ Also required:
   branch, or from same-repo PRs only.
 - **Jobs given the merge App key stay hosted.** This includes `branch-reaper-self`.
 
-Hardening backlog: #1637 (`/dev/shm`), #1638 (no turbo cache bucket), #1639 (pin-hold).
+Hardening, done after the first review, each gated on `ci-utility=true` or enforced by
+the module:
+
+- #1637: each slot unit gets its own `/dev/shm` (`TemporaryFileSystem=`); `PrivateTmp`
+  does not cover it.
+- #1638: a plan-time guard refuses any `ci-turbo-*` metadata key on the host.
+- #1639: no pin hold, no `ci-pin-hold` sudoers drop-in, no run-status check, no sweep.
+- #1647: `service_account_email` refuses a controller account (`*-ctl@`) and the default
+  compute account.
+- #1648: `repos[*].labels` and `runner_labels` refuse a `-shared` (pool) label.
 
 Unchanged guarantees:
 
 - Slot uids cannot reach the metadata server.
 - The App private key is readable only by root.
 - Tokens are per-repo.
+
+## Lane host (owner, 2026-11-05)
+
+A **second instance** of `modules/ci-runner-utility-host` (for example `name = "ci-lane"`,
+`label_suffix = "lane"`) serves **only each repository's merge-lane job**. Its slots
+register `<Repo>-lane` instead of `<Repo>-util`, so a lane job never lands on the
+gatekeeper host and a gatekeeper never lands on the lane host.
+
+- **Why:** the lane job carries the merge App key, so "jobs given the merge App key stay
+  hosted" (Security) keeps it off the shared gatekeeper host, and on hosted runners it
+  queues behind PR CI. This section amends that rule for the lane job alone, on a host
+  of its own; every other key-carrying job stays hosted. Measured
+  on entity-platform on 2026-11-05: an 8-minute hosted queue, and nothing merged
+  between 14:11 and 14:27Z.
+- **Still never on either host:** `merge-lane-events`, `merge-lane-review-relay`,
+  `branch-reaper-self`, and anything triggered by `pull_request_target`.
+- **Precondition:** #1640 (repository tokens in `curl` argv) must be fixed before any
+  lane job moves. A token in argv on a host whose slots serve several repositories is
+  the leak B1 exists to contain.
+- **Names:** the lane host's `name` must differ from the gatekeeper host's and from
+  every pool base name in the project. The module refuses a `lane` host left on the
+  default `ci-utility`; distinctness from pool names is the root's to keep.
+- **Labels:** both hosts refuse a `-shared`, `-util` or `-lane` label in `repos[*].labels`
+  and `runner_labels`; the scope label is added by the module from `label_suffix`.
 
 ## Cost
 

@@ -72,6 +72,28 @@ variable "name" {
   }
 }
 
+variable "label_suffix" {
+  description = <<-EOT
+    The scope suffix of every slot's routing label: slot of repository `<Repo>`
+    registers `<Repo>-<label_suffix>`, and a workflow asks for exactly that.
+
+    - `util` (default): the GATEKEEPER host — short policy and check jobs.
+    - `lane`: the LANE host — a second instance of this module that serves only
+      each repository's merge-lane job, which carries the merge App key and so
+      is kept off the gatekeeper host (docs/adr-utility-host.md, "Lane host").
+
+    Two instances in one project need different `name`s as well as different
+    suffixes; the template refuses a `lane` host still called `ci-utility`.
+  EOT
+  type        = string
+  default     = "util"
+
+  validation {
+    condition     = contains(["util", "lane"], var.label_suffix)
+    error_message = "label_suffix must be \"util\" (the gatekeeper host) or \"lane\" (the merge-lane host)."
+  }
+}
+
 variable "github_owner" {
   description = "GitHub organisation or user that owns every repository in `repos`. Tokens are minted per slot, scoped to that slot's one repository."
   type        = string
@@ -88,7 +110,7 @@ variable "repos" {
     Each gets `slots` job slots of its own; every one of them registers a
     just-in-time runner IN THAT REPOSITORY ONLY, with the labels
 
-      [self-hosted, <runner_labels...>, <Repo>-util, <labels...>]
+      [self-hosted, <runner_labels...>, <Repo>-<label_suffix>, <labels...>]
 
     so a workflow moves a gatekeeper job here with `runs-on: [self-hosted, linux,
     gcp, <Repo>-util]`. Slots are laid out in repository-name order, and a slot
@@ -126,7 +148,7 @@ variable "repos" {
     # `host-x-util`, which the controller reads in a job's runs-on as an affinity
     # pin to an instance called `x-util` — one that does not exist.
     condition     = alltrue([for r in keys(var.repos) : !startswith(lower(r), "host-")])
-    error_message = "a repository whose name starts with `host-` cannot be served here: its slot label `<Repo>-util` would carry the reserved `host-` prefix, which the controller reads as a pin to a host that does not exist."
+    error_message = "a repository whose name starts with `host-` cannot be served here: its slot label `<Repo>-<label_suffix>` would carry the reserved `host-` prefix, which the controller reads as a pin to a host that does not exist."
   }
 
   validation {
@@ -155,6 +177,20 @@ variable "repos" {
       for l in r.labels : !startswith(lower(l), "host-") && lower(l) != "background"
     ]]))
     error_message = "repos[*].labels may not use the reserved `host-` prefix (an affinity pin) or `background` (the host's own push-run label)."
+  }
+
+  validation {
+    # #1648. `<Repo>-shared` is the label a pool answers to; on a utility slot
+    # it would route that repository's POOL jobs here, onto a host shared with
+    # other repositories (docs/adr-utility-host.md decisions 4-5). The two scope
+    # suffixes are refused too: the slot's own `<Repo>-<label_suffix>` is added
+    # by the module, and the OTHER one would route the lane host's jobs to the
+    # gatekeeper host or the reverse. Both are refused rather than only the
+    # other, because a validation may not read label_suffix on Terraform 1.5.
+    condition = alltrue(flatten([for r in values(var.repos) : [
+      for l in r.labels : !endswith(lower(l), "-shared") && !endswith(lower(l), "-util") && !endswith(lower(l), "-lane")
+    ]]))
+    error_message = "repos[*].labels may not end in `-shared` (a pool's routing label), `-util` or `-lane` (the scope labels the module adds per slot, from label_suffix) — any of them would route another host's jobs onto this one (docs/adr-utility-host.md decisions 4-5)."
   }
 }
 
@@ -215,6 +251,17 @@ variable "service_account_email" {
     condition     = can(regex("^[^@\\s]+@[^@\\s]+$", var.service_account_email))
     error_message = "service_account_email must be a service account email."
   }
+
+  validation {
+    # #1647. ci-runner-identity names the controller account `<account_id>-ctl`
+    # (modules/ci-runner-identity/main.tf, google_service_account.controller),
+    # and that account holds roles/compute.instanceAdmin.v1 over the pools. On
+    # this host it would be an instance-admin token beside workflow code from
+    # several repositories. The project's default compute account is refused for
+    # the same reason: it carries roles/editor unless someone removed it.
+    condition     = !endswith(lower(split("@", var.service_account_email)[0]), "-ctl") && !endswith(lower(var.service_account_email), "-compute@developer.gserviceaccount.com")
+    error_message = "service_account_email must not be a pool controller's account (`<account_id>-ctl@...`, which holds roles/compute.instanceAdmin.v1) nor the default compute account (`<number>-compute@developer.gserviceaccount.com`, which holds roles/editor by default). Pass the HOST account (module.<identity>.service_account_email)."
+  }
 }
 
 variable "github_app_id" {
@@ -253,7 +300,7 @@ variable "runner_group" {
 variable "runner_labels" {
   description = <<-EOT
     Labels EVERY slot registers with, after `self-hosted` and before the slot's
-    own `<Repo>-util`. The default is the ADR's `[linux, gcp]`, the same base set
+    own `<Repo>-<label_suffix>`. The default is the ADR's `[linux, gcp]`, the same base set
     the fleet's workflows already ask for.
   EOT
   type        = list(string)
@@ -268,8 +315,15 @@ variable "runner_labels" {
     # `-util` is the whole of what keeps a utility slot out of a pool's routing
     # and a pool's controller out of this host's demand. A host-wide label that
     # a pool also answers to would let a pool job land here (and vice versa).
-    condition     = alltrue([for l in var.runner_labels : !startswith(lower(l), "host-") && lower(l) != "background" && !endswith(lower(l), "-util")])
-    error_message = "runner_labels may not use the reserved `host-` prefix, `background`, or a `-util` suffix — the per-repository `<Repo>-util` label is added per slot, never host-wide."
+    condition     = alltrue([for l in var.runner_labels : !startswith(lower(l), "host-") && lower(l) != "background" && !endswith(lower(l), "-util") && !endswith(lower(l), "-lane")])
+    error_message = "runner_labels may not use the reserved `host-` prefix, `background`, or a `-util`/`-lane` suffix — the per-repository `<Repo>-<label_suffix>` label is added per slot, never host-wide."
+  }
+
+  validation {
+    # #1648: a pool's `<Repo>-shared` label, host-wide, would route that pool's
+    # jobs to every slot here (docs/adr-utility-host.md decisions 4-5).
+    condition     = alltrue([for l in var.runner_labels : !endswith(lower(l), "-shared")])
+    error_message = "runner_labels may not end in `-shared` — that is a pool's routing label, and the utility host must never take a pool's jobs (docs/adr-utility-host.md decisions 4-5)."
   }
 }
 

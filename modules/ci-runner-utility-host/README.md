@@ -1,8 +1,9 @@
 # `ci-runner-utility-host`
 
 ONE always-on Linux host whose job slots serve **several** repositories, one
-repository per slot, for the short gatekeeper jobs (lane, policy, reaper,
-review-to-issue) that would otherwise each bill a GitHub-hosted minute. Design,
+repository per slot, for the short gatekeeper jobs (policy, checks) that would
+otherwise each bill a GitHub-hosted minute — or, as a second instance with
+`label_suffix = "lane"`, for each repository's merge-lane job alone. Design,
 measurements and the security review: [`docs/adr-utility-host.md`](../../docs/adr-utility-host.md) (#1635).
 
 ## What it builds
@@ -26,7 +27,7 @@ It creates **no IAM binding**, no service account, no bucket and no firewall rul
 |---|---|
 | `ci-utility` | `true` — per-slot repositories plus the co-tenancy hardening (ADR B1–B4) |
 | `ci-slot-repos` | comma list, one repository per slot, in repository-name order |
-| `ci-slot-labels` | `;`-separated per-slot label sets, each led by `<Repo>-util` |
+| `ci-slot-labels` | `;`-separated per-slot label sets, each led by `<Repo>-<label_suffix>` (`-util` or `-lane`) |
 | `ci-cache-seed` | `off` — no shared dependency or tool cache |
 | `ci-slots` | total slots across `repos` |
 | `ci-runner-labels` | `self-hosted` + `runner_labels` (default `linux,gcp`) |
@@ -34,7 +35,12 @@ It creates **no IAM binding**, no service account, no bucket and no firewall rul
 | `ci-interactive-slots` | `0` — no autoscaler headroom to reserve |
 
 Absent on purpose, so the host reads them as off: `ci-job-service-account`, every
-`ci-cache-*` and `ci-turbo-*` key, and any `ci-shared-infra-*` network tag.
+`ci-cache-*` and `ci-turbo-*` key (a plan-time guard refuses `ci-turbo-*`, the job
+identity and the cache bucket, #1638), `enable-guest-attributes` (no pin hold on
+this host, #1639), and any `ci-shared-infra-*` network tag.
+
+`ci-utility=true` also gives every slot unit its own `/dev/shm` (#1637) and skips
+the pin hold with its `ci-pin-hold` sudoers drop-in (#1639).
 
 ## Usage
 
@@ -69,6 +75,27 @@ A workflow then moves one gatekeeper job with
 `runs-on: [self-hosted, linux, gcp, <Repo>-util]` (the `runs_on` output). Check
 names do not change.
 
+### The lane host — a second instance
+
+The merge-lane job carries the merge App key, so it does not share the gatekeeper
+host. A second instance with `label_suffix = "lane"` serves only that job, on
+`<Repo>-lane` (ADR, "Lane host"). Do not move a lane job onto it before #1640
+(tokens in `curl` argv) is fixed.
+
+```hcl
+module "lane_host" {
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=<release>"
+
+  # ...the same inputs as module.utility_host, plus:
+  name         = "ci-lane" # differs from the gatekeeper host and every pool base name
+  label_suffix = "lane"
+
+  repos = {
+    "<repo-a>" = { slots = 1 }
+  }
+}
+```
+
 ## What must stay true
 
 - **Only repositories with fork pull-request workflows disabled.** Never a job
@@ -81,7 +108,10 @@ names do not change.
   controller owns exactly `<its base>-<4 chars>`, so a shared base name would let
   it drain and delete this host.
 - **`service_account_email` is a host account**, never the controller's: it needs
-  only the App key secret read plus metric and log writes.
+  only the App key secret read plus metric and log writes. The module refuses a
+  `*-ctl@` account and the default compute account (#1647).
+- **No pool label.** `repos[*].labels` and `runner_labels` refuse `-shared`,
+  `-util` and `-lane`: the scope label comes from `label_suffix` (#1648).
 
 ## Rolling a change onto the host
 

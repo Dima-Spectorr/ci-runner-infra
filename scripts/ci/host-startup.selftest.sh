@@ -2799,6 +2799,10 @@ has_utility_isolation() { # <file>
   grep -qx 'ProtectProc=invisible' "$root/d/30-utility.conf" 2>/dev/null || okk=1
   grep -q '^UnsetEnvironment=CI_SHARED_INFRA_ADDR ' "$root/r/30-utility.conf" 2>/dev/null || okk=1
   ! grep -q UnsetEnvironment "$root/d/30-utility.conf" 2>/dev/null || okk=1
+  # #1637: a /dev/shm of each unit's own, writable by the slot user, in BOTH
+  # units -- PrivateTmp does not cover it, and the host's is shared by every slot
+  grep -qx 'TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev' "$root/r/30-utility.conf" 2>/dev/null || okk=1
+  grep -qx 'TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev' "$root/d/30-utility.conf" 2>/dev/null || okk=1
   # a pool host carries no drop-in, even one a previous utility boot left
   # shellcheck disable=SC2034  # read by the eval'd utility_unit_dropin body
   ( UTILITY=false; eval "$body"; utility_unit_dropin "$root/r" runner ) || okk=1
@@ -2818,8 +2822,9 @@ has_utility_isolation() { # <file>
   # B3: no band on a utility host -- no reservation, forward accept, DNAT or hairpin
   matches "$code" '^  \[ "\$UTILITY" = true \] \|\| case ",\$reserved," in$' || return 1
   # harden_proc, the band's reservation+accept, its DNAT+hairpin, the loop's
-  # runner record and main's bind loop -- and nothing else turns on it
-  counts "$code" '^  if \[ "\$UTILITY" = true \]; then$' 5 || return 1
+  # runner record, main's bind loop and install_pin_hold's skip (#1639) -- and
+  # nothing else turns on it
+  counts "$code" '^  if \[ "\$UTILITY" = true \]; then$' 6 || return 1
   matches "$code" '^  elif \[ -n "\$baddr" \]; then$' || return 1
   matches "$code" '^  elif \[ -n "\$addr" \]; then$' || return 1
   # B4: every slot bound, fail-closed, before anything is provisioned in it
@@ -2843,6 +2848,48 @@ if has_utility_isolation "$SCRIPT"; then
 else
   bad "a utility host's slots are not isolated from each other -- /proc readable, a sibling's address reachable, the band published, or a rebind that keeps the last repository's tree (#1635)"
 fi
+
+# NO PIN HOLD ON A UTILITY HOST (#1639): its run-status check mints for the
+# host's nominal repository, and nothing there needs a run kept on one host. The
+# pool path is has_pin_hold's; this is only the utility skip, and its ordering.
+utility_has_no_pin_hold() { # <file>
+  local body dis code gate gl sl
+  body=$(extract_fn "$1" install_pin_hold | grep -vE '^[[:space:]]*#')
+  dis=$(extract_fn "$1" disable_pin_hold | grep -vE '^[[:space:]]*#')
+  code=$(code_of "$1")
+  [ -n "$body" ] && [ -n "$dis" ] || return 1
+  # the skip is the whole block, fatal, and RETURNS before anything is written
+  gate=$(printf '%s\n' '  if [ "$UTILITY" = true ]; then' '    disable_pin_hold || return 1' '    return 0' '  fi')
+  case "$body" in *"$gate"*) : ;; *) return 1 ;; esac
+  gl=$(printf '%s\n' "$body" | grep -nF '    disable_pin_hold || return 1' | head -n1 | cut -d: -f1)
+  sl=$(printf '%s\n' "$body" | grep -nF 'cat >/opt/ci/job-hooks/pin-hold.sh' | head -n1 | cut -d: -f1)
+  [ -n "$gl" ] && [ -n "$sl" ] && [ "$gl" -lt "$sl" ] || return 1
+  # the drop-in, the helper and the sweep are REMOVED, and a drop-in that
+  # survives the removal stops the boot
+  matches "$dis" 'rm -f -- /etc/sudoers\.d/ci-pin-hold /usr/local/bin/ci-pin-hold \\$' || return 1
+  matches "$dis" '/opt/ci/job-hooks/pin-hold\.sh /opt/ci/job-hooks/pin-run-status\.sh \\$' || return 1
+  matches "$dis" '^  \[ ! -e /etc/sudoers\.d/ci-pin-hold \] \|\| return 1$' || return 1
+  matches "$dis" '^  systemctl disable --now ci-pin-sweep\.timer ' || return 1
+  # and the job hook renews nothing there
+  matches "$code" "^  \\[ \"\\\$UTILITY\" != true \\] \\|\\| renew=': # no pin hold on a utility host \\(#1639\\)'$" || return 1
+  return 0
+}
+
+if utility_has_no_pin_hold "$SCRIPT"; then
+  ok
+else
+  bad "a utility host installs the pin hold or keeps its sudoers drop-in -- its run-status check asks about the host's nominal repository, not the slot's (#1639)"
+fi
+
+mutate "utility host installs the pin hold"   '/^install_pin_hold() {/,/^}/s@^  if \[ "\$UTILITY" = true \]; then$@  if [ "$UTILITY" = false ]; then@' utility_has_no_pin_hold
+mutate "utility pin-hold skip not fatal"      's@^    disable_pin_hold || return 1$@    disable_pin_hold@' utility_has_no_pin_hold
+mutate "utility pin-hold skip falls through"  '/^install_pin_hold() {/,/^}/s@^    return 0$@    :@' utility_has_no_pin_hold
+mutate "the pin-hold sudoers drop-in survives" 's@rm -f -- /etc/sudoers.d/ci-pin-hold /usr/local/bin@rm -f -- /usr/local/bin@' utility_has_no_pin_hold
+mutate "a surviving drop-in is ignored"       's@^  \[ ! -e /etc/sudoers.d/ci-pin-hold \] || return 1$@  true@' utility_has_no_pin_hold
+mutate "the utility job hook still renews"    's@^  \[ "\$UTILITY" != true \] || renew=@  true || renew=@' utility_has_no_pin_hold
+mutate "utility units share the host /dev/shm" '/^    printf .TemporaryFileSystem=\/dev\/shm/d' has_utility_isolation
+mutate "the private /dev/shm not slot-writable" 's@TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev@TemporaryFileSystem=/dev/shm@' has_utility_isolation
+mutate "only the runner gets a private /dev/shm" "s@^    printf 'TemporaryFileSystem=@    [ \"\$2\" = runner ] \\&\\& printf 'TemporaryFileSystem=@" has_utility_isolation
 
 mutate "a mint falls back to the host repo"  's@^  \[ -n "\$repo" \] || { log "slot \$idx: mint_jit was not told@  repo=${repo:-$REPO}; [ -n "$repo" ] || { log "slot $idx: mint_jit was not told@' slot_repo_binding_behaves
 mutate "a delete falls back to the host repo" 's@local tok code repo="\${2:-}"@local tok code repo="${2:-$REPO}"@' slot_repo_binding_behaves
