@@ -3283,7 +3283,7 @@ install_slot_loop() {
     printf 'LOG_TAG=ci-slot-loop\n'
     declare -p OWNER REPO APP_ID INSTALL_ID KEY_SECRET RUNNER_GROUP HOSTNAME_SHORT \
       LABELS BACKGROUND_SLOTS JIT_DIR SLOT_STATE SLOT_USER_PREFIX PIN_DIR CURL_TIMEOUTS \
-      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR
+      SLOT_REPOS SLOT_LABEL_SETS UTILITY SLOT_BINDING_DIR SLOT_ROOT
     declare -f log safe_for_log md gh_token slot_field slot_repo slot_labels runner_group_id \
       jit_labels_json mint_jit delete_runner host_admissible
     declare -p GH_RATE_FILE
@@ -3301,6 +3301,10 @@ ENVFILE="$JIT_DIR/$idx.env"
 u="$SLOT_USER_PREFIX$idx"
 dir="$SLOT_STATE/$idx"
 CONDEMN_MAX=3
+# A runner that stops this soon after it started, without having taken a job,
+# was refused by GitHub, not finished (#1676). See fast_exit below.
+FAST_EXIT_SECS=60
+fast_exits=0
 # The condemn and recovery lines go out under this tag: the condemned-slot alert
 # keys on ci-slot-loop, and the log shipper sends it (IDENTIFIERS).
 say() { logger -t ci-slot-loop -- "$*" 2>/dev/null || true; echo "slot loop: $*" >&2; }
@@ -3390,6 +3394,43 @@ withdraw_idle() { # <id>
   delete_runner "$1" "$SLOT_REPO" && return 0
   retry_at=$(($(date +%s) + 60))
   return 1
+}
+
+# FAST EXITS (#1676). On 2026-11-05 GitHub deprecated the runner version baked
+# into the image. Every agent registered, printed "Listening for Jobs", and
+# exited about 3s later; this loop minted the next runner at once, and the fleet
+# spent the App installation's hourly API budget in minutes, so the outage first
+# read as a rate limit. The only record of why was the agent's own
+# _diag/Runner_*.log, which nothing ships.
+#
+# fast_exit <started epoch> -- called when the agent stopped without a job and
+# was not withdrawn. Under FAST_EXIT_SECS, it says one fixed sentence (the
+# runner-fast-exit alert counts it) and backs off exponentially, so a refused
+# fleet stops spending the API budget. The _diag directory is the slot user's
+# and a job can write it, so its text is never logged: only whether GitHub's
+# deprecation phrase is in it, as a second fixed sentence.
+fast_exit() { # <started epoch>
+  local lived wait diag
+  lived=$(($(date +%s) - $1))
+  if [ "$lived" -ge "$FAST_EXIT_SECS" ]; then
+    fast_exits=0
+    return 0
+  fi
+  # The controller deregisters an idle runner when it drains or cordons the
+  # host; that agent stops early too, and is not a refusal.
+  gate >/dev/null && return 0
+  fast_exits=$((fast_exits + 1))
+  wait=$((30 << (fast_exits > 5 ? 5 : fast_exits - 1)))
+  [ "$wait" -le 900 ] || wait=900
+  wait=$((wait + RANDOM % 30))
+  say "slot $idx: runner $id stopped ${lived}s after it started without taking a job -- registering again in ${wait}s"
+  # _diag is job-writable: a regular file only (no FIFO or symlink to hang
+  # on), the first MiB, five seconds at most, and never its text in the log.
+  diag=$(find "$SLOT_ROOT/$idx/_diag" -maxdepth 1 -type f -name 'Runner_*.log' -newermt "@$1" -print -quit 2>/dev/null)
+  if [ -n "$diag" ] && timeout 5 head -c 1048576 -- "$diag" 2>/dev/null | grep -qiE 'is deprecated|cannot receive messages'; then
+    say "slot $idx: GitHub refused runner $id as a deprecated version -- the image must be rebuilt with a current runner"
+  fi
+  sleep "$wait"
 }
 
 # Prints why this slot must not register right now; false when it may.
@@ -3484,6 +3525,7 @@ while :; do
     continue
   fi
 
+  started=$(date +%s)
   if ! systemctl start "$UNIT" >/dev/null 2>&1; then
     rm -f -- "$ENVFILE"
     systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
@@ -3498,9 +3540,11 @@ while :; do
   dirty=0
   withdrawn=0
   relabel=0
+  had_job=0
   retry_at=0
   while agent_up; do
     sleep 5
+    [ "$had_job" = 1 ] || ! job_running || had_job=1
     if [ "$withdrawn" -gt 0 ]; then
       # GitHub agreed the runner has no job. An agent that has not noticed its
       # own deletion within about a minute is stopped -- nothing can be assigned
@@ -3538,6 +3582,11 @@ while :; do
   systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
   rm -f -- "$ENVFILE"
   delete_runner "$id" "$SLOT_REPO" || true
+  if [ "$had_job" = 0 ] && [ "$withdrawn" = 0 ]; then
+    fast_exit "$started"
+  else
+    fast_exits=0
+  fi
   # A runner withdrawn ONLY to change its label never had a job (GitHub refused
   # no delete), so its slot is exactly as clean as its last reset left it;
   # another full reset would add the reset's time to every hold change. A

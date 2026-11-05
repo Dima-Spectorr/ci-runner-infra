@@ -1,0 +1,148 @@
+name: Runner version
+
+# IS EVERY POOL BOOTING A RUNNER GITHUB WILL STILL TALK TO? (#1676)
+#
+# The hosts bake the Actions runner with `--disableupdate`. On 2026-11-05
+# GitHub deprecated v2.336.0, which every pool was booting. Each slot
+# registered, then exited about 3 s later, and kept doing that until the App's
+# hourly API budget was gone. The version had been behind for 71 days, and
+# nothing compared it with GitHub's release list. This workflow does, daily:
+#
+#   1. reads the three runner pins in this repository and actions/runner's
+#      releases (scripts/ci/runner-version.sh, rules + self-test);
+#   2. keeps ONE pull request open that bumps all three pins to the newest
+#      release with both archives attached; merging it fires the image trigger;
+#   3. reads the image each consumer root pins (fleet/image-pins.tsv), works out
+#      which runner that image bakes, and reports each pool that is behind.
+#
+# Copying the new image into each pool's project stays an operator step
+# (scripts/ci/propagate-host-image.sh): it needs cross-project compute grants
+# this workflow does not hold. Rolling the hosts does not: once a root applies
+# the new pin, its controller recycles them. See docs/applying-runner-infra.md,
+# "Rolling a new runner version out".
+#
+# THIS FILE DOES NOT RUN ON THE PULL REQUEST THAT CHANGES IT. A schedule fires
+# from the default branch only; runner-version.selftest.sh in ci.yml stands in.
+
+on:
+  # 06:23 UTC: off the hour (GitHub delays busy cron slots), after the 05:41
+  # fleet audit. Daily is plenty: GitHub's window is 30 days, the grace is 14.
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Report only; open or move no pull request'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two runs would race on the bump branch. The commit's expected-head check
+  # makes the loser fail rather than clobber, but there is no reason to race.
+  group: runner-version
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check runner versions
+    # GitHub-hosted: the check that guards the self-hosted fleet must not need
+    # the fleet alive. IntegrateIT's predecessor ran self-hosted and died with
+    # the pools it was meant to warn about.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The App token is the gate, as in fleet-audit.yml. Default branch only:
+    # the bump commit is parented on this checkout, so a dispatch from another
+    # branch would have the App open a "bake runner" PR carrying that branch's
+    # unreviewed commits.
+    if: >-
+      vars.MERGE_LANE_ENABLED == 'true' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+
+    permissions:
+      contents: read
+      # The standing issue is written with the built-in token. The branch, the
+      # commit and the pull request go through the App token, so that the bump
+      # PR's own CI runs (a GITHUB_TOKEN push triggers no workflow).
+      issues: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Owner-wide: the fleet step reads the consumer roots in other repositories.
+      - name: Mint the App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Owner-wide because the fleet scan reads the roots in
+          # fleet/image-pins.tsv; narrowed to the two permissions the bump PR
+          # needs. Scoping the repositories too is #1681.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Run the check
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          RV_REPO: ${{ github.repository }}
+          RV_BASE: ${{ github.event.repository.default_branch }}
+          RV_DRY_RUN: ${{ inputs.dry-run && '1' || '0' }}
+          RV_REPORT: report.txt
+        run: |
+          set -uo pipefail
+          bash scripts/ci/runner-version-watch.sh all 2>&1 | tee log.txt
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # ONE standing issue, opened on the first failing run, commented on while
+      # it stays red, closed by the first clean run. A new issue a day trains
+      # people to close them unread.
+      - name: Keep the standing issue
+        if: always() && steps.check.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          title="Runner version check: a pool is at risk of losing its runners"
+          num=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          {
+            echo "### $(date -u +%Y-%m-%d\ %H:%M) UTC"
+            echo
+            # Image names come from other repositories' tfvars: no backtick
+            # can close the fence, no @ can mention anyone.
+            echo '```'
+            tr -d '`@' < report.txt
+            echo '```'
+            echo
+            echo "[run]($RUN_URL) -- rollout: docs/applying-runner-infra.md, \"Rolling a new runner version out\""
+          } > comment.md
+          if [ "$STATUS" != 0 ]; then
+            if [ -n "$num" ]; then
+              gh issue comment "$num" --repo "$REPO" --body-file comment.md
+            else
+              gh issue create --repo "$REPO" --title "$title" --body-file comment.md
+            fi
+          elif [ -n "$num" ]; then
+            gh issue close "$num" --repo "$REPO" --reason completed --comment "$(cat comment.md)"
+          fi
+
+      - name: "Fail on any fail: finding"
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+        run: |
+          [ "$STATUS" = "0" ] || {
+            echo "runner-version reported failures; see the report above" >&2
+            exit 1
+          }

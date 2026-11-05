@@ -533,6 +533,12 @@ jobs:
       - name: alert slot-reset self-test
         run: bash scripts/ci/alert-slot-reset.selftest.sh
 
+      # The refused-runner alert (#1676): the slot loop's fast_exit sentences
+      # against the ci_runner_fast_exits filter, and the backoff that keeps a
+      # fleet GitHub turns away from spending the App's API budget, run.
+      - name: alert runner-fast-exit self-test
+        run: bash scripts/ci/alert-runner-fast-exit.selftest.sh
+
 
       # A wrong verdict here does not degrade the pool, it silences it: the
       # watchdog restart kills the tick before its metrics flush, so a
@@ -862,6 +868,14 @@ jobs:
         run: bash scripts/ci/branch-reaper-decision.selftest.sh
       - name: branch-reaper structural self-test
         run: bash scripts/ci/branch-reaper.selftest.sh
+
+      # runner-version.yml is scheduled too, so this is the only thing that runs
+      # on the pull request that changes it. It proves the bump PR's contents
+      # against copies of the real pins: exactly three lines, all three or none
+      # (a partial bump bakes the OLD runner), and a deadline taken from the
+      # oldest release the pin missed, not the newest (#1676).
+      - name: runner-version self-test
+        run: bash scripts/ci/runner-version.selftest.sh
 
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert

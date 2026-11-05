@@ -217,7 +217,7 @@ mutate() { # <description> <src|hs> <sed program>
     FAIL=$((FAIL + 1)); echo "FAIL: mutation not detected: $1"; fi
 }
 
-mutate "the policy is not synced"          src 's/ unverifiedkeep slotreset; do$/ unverifiedkeep; do/'
+mutate "the policy is not synced"          src 's/ unverifiedkeep slotreset runnerfastexit; do$/ unverifiedkeep runnerfastexit; do/'
 mutate "the metric is never created"       src 's/^ensure_log_metric ci_slot_reset_failures /ensure_log_metric ci_slot_reset_failurez /'
 mutate "the policy watches another metric" src 's@logging.googleapis.com/user/ci_slot_reset_failures@logging.googleapis.com/user/ci_slot_resets@'
 mutate "the filter reads another log"      src "s@'logName:\"logs/ci-slot-lifecycle\" AND@'logName:\"logs/ci-slot-reset\" AND@"
