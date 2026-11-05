@@ -120,9 +120,10 @@ gatekeeper host and a gatekeeper never lands on the lane host.
   between 14:11 and 14:27Z.
 - **Still never on either host:** `merge-lane-events`, `merge-lane-review-relay`,
   `branch-reaper-self`, and anything triggered by `pull_request_target`.
-- **Precondition:** #1640 (repository tokens in `curl` argv) must be fixed before any
-  lane job moves. A token in argv on a host whose slots serve several repositories is
-  the leak B1 exists to contain.
+- **Preconditions:** #1640 (repository tokens in `curl` argv) is fixed (#1692). #1694
+  must also be fixed before any lane job moves: the host has to refuse every job that is
+  not the merge-lane workflow from the default branch, because a label alone lets any
+  workflow in a served repository sit next to the job that holds the merge key.
 - **Names:** the lane host's `name` must differ from the gatekeeper host's and from
   every pool base name in the project. The module refuses a `lane` host left on the
   default `ci-utility`; distinctness from pool names is the root's to keep.

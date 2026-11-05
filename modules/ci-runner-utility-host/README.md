@@ -79,12 +79,12 @@ names do not change.
 
 The merge-lane job carries the merge App key, so it does not share the gatekeeper
 host. A second instance with `label_suffix = "lane"` serves only that job, on
-`<Repo>-lane` (ADR, "Lane host"). Do not move a lane job onto it before #1640
-(tokens in `curl` argv) is fixed.
+`<Repo>-lane` (ADR, "Lane host"). Do not move a lane job onto it before #1694
+(only the merge-lane workflow from the default branch may run there) is fixed.
 
 ```hcl
 module "lane_host" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=<release>"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.155.1"
 
   # ...the same inputs as module.utility_host, plus:
   name         = "ci-lane" # differs from the gatekeeper host and every pool base name
