@@ -40,7 +40,7 @@ Absent on purpose, so the host reads them as off: `ci-job-service-account`, ever
 
 ```hcl
 module "utility_host" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.155.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.155.1"
 
   project_id = var.project_id
   region     = var.region
