@@ -245,7 +245,7 @@ Four things the operator can set, two of them required:
 
 [docs/adr-utility-host.md](adr-utility-host.md) requires every repository bound
 to the shared utility host to have fork pull-request workflows disabled.
-`RUNNER17` checks that a `-util` job *declares* `--forks=blocked`; a declaration
+`RUNNER17` checks that a `-util` or `-lane` job *declares* `--forks=blocked`; a declaration
 is not the setting, and a repository admin can switch it back on in Settings
 with nothing in any pull request showing it. So the audit reads the live
 setting daily — `GET repos/{owner}/{repo}/actions/permissions/fork-pr-workflows-private-repos`

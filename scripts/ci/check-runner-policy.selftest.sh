@@ -396,13 +396,29 @@ mutate "the RUNNER18 diagnostic never emitted" \
 mutate "the RUNNER19 diagnostic never emitted" \
   's@ err RUNNER19 @ : RUNNER19 @'
 
-# RUNNER17 satisfied by any posture, or widened from `-util` to `-lane`.
+# RUNNER17 satisfied by any posture, or narrowed to one co-tenant suffix
+# (#1712: both `-util` and `-lane` are asked).
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "RUNNER17 ignores the declared fork posture" \
   's@ && \[ "$forks" != "blocked" \]; then@; then@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "RUNNER17 asked of a -lane job too" \
-  's@if \[ "$util_host" -eq 1 \] && \[ "$forks"@if [ "$forks"@'
+mutate "RUNNER17 asked of -util only again" \
+  's@if { \[ "$util_host" -eq 1 \] || \[ "$lane_host" -eq 1 \]; } && \[ "$forks"@if [ "$util_host" -eq 1 ] \&\& [ "$forks"@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER17 no longer asked of -util" \
+  's@if { \[ "$util_host" -eq 1 \] || \[ "$lane_host" -eq 1 \]; } && \[ "$forks"@if [ "$lane_host" -eq 1 ] \&\& [ "$forks"@'
+
+# RUNNER20 (#1712): a -lane job reachable from a pull request. Never
+# reported, judged on the gatekeeper host instead, or on the file's own
+# trigger only (a local callee of a pull_request caller escapes).
+mutate "the RUNNER20 diagnostic never emitted" \
+  's@ err RUNNER20 @ : RUNNER20 @'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER20 judged on the -util host instead" \
+  's@if \[ "$lane_host" -eq 1 \] && \[ "$has_pr_any" -eq 1 \]; then@if [ "$util_host" -eq 1 ] \&\& [ "$has_pr_any" -eq 1 ]; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "RUNNER20 reads the file's own trigger only" \
+  's@if \[ "$lane_host" -eq 1 \] && \[ "$has_pr_any" -eq 1 \]; then@if [ "$lane_host" -eq 1 ] \&\& [ "$has_own_pr" -eq 1 ]; then@'
 
 # The utility-host arms widened to every job: a pool job with `container:` —
 # how the Linux pool is meant to be used — goes red.
@@ -425,9 +441,31 @@ mutate "RUNNER16 never learns the trigger" \
 mutate "RUNNER18 no longer excuses the merge-lane call" \
   's@if \[ "$lane_host" -eq 1 \] && \[ "$merge_lane_call" -eq 0 \]; then@if [ "$lane_host" -eq 1 ]; then@'
 mutate "the merge-lane call is never recognised" \
-  's@^      merge_lane_call=1$@      merge_lane_call=0@'
+  's@^        merge_lane_call=1$@        merge_lane_call=0@'
 mutate "a merge-lane.yml in any repository counts as the fleet's" \
   's@\[^/\]+/ci-runner-infra/@[^/]+/[^/]+/@'
+
+# RUNNER18's owner and ref (#1712): any owner, an unknown owner read as any,
+# a case-sensitive compare, any ref, or the owner's resolution order broken.
+mutate "the lane owner is never compared" \
+  's@^lane_owner_matches() {$@lane_owner_matches() { return 0@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "an unknown lane owner accepts any owner" \
+  's@^  \[ -n "$LANE_OWNER" \] || return 1$@  [ -n "$LANE_OWNER" ] || return 0@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the lane owner compared case-sensitively" \
+  's@^  got="$(printf .%s. "$1" | tr .\[:upper:\]. .\[:lower:\].)"$@  got="$1"@'
+mutate "the merge-lane ref no longer has to be a full SHA" \
+  "s@^LANE_REF_SHA='\\[0-9a-f\\]{40}'\$@LANE_REF_SHA='.*'@"
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the --lane-owner flag no longer beats the environment" \
+  's@^  if \[ "$given" -eq 1 \]; then$@  if false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the Actions-provided owner is no longer read" \
+  's@"${GITHUB_REPOSITORY_OWNER:-}"@""@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "an explicit empty --lane-owner falls back to the environment" \
+  's@^  if \[ "$given" -eq 1 \]; then$@  if [ "$given" -eq 1 ] \&\& [ -n "$value" ]; then@'
 
 # A host-added label read as a scope again (#1703): `runs-on: [self-hosted,
 # background]` silences RUNNER1 and can reach a `-util` slot that RUNNER15-17
@@ -616,7 +654,9 @@ CASES="$(case_list | wc -l)"
 # decided to delete. Raised to 52 by the twenty-seven utility-host cases
 # (`-util` and `-lane`, #1635). Ratcheted to 65, the count the list actually
 # yields, with the three host-label cases (#1703) — it had drifted ten below.
-FLOOR=65
+# 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
+# its two suffixes (+2) in place of the "asked of -lane too" case (-1).
+FLOOR=76
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

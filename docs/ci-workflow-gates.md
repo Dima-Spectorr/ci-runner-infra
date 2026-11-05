@@ -42,6 +42,7 @@ bash scripts/ci/check-runner-policy.sh [--selftest] [--scope=<label>]
                                        [--forks=allowed|blocked]
                                        [--max-timeout=<minutes>]
                                        [--allow-dynamic-runner] [--shared-infra]
+                                       [--lane-owner=<owner>]
                                        [<file>...]
 ```
 
@@ -64,9 +65,20 @@ With no `<file>` arguments it reads every `.yml`/`.yaml` directly under
 | `RUNNER11` | with `--shared-infra`, a **Windows** fleet job does not name `localhost`/`127.0.0.1` on a shared-infrastructure port — there is nothing listening there |
 | `RUNNER15` | a job on a utility-host label (`-util`/`-lane`) declares no `container:` and no `services:` ([#1643](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1643)) |
 | `RUNNER16` | a job on a utility-host label is not in a `pull_request_target` workflow, nor in a local callee one reaches ([#1696](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1696)) |
-| `RUNNER17` | a job on a `-util` label: the run declares `--forks=blocked` ([#1649](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1649)) |
-| `RUNNER18` | a job on a `-lane` label is the REMOTE call to the fleet's merge-lane workflow, and nothing else (a consumer's own `./…merge-lane.yml` does not count) |
+| `RUNNER17` | a job on a utility-host label (`-util` or `-lane`): the run declares `--forks=blocked` ([#1649](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1649), [#1712](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1712)) |
+| `RUNNER18` | a job on a `-lane` label is the REMOTE call to the fleet's merge-lane workflow, and nothing else: `<owner>/ci-runner-infra/.github/workflows/merge-lane.yml@<40-hex SHA>`, where `<owner>` is the fleet lane's owner (see below). A consumer's own `./…merge-lane.yml`, a look-alike owner, and a tag, branch or short-SHA ref do not count ([#1712](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1712)) |
 | `RUNNER19` | the merge-lane call is not routed to a `-util` label, and its `with: runs-on:` is written literally (a computed one is undecidable and refused) |
+| `RUNNER20` | a job on a `-lane` label is not in a workflow a pull request triggers: `pull_request` or `pull_request_target`, its own trigger or a local caller's. The lane runs default-branch code on `workflow_run`, `schedule` or `workflow_dispatch` ([#1712](https://github.com/Dima-Spectorr/ci-runner-infra/issues/1712)) |
+
+**The fleet lane's owner (`RUNNER18`)** is never written in the gate; this is a
+generic product. It is resolved at run time: `--lane-owner=<owner>` when given
+(an explicit empty value stays empty), else `$GITHUB_REPOSITORY_OWNER`, which
+Actions sets in every run. That is right wherever the consumers live under the
+same owner as `ci-runner-infra`; a consumer under another owner passes the flag.
+Owners are compared case-insensitively. **With no owner the gate refuses**:
+no call counts as the fleet lane, so every `-lane` job reports `RUNNER18`
+naming the missing owner, and a repository with no `-lane` job is unaffected.
+It never falls back to "any owner".
 
 **`RUNNER12`, `RUNNER13` and `RUNNER14` are retired and the numbers are not
 reused.** All three judged the route between a pull-request pool and a
