@@ -86,8 +86,9 @@ reset_fixture() {
 # The stub. Dispatch order matters: `/git/tags/` and `/commits/` both end in a
 # sha, and the bare repository path is a prefix of every other one, so it is
 # last. Replaced by a second stub for the fork-posture cases near the end, which
-# is why shellcheck reads this one's body as unreachable.
-# shellcheck disable=SC2317
+# is why shellcheck reads this one's body as unreachable (SC2317) and, from
+# v0.11, the function as never invoked (SC2329).
+# shellcheck disable=SC2317,SC2329
 api() {
   case "$1" in
     */git/ref/tags/*) printf '%s' "$F_REF" ;;
