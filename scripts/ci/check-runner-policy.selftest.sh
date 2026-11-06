@@ -431,6 +431,8 @@ mutate "a matrix-fed with: runs-on is never resolved" \
   's@if w_matrix_refs:@if False:@'
 mutate "a computed matrix behind with: runs-on is trusted" \
   's@if w_matrix_dyn and any@if False and any@'
+mutate "a matrix read in another case is missed" \
+  's@r"(?i)(?<!@r"(?<!@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -671,8 +673,8 @@ CASES="$(case_list | wc -l)"
 # 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
 # its two suffixes (+2) in place of the "asked of -lane too" case (-1). 77 when
 # RUNNER20 became an allowlist (+1, the denylist case). 79 with the matrix-fed
-# `with: runs-on:` cases (#1714, +2).
-FLOOR=79
+# `with: runs-on:` cases (#1714, +3).
+FLOOR=80
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

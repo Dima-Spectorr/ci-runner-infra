@@ -530,7 +530,10 @@ SLOT_TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_.][A-Za-z0-9_.-]*-(?:[Uu
 # `format('{0}-util', …)` build a slot SLOT_TOKEN cannot see whole.
 DYN_SLOT = re.compile(r"-([Uu][Tt][Ii][Ll]|[Ll][Aa][Nn][Ee])(?![A-Za-z0-9_.-])")
 # A `matrix.<key>` reference in a `with:` value of a `uses:` job (#1714).
-MATRIX_REF = re.compile(r"(?<![A-Za-z0-9_.-])matrix\.")
+# Any bare `matrix` token, any case: `matrix.pool`, `matrix['pool']`,
+# `Matrix.pool` and `toJSON(matrix)` all read the matrix (expressions are
+# case-insensitive), and each must reach the scan below.
+MATRIX_REF = re.compile(r"(?i)(?<![A-Za-z0-9_.-])matrix(?![A-Za-z0-9_-])")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -1012,12 +1015,19 @@ for job_id, job in jobs.items():
                 and MATRIX_REF.search(w_value if isinstance(w_value, str) else json.dumps(w_value))
             ]
             w_matrix_dyn = False
+            w_matrix_slots = []
             if w_matrix_refs:
-                w_matrix = (job.get("strategy") or {}).get("matrix")
+                w_strategy = job.get("strategy")
+                w_matrix = w_strategy.get("matrix") if isinstance(w_strategy, dict) else None
                 if isinstance(w_matrix, dict):
                     for w_text in w_strings(w_matrix):
                         if "${{" in w_text:
                             w_matrix_dyn = True
+                            # A leg BUILT at run time (`${{ x }}-lane`) is
+                            # decidable by its suffix, for any input reading it.
+                            for m in DYN_SLOT.finditer(w_text):
+                                if m.group(1).lower() not in w_matrix_slots:
+                                    w_matrix_slots.append(m.group(1).lower())
                         for m in SLOT_TOKEN.finditer(w_text):
                             if m.group(0) not in w_seen:
                                 w_seen.append(m.group(0))
@@ -1037,6 +1047,9 @@ for job_id, job in jobs.items():
                         kind = m.group(1).lower()
                         if kind not in w_dyn:
                             w_dyn.append(kind)
+            for kind in w_matrix_slots:
+                if kind not in w_dyn:
+                    w_dyn.append(kind)
             if w_matrix_dyn and any(w_key == "runs-on" for w_key, _ in w_matrix_refs):
                 for kind in ("util", "lane"):
                     if kind not in w_dyn:
@@ -3070,6 +3083,63 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       runs-on: ${{ matrix.pool }}'
+
+  # Every way an expression reads the matrix, not only `matrix.<key>`:
+  # index syntax, any case, and the whole matrix handed over as JSON.
+  expect "a matrix read by index syntax on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo-lane]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix['"'"'pool'"'"'] }}'
+
+  expect "a matrix read in another case on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo-lane]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ Matrix.pool }}'
+
+  expect "a whole matrix passed as JSON with a -lane leg is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo-lane]
+    uses: ./.github/workflows/build.yml
+    with:
+      cfg: ${{ toJSON(matrix) }}'
+
+  # A leg built at run time is decided by its suffix, whatever input reads it.
+  expect "a matrix leg built as a -lane slot is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: ["${{ github.event.repository.name }}-lane"]
+    uses: ./.github/workflows/build.yml
+    with:
+      pool: ${{ matrix.pool }}'
+
+  # A computed strategy is read as no matrix, not a reader crash.
+  expect "a computed strategy behind a non-runs-on input stays clean" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy: ${{ fromJSON(vars.STRATEGY) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      suite: ${{ matrix.suite }}'
 
   expect "a matrix of pool labels only stays clean" "" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
