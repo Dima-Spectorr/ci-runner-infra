@@ -168,8 +168,13 @@ if it still cannot import it.
   a bare `uses:`. A `uses:` value never needs a backslash.
 - `warn:workflow-pin-scan-incomplete workflows-listing-unreadable` — the
   workflows listing itself could not be read (and the repository did not answer
-  as one with no workflows). Nothing was scanned, so nothing else in the scan is
-  judged, and the repository is never reported compliant.
+  as one with no workflows), or came back `truncated`. Nothing was scanned, so
+  nothing else in the scan is judged, and the repository is never reported
+  compliant. The listing is the git tree of `<default branch>:.github/workflows`
+  (`git/trees`), never the contents API: that one returns at most 1000 entries,
+  alphabetically and without paging, so 1000 decoy files would hide a `zz.yml`
+  behind them. Only top-level files (`blob` entries) are workflows — GitHub
+  runs nothing from a subdirectory of `.github/workflows`, so those are skipped.
 
 - `fail:workflow-pin-not-in-fleet-history pin=<sha8> files=<a.yml,b.yml>` — some
   pin is not reachable from the default branch; `files` names every file that
@@ -177,9 +182,12 @@ if it still cannot import it.
   own line.
 - `warn:workflow-pin-history-unknown pin=<sha8> files=…` — no imposter, but some
   pin's provenance could not be established.
-- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n>` — a file whose
-  read came back empty, or a name the audit will not put in a URL, was not
-  scanned. An unscanned file is never a clean one.
+- `fail:workflow-pin-unread files=<a.yml,…>` — a file whose read came back
+  empty (deleted mid-run, or over 1 MB, where the contents API returns no
+  `content`). GitHub still runs it unseen, so — like an unparsed file — it
+  fails; padding a workflow past 1 MB cannot demote an imposter to a warning.
+- `warn:workflow-pin-scan-incomplete refused=<n>` — a name the audit will not
+  put in a URL was not scanned. An unscanned file is never a clean one.
 - `fail:workflow-pin-unparsed files=<a.yml,…>` — a file the YAML parser could
   not load (or that exceeded the decoder's bounds). GitHub may still run it, and
   an escaped or explicit-key `uses` in it is invisible to the text scan, so it

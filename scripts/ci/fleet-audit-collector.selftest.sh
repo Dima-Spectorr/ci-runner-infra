@@ -478,6 +478,8 @@ eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknow
 # gh's error-document form, which `api` passes through on stdout.
 F_FORK=""
 F_COMPARE=""
+F_TREE=""
+F_META=""
 # Per-SHA compare answers and per-path file bodies for the every-pin cases
 # (#1716); a SHA with no entry gets F_COMPARE, a path with no entry nothing.
 declare -A COMPARE_BY_SHA=()
@@ -496,6 +498,12 @@ api() {
     */contents/*)
       echo "$1" >> "$PROV_CALLS"
       printf '%s' "${FILE_BY_PATH[${1#*/contents/}]:-}" ;;
+    # The workflows listing (#1716) and the repository it hangs off; both
+    # default to empty, which is the unreadable-listing case further down.
+    */git/trees/*)
+      echo "$1" >> "$PROV_CALLS"
+      printf '%s' "$F_TREE" ;;
+    repos/acct/svc-a) printf '%s' "$F_META" ;;
     *) printf '' ;;
   esac
 }
@@ -922,6 +930,62 @@ for TIER in checks pool lane; do
      "an unreadable workflows listing is reported in the $TIER tier"
 done
 eq "$(facts_for svc-a dormant "$GOOD" | grep -c 'wf_')" "0" "a dormant repository is not scanned"
+
+# Round 5: the listing is the git tree, never the contents API, which stops at
+# 1000 entries in alphabetical order. 1000 decoys, then an imposter sorted
+# after them: the tree returns all of them, and the imposter is read and fails.
+tree_body() { # <truncated-json> <entries-json…>
+  local t="$1" out="" e; shift
+  for e in "$@"; do out="${out:+$out,}$e"; done
+  printf '{"sha":"x","tree":[%s],"truncated":%s}' "$out" "$t"
+}
+blob() { printf '{"path":"%s","mode":"100644","type":"blob","sha":"x"}' "$1"; }
+DECOYS=()
+for i in $(seq -w 0 999); do DECOYS+=("$(blob "a0$i.txt")"); done
+F_META='{"default_branch":"main"}'
+F_TREE=$(tree_body false "${DECOYS[@]}" "$(blob zz-imposter.yml)")
+FILE_BY_PATH=([.github/workflows/zz-imposter.yml]="{\"content\":\"$(b64 "jobs:
+  z:
+    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD")\"}")
+: > "$PROV_CALLS"
+CAP_FACTS=$(facts_for svc-a checks "$GOOD")
+eq "$(printf '%s' "$CAP_FACTS" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+   "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=zz-imposter.yml" \
+   "an imposter behind 1000 decoy files is read and fails"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$CAP_FACTS") | grep -c 'ok:compliant')" "0" \
+   "a repository with an imposter behind 1000 decoys never reads compliant"
+eq "$(grep -cx 'repos/acct/svc-a/git/trees/main%3A.github%2Fworkflows' "$PROV_CALLS")" "1" \
+   "the listing reads the default branch's tree, fully URL-encoded"
+eq "$(grep -cx 'repos/acct/svc-a/contents/.github/workflows' "$PROV_CALLS")" "0" \
+   "the capped contents listing is never used"
+
+# A truncated tree is unscanned, never a scan of the part that arrived.
+F_TREE=$(tree_body true "${DECOYS[@]:0:5}")
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+   "a truncated workflows tree is an unreadable listing"
+F_TREE=$(tree_body true "$(blob zz-imposter.yml)")
+eq "$(facts_for svc-a checks "$GOOD" | grep -c 'wf_pins=')" "0" "a truncated tree with a workflow in it is still not scanned"
+# A tree with no `truncated` key at all is not known to be whole either.
+F_TREE='{"sha":"x","tree":[]}'
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+   "a tree with no truncated flag is an unreadable listing"
+# A refusal body from the trees call on a readable repository: no workflows dir.
+F_TREE='{"message":"Not Found","status":"404"}'
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*')" "has_ci=0" "a missing workflows tree on a readable repository is no CI"
+
+# A subdirectory is not a workflow: GitHub runs only top-level files there.
+F_TREE=$(tree_body false "$(blob zz-imposter.yml)" '{"path":"nested.yml","mode":"040000","type":"tree","sha":"y"}')
+: > "$PROV_CALLS"
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_history_files=[^;]*;wf_unread=[^;]*')" "wf_history_files=zz-imposter.yml;wf_unread=" \
+   "a subdirectory entry is skipped, the top-level file is scanned"
+eq "$(grep -c 'nested.yml' "$PROV_CALLS")" "0" "a subdirectory is never read as a workflow"
+# A control character in a name is refused, never split into two names.
+F_TREE=$(tree_body false '{"path":"a\nzz-imposter.yml","mode":"100644","type":"blob","sha":"z"}')
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_unread=[^;]*;wf_refused=[^;]*')" "wf_unread=;wf_refused=1" \
+   "a name holding a newline is refused, not split"
+F_TREE=""
+F_META=""
 FILE_BY_PATH=()
 COMPARE_BY_SHA=()
 # shellcheck disable=SC2034  # read by pin_in_history

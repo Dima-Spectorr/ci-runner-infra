@@ -214,10 +214,17 @@ has "warn:workflow-pin-history-unknown" "an unknown provenance in an extra file 
   "$(wf "$HEALTHY_POOL" wf_pin_in_history '')"
 has "warn:workflow-pin-history-unknown" "a malformed scan verdict is unknown, not a pass" \
   "$(wf "$HEALTHY_POOL" wf_pin_in_history yes)"
-has "warn:workflow-pin-scan-incomplete unread=gone.yml" "an unread workflow file is unscanned, never clean" \
-  "$(wf "$HEALTHY_POOL" wf_unread gone.yml)"
-has "warn:workflow-pin-scan-incomplete" "a refused workflow name is unscanned, never clean" \
+has "fail:workflow-pin-unread files=gone.yml,big.yml" "an unread workflow file (over 1 MB, or gone) fails, naming it" \
+  "$(wf "$HEALTHY_POOL" wf_unread gone.yml,big.yml)"
+hasnt "ok:compliant" "an unread workflow file is never compliant" \
+  "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
+hasnt "workflow-pin-scan-incomplete" "an unread file is its own failure, not a scan-incomplete warning" \
+  "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
+has "fail:workflow-pin-unread files=big.yml" "an unread file fails in the checks tier too" \
+  "$(wf "tier=checks;has_ci=1" wf_unread big.yml)"
+has "warn:workflow-pin-scan-incomplete refused=1" "a refused workflow name is unscanned, never clean" \
   "$(wf "$HEALTHY_POOL" wf_refused 1)"
+hasnt "workflow-pin-unread" "an empty unread fact is quiet" "$HEALTHY_POOL;$WF_OK"
 has "fail:workflow-pin-not-in-fleet-history" "a checks repository's imposter pin fails too" \
   "$(wf "tier=checks;has_ci=1" wf_pin_in_history 0)"
 has "ok:compliant tier=checks" "a checks repository whose pins are all in history is compliant" \

@@ -43,9 +43,9 @@ _fleet_say() {
 
 # _fleet_workflow_pins <scanned> <verdict> <pin> <files> <unread> <refused> —
 # the every-workflow provenance scan (#1716). Says nothing when the scan did not
-# run; an imposter anywhere fails, an unknown warns, an unread file is a
-# warning of its own — a file the audit could not read is never a clean one —
-# and a file it read but could not DECODE, or a run with no decoder, fails.
+# run; an imposter anywhere fails, an unknown warns, a refused name is a
+# warning of its own, and a file it could not READ, a file it read but could
+# not DECODE, or a run with no decoder, fails — never a clean one.
 #   …then <not-sha-files> <obfuscated-files> <listing-unreadable>
 #   <unparsed-files> <no-parser>.
 _fleet_workflow_pins() {
@@ -66,8 +66,13 @@ _fleet_workflow_pins() {
     0) _fleet_say "fail:workflow-pin-not-in-fleet-history pin=${pin:0:8} files=${files:-?} not-reachable-from-the-fleet-default-branch" ;;
     *) _fleet_say "warn:workflow-pin-history-unknown pin=${pin:0:8} files=${files:-?}" ;;
   esac
-  if [ -n "$unread" ] || { [ -n "$refused" ] && [ "$refused" != "0" ]; }; then
-    _fleet_say "warn:workflow-pin-scan-incomplete unread=${unread:-none} refused=${refused:-0}"
+  # A file whose read came back empty — a 404 race, or a file over 1 MB, where
+  # the contents API returns no `content` — is one GitHub still runs, unseen.
+  # Like an unparsed file it FAILS, so padding a workflow past 1 MB cannot
+  # turn an imposter pin into a warning (#1716).
+  [ -n "$unread" ] && _fleet_say "fail:workflow-pin-unread files=$unread"
+  if [ -n "$refused" ] && [ "$refused" != "0" ]; then
+    _fleet_say "warn:workflow-pin-scan-incomplete refused=$refused"
   fi
   # A file the parser could not load is one GitHub may still run: its escaped
   # or explicit-key `uses` is invisible to the text scan, so it FAILS (#1716).

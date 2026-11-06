@@ -460,7 +460,8 @@ declare -A WORKFLOW_TEXT=()
 #   obfuscated_in), wf_unparsed (files the YAML parser could not load: their
 #   literal text is still judged, and the file FAILS), wf_no_parser (1 when no
 #   PyYAML was found, so no file was decoded: FAILS).
-#   facts_for adds wf_listing_unreadable=1 instead when the listing failed.
+#   facts_for adds wf_listing_unreadable=1 instead when the listing failed or
+#   came back truncated.
 workflow_pin_facts() {
   local repo="$1" names="$2" name text tokens pins sha v count=0 refused=0
   local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
@@ -969,15 +970,51 @@ fork_pr_facts() {
 
 facts_for() {
   local repo="$1" tier="$2" want="$3"
-  local lane guard reaper events relay workflows
+  local lane guard reaper events relay workflows=""
   local has_lane=0 has_guard=0 has_reaper=0 has_events=0 has_relay=0 has_ci=""
   # Per repository: the texts already read, so the workflow scan does not read
   # them twice. facts_for runs in `$(…)`, but a direct call must not inherit
   # another repository's files.
   WORKFLOW_TEXT=()
 
-  workflows=$(api "repos/$OWNER/$repo/contents/.github/workflows" | jq -r '.[].name // empty' 2>/dev/null)
-  if [ -n "$workflows" ]; then
+  # THE LISTING COMES FROM THE GIT TREE, NEVER THE CONTENTS API (#1716). The
+  # contents API returns at most 1000 entries of a directory, alphabetically,
+  # with no paging: 1000 decoy files followed by `zz.yml` pinned to an imposter
+  # hid that file from the scan, and the repository read compliant. The trees
+  # API returns the whole directory or says `truncated: true`, and a truncated
+  # (or malformed) listing is unscanned — wf_listing_unreadable — never clean.
+  # The ref is `<default branch>:.github/workflows`, fully URL-encoded (GitHub
+  # 404s an unencoded `:` or `/` there), i.e. the tree file_at reads from.
+  # Only `blob` entries are workflows: GitHub runs top-level files of
+  # .github/workflows and nothing in a subdirectory, so a `tree` entry (or a
+  # submodule `commit`) is not a workflow and is skipped. A control character
+  # in a name becomes `?`, which workflow_pin_facts then refuses (unscanned);
+  # by code point, not `gsub`: Oniguruma reads `\u0000-…` in a class as a
+  # range over ordinary letters and mangled every name.
+  local branch tree listing listing_truncated=0
+  branch=$(api "repos/$OWNER/$repo" | jq -r '.default_branch // empty' 2>/dev/null | tr -d '\r')
+  if [ -n "$branch" ]; then
+    tree=$(api "repos/$OWNER/$repo/git/trees/$(printf '%s' "$branch:.github/workflows" | jq -sRr @uri | tr -d '\r')")
+    listing=$(printf '%s' "$tree" | jq -r 'if type=="object" and (.tree|type)=="array"
+        then (if .truncated == false then "#OK" else "#TRUNCATED" end),
+             (.tree[] | select(.type=="blob") | .path | strings
+              | explode | map(if . < 32 or . == 127 then 63 else . end) | implode)
+        else empty end' 2>/dev/null | tr -d '\r')
+    case "$listing" in
+      '#TRUNCATED'*) listing_truncated=1 ;;
+    esac
+    workflows=$(printf '%s\n' "$listing" | sed '1d')
+  fi
+  if [ "$listing_truncated" = "1" ]; then
+    # Some of the directory is missing, so the scan below never runs on it.
+    # The named callers are still looked for among the names that did arrive.
+    has_ci=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane.yml' >/dev/null && has_lane=1
+    printf '%s\n' "$workflows" | grep -cx 'pr-guard-self.yml' >/dev/null && has_guard=1
+    printf '%s\n' "$workflows" | grep -cx 'branch-reaper-self.yml' >/dev/null && has_reaper=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-events.yml' >/dev/null && has_events=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-review-relay.yml' >/dev/null && has_relay=1
+  elif [ -n "$workflows" ]; then
     has_ci=1
     # `grep -cx … >/dev/null`, never `grep -qx`. Under `pipefail` a `-q` reader
     # exits on its first match while the in-process writer is still going, the
@@ -993,7 +1030,7 @@ facts_for() {
     # two must not render alike. The repository itself answers: a repository
     # that exists with a default branch and no `.github` directory is the
     # former, and a 404 on the repository is the latter.
-    api "repos/$OWNER/$repo" | jq -e '.default_branch' >/dev/null 2>&1 && has_ci=0
+    [ -n "$branch" ] && has_ci=0
   fi
 
   local facts="tier=$tier;has_lane=$has_lane;has_guard=$has_guard;has_reaper=$has_reaper"
@@ -1064,11 +1101,12 @@ facts_for() {
   # only for having CI at all. The named callers' texts are reused, not re-read.
   case "$tier" in
     pool|lane|checks)
-      if [ -n "$workflows" ]; then
+      if [ "$listing_truncated" = "0" ] && [ -n "$workflows" ]; then
         facts="$facts;$(workflow_pin_facts "$repo" "$workflows")"
       elif [ "$has_ci" != "0" ]; then
-        # The listing failed (has_ci=0 is a readable repository with no
-        # workflows, which has nothing to scan). Unscanned is never clean.
+        # The listing failed or was truncated (has_ci=0 is a readable
+        # repository with no workflows, which has nothing to scan). Unscanned
+        # is never clean.
         facts="$facts;wf_scanned=1;wf_listing_unreadable=1"
       fi
       ;;
