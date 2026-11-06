@@ -65,24 +65,54 @@ So a pin that could not be read is `warn:lane-pin-unreadable`, not silence; a
 ruleset that could not be compared is `warn:required-checks-uncomparable`, not a
 pass; an unrecognised tier is `fail:unknown-tier`, not a default.
 
-### Pin provenance (#1715)
+### Pin provenance (#1715, #1716)
 
 A 40-hex pin is not proof the code came from this repository. GitHub resolves
 `<owner>/ci-runner-infra/.github/workflows/<callee>@<sha>` for a commit that
 exists only in a **fork** of it (an "imposter commit"), and RUNNER18 checks only
-the owner and the SHA's shape. So every caller's pin — `merge-lane.yml`,
-`merge-lane-events.yml`, the guard and the reaper — is also compared against
-this repository's default branch (`compare/<default-branch>...<sha>`, one call
-per distinct SHA per run):
+the owner and the SHA's shape. So every pin is also compared against this
+repository's default branch (`compare/<default-branch>...<sha>`, one call per
+distinct SHA per run, cached across repositories).
+
+**Every pin, not the first.** A caller can hold several pins — a second job
+calling the same callee, or a commented-out line above the real one. Comments
+are not pins: a line whose first non-space character is `#` is skipped, and a
+trailing ` #…` is cut before matching, so a commented decoy that *is* in the
+history cannot stand in for the real `uses:` line. Every remaining pin is
+de-duplicated and judged, and the **worst verdict wins**: any pin not in the
+history fails, else any unknown warns, else the caller is quiet. The finding
+names the pin that made the verdict. `<caller>-pin-stale` still compares the
+first non-comment pin with the expected release.
+
+The named callers — `merge-lane.yml`, `merge-lane-events.yml`, the guard and
+the reaper — report per caller:
 
 - `fail:<caller>-pin-not-in-fleet-history` — the compare answers `ahead` or
   `diverged`, or 404s: the pinned commit is not reachable from the default
   branch. Reported independently of `<caller>-pin-stale`; an old release that
   *is* in the history is only stale.
-- `warn:<caller>-pin-history-unknown` — the compare failed in any other way, or
-  the audit's token cannot read this repository at all. The latter is checked
-  first, once per run, because under such a token every compare is a 404 and
-  would otherwise read as an imposter in every repository.
+- `warn:<caller>-pin-history-unknown` — the compare failed in any other way
+  (including a body that is not exactly one JSON object), or the audit's token
+  cannot read this repository at all. The latter is checked first, once per
+  run, because under such a token every compare is a 404 and would otherwise
+  read as an imposter in every repository.
+
+**Every workflow, not four.** Any workflow can call a fleet reusable workflow,
+so in the `pool`, `lane` and `checks` tiers every `.github/workflows/*.yml` /
+`*.yaml` in the repository is read — from the listing the audit already takes,
+reusing the named callers' texts, so the extra cost is one read per other
+workflow file — and every non-comment `ci-runner-infra/.github/workflows/<x>@<sha>`
+in it is judged the same way:
+
+- `fail:workflow-pin-not-in-fleet-history pin=<sha8> files=<a.yml,b.yml>` — some
+  pin is not reachable from the default branch; `files` names every file that
+  holds such a pin. A named caller's imposter is reported here as well as on its
+  own line.
+- `warn:workflow-pin-history-unknown pin=<sha8> files=…` — no imposter, but some
+  pin's provenance could not be established.
+- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n>` — a file whose
+  read came back empty, or a name the audit will not put in a URL, was not
+  scanned. An unscanned file is never a clean one.
 
 ### The two-file lane
 

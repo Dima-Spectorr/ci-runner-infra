@@ -182,6 +182,44 @@ hasnt "pin-history-unknown" "an unreadable pin gets no provenance finding" \
 hasnt "guard-pin-history" "a missing caller is not judged for provenance" \
   "$(swap has_guard 0 | sed 's/;guard_pin=[^;]*/;guard_pin=/;s/;guard_pin_in_history=[^;]*/;guard_pin_in_history=/')"
 
+# --- every pin, every workflow (#1716) ------------------------------------------
+# The collector judges EVERY non-comment pin in a caller, worst wins, and names
+# the pin that made the verdict — which need not be the first one the stale
+# rule reads (a second job, or the real line under a commented decoy).
+IMPOSTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+has "fail:lane-pin-not-in-fleet-history pin=eeeeeeee" "a caller's verdict names the imposter pin, not its first pin" \
+  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER"
+has "warn:guard-pin-history-unknown pin=eeeeeeee" "an unknown verdict names the pin it is about" \
+  "$(swap guard_pin_in_history '');guard_history_pin=$IMPOSTER"
+hasnt "fail:lane-pin-stale" "the first pin is still the expected release, so it is not stale" \
+  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER"
+
+# The scan over every workflow file.
+WF_OK="wf_scanned=1;wf_pins=5;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0"
+wf() { printf '%s;%s' "$1" "$(printf '%s' "$WF_OK" | sed "s/$2=[^;]*/$2=$3/")"; }
+has "ok:compliant" "every pin in every workflow in history is quiet" "$HEALTHY_POOL;$WF_OK"
+hasnt "workflow-pin" "and says nothing about the scan" "$HEALTHY_POOL;$WF_OK"
+hasnt "workflow-pin" "a scan that did not run says nothing (old collectors)" "$HEALTHY_POOL"
+has "fail:workflow-pin-not-in-fleet-history pin=eeeeeeee files=deploy.yml,ci.yml" \
+  "an imposter pin in an extra workflow file fails, naming the files" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history 0 | sed "s/wf_history_pin=/wf_history_pin=$IMPOSTER/;s/wf_history_files=/wf_history_files=deploy.yml,ci.yml/")"
+has "warn:workflow-pin-history-unknown" "an unknown provenance in an extra file is a warning" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history '')"
+has "warn:workflow-pin-history-unknown" "a malformed scan verdict is unknown, not a pass" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history yes)"
+has "warn:workflow-pin-scan-incomplete unread=gone.yml" "an unread workflow file is unscanned, never clean" \
+  "$(wf "$HEALTHY_POOL" wf_unread gone.yml)"
+has "warn:workflow-pin-scan-incomplete" "a refused workflow name is unscanned, never clean" \
+  "$(wf "$HEALTHY_POOL" wf_refused 1)"
+has "fail:workflow-pin-not-in-fleet-history" "a checks repository's imposter pin fails too" \
+  "$(wf "tier=checks;has_ci=1" wf_pin_in_history 0)"
+has "ok:compliant tier=checks" "a checks repository whose pins are all in history is compliant" \
+  "tier=checks;has_ci=1;$WF_OK"
+has "fail:workflow-pin-not-in-fleet-history" "a repository with no lane caller is still scanned" \
+  "$(wf "tier=lane;has_lane=0" wf_pin_in_history 0)"
+hasnt "workflow-pin" "the source repository is not judged by the scan" \
+  "$(wf "$HEALTHY_SOURCE" wf_pin_in_history 0)"
+
 # --- the two-file lane (#1382) ----------------------------------------------------
 # The healthy pool with a healthy events file beside the pool caller. Each case
 # is this string with one fact changed.

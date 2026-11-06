@@ -117,11 +117,27 @@ file_at() {
   printf '%s' "$body" | tr -d '\r\n' | base64 -d 2>/dev/null
 }
 
-# pin_in <file-contents> <callee> — the sha a caller pins for one callee.
+# pins_in <file-contents> <callee-regex> — EVERY sha a file pins for the callee,
+# one per line, lowercased, de-duplicated in first-appearance order (#1716).
+#
+# COMMENTS ARE NOT PINS. A line whose first non-space character is `#` is
+# dropped, and a trailing ` #…` is cut before matching: a commented decoy pin
+# (in history) above the real `uses:` line (an imposter) read as the pin when
+# only the first match was taken. Every pin is returned, not the first, because
+# a second job calling the same callee is a second pin to judge.
+pins_in() {
+  printf '%s\n' "$1" | tr -d '\r' \
+    | grep -vE '^[[:space:]]*#' \
+    | sed -E 's/[[:space:]]#.*$//' \
+    | grep -oE "ci-runner-infra/\.github/workflows/$2@[0-9a-fA-F]{40}" \
+    | grep -oE '[0-9a-fA-F]{40}$' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+}
+
+# pin_in <file-contents> <callee> — the first non-comment pin, which is what the
+# pin-stale rule compares against the expected release. Provenance does not use
+# it: it judges every pin through pins_in.
 pin_in() {
-  printf '%s' "$1" \
-    | grep -oE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}" \
-    | head -1 | grep -oE '[0-9a-f]{40}$'
+  pins_in "$1" "$2" | sed -n 1p
 }
 
 # --- pin provenance (#1715) ------------------------------------------------------
@@ -180,6 +196,93 @@ pin_in_history() {
   verdict=$(history_of_compare "$(api "repos/$OWNER/ci-runner-infra/compare/$branch...$sha")")
   [ -n "$cache" ] && [ -d "$cache" ] && printf '%s' "$verdict" > "$cache/$sha"
   printf '%s' "$verdict"
+}
+
+# pins_history <sha-list> — "<verdict> <sha>" for a newline-separated list:
+# the WORST verdict and the pin it names. Any pin not in history is 0; else any
+# unknown is empty; else 1, naming the first pin. Nothing for an empty list.
+pins_history() {
+  local sha v worst=1 named="" first=""
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    [ -z "$first" ] && first="$sha"
+    v=$(pin_in_history "$sha")
+    case "$v" in
+      1) : ;;
+      0) worst=0; named="$sha"; break ;;
+      *) [ "$worst" = "1" ] && { worst=""; named="$sha"; } ;;
+    esac
+  done <<< "${1:-}"
+  [ -z "$first" ] && return 0
+  printf '%s %s' "$worst" "${named:-$first}"
+}
+
+# caller_pin_facts <prefix> <file-contents> <callee-regex> — the named caller's
+# facts: `<prefix>_pin` (the first pin, for the stale rule), its provenance over
+# EVERY pin (worst wins), and `<prefix>_history_pin`, the pin that verdict names.
+caller_pin_facts() {
+  local pins r
+  pins=$(pins_in "$2" "$3")
+  r=$(pins_history "$pins")
+  printf '%s_pin=%s;%s_pin_in_history=%s;%s_history_pin=%s' \
+    "$1" "$(printf '%s\n' "$pins" | sed -n 1p)" "$1" "${r%% *}" "$1" "${r#* }"
+}
+
+# --- every workflow's fleet pins (#1716) -----------------------------------------
+#
+# The named callers above are four files. Any other workflow can call a fleet
+# reusable workflow at an imposter SHA, so every `.github/workflows/*.y(a)ml`
+# is read and every non-comment `ci-runner-infra/.github/workflows/<x>@<sha>`
+# in it is judged for provenance. Cost: one read per workflow file not already
+# read for the named callers (WORKFLOW_TEXT), plus one compare per DISTINCT SHA
+# in the run (pin_in_history's cache) — the listing is the one facts_for has.
+declare -A WORKFLOW_TEXT=()
+
+# workflow_pin_facts <repo> <workflow-names> — the scan's facts:
+#   wf_scanned=1, wf_pins (count of file/pin pairs), wf_pin_in_history (worst
+#   verdict: 0 / "" / 1), wf_history_pin (the pin it names), wf_history_files
+#   (the files holding a pin with that verdict), wf_unread (files whose read
+#   came back empty — an unread file is unscanned, never clean), wf_refused
+#   (names not safe to put in a URL or a fact, also unscanned).
+workflow_pin_facts() {
+  local repo="$1" names="$2" name text pins sha v count=0 refused=0
+  local unread="" bad="" bad_files="" unk="" unk_files=""
+  while IFS= read -r name; do
+    name="${name%$'\r'}"
+    case "$name" in *.yml|*.yaml) ;; *) continue ;; esac
+    if ! printf '%s' "$name" | grep -cE '^[A-Za-z0-9._-]+$' >/dev/null; then
+      refused=$((refused + 1))
+      continue
+    fi
+    if [ -n "${WORKFLOW_TEXT[$name]+set}" ]; then
+      text="${WORKFLOW_TEXT[$name]}"
+    else
+      text=$(file_at "$repo" ".github/workflows/$name")
+    fi
+    if [ -z "$text" ]; then
+      unread="${unread:+$unread,}$name"
+      continue
+    fi
+    pins=$(pins_in "$text" '[A-Za-z0-9._-]+\.ya?ml')
+    while IFS= read -r sha; do
+      [ -z "$sha" ] && continue
+      count=$((count + 1))
+      v=$(pin_in_history "$sha")
+      case "$v" in
+        1) : ;;
+        0) [ -z "$bad" ] && bad="$sha"
+           case ",$bad_files," in *",$name,"*) ;; *) bad_files="${bad_files:+$bad_files,}$name" ;; esac ;;
+        *) [ -z "$unk" ] && unk="$sha"
+           case ",$unk_files," in *",$name,"*) ;; *) unk_files="${unk_files:+$unk_files,}$name" ;; esac ;;
+      esac
+    done <<< "$pins"
+  done <<< "$names"
+  local verdict=1 named="" files=""
+  if [ -n "$bad" ]; then verdict=0; named="$bad"; files="$bad_files"
+  elif [ -n "$unk" ]; then verdict=""; named="$unk"; files="$unk_files"
+  fi
+  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s' \
+    "$count" "$verdict" "$named" "$files" "$unread" "$refused"
 }
 
 # --- the two-file lane (#1380, #1382) ------------------------------------------
@@ -627,6 +730,10 @@ facts_for() {
   local repo="$1" tier="$2" want="$3"
   local lane guard reaper events relay workflows
   local has_lane=0 has_guard=0 has_reaper=0 has_events=0 has_relay=0 has_ci=""
+  # Per repository: the texts already read, so the workflow scan does not read
+  # them twice. facts_for runs in `$(…)`, but a direct call must not inherit
+  # another repository's files.
+  WORKFLOW_TEXT=()
 
   workflows=$(api "repos/$OWNER/$repo/contents/.github/workflows" | jq -r '.[].name // empty' 2>/dev/null)
   if [ -n "$workflows" ]; then
@@ -653,22 +760,23 @@ facts_for() {
 
   if [ "$has_lane" = "1" ]; then
     lane=$(file_at "$repo" ".github/workflows/merge-lane.yml")
+    WORKFLOW_TEXT[merge-lane.yml]="$lane"
     # Every pin also carries whether it is in the fleet's history (#1715): one
     # cached compare per distinct SHA, so the guard and reaper ride along free.
-    local pin
-    pin=$(pin_in "$lane" 'merge-lane\.yml')
-    facts="$facts;lane_pin=$pin;lane_pin_in_history=$(pin_in_history "$pin")"
+    # EVERY non-comment pin is judged, worst verdict wins (#1716).
+    facts="$facts;$(caller_pin_facts lane "$lane" 'merge-lane\.yml')"
     facts="$facts;has_events=$has_events"
     [ "$has_events" = "1" ] && {
       # The events file calls the same callee, so it carries the same kind of
       # pin — and drifts from merge-lane.yml's exactly the way the guard and
       # reaper pins drifted from each other.
       events=$(file_at "$repo" ".github/workflows/merge-lane-events.yml")
-      pin=$(pin_in "$events" 'merge-lane\.yml')
-      facts="$facts;events_pin=$pin;events_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[merge-lane-events.yml]="$events"
+      facts="$facts;$(caller_pin_facts events "$events" 'merge-lane\.yml')"
       facts="$facts;with_match=$(with_agrees "$lane" "$events")"
       if [ "$has_relay" = "1" ]; then
         relay=$(file_at "$repo" ".github/workflows/merge-lane-review-relay.yml")
+        WORKFLOW_TEXT[merge-lane-review-relay.yml]="$relay"
         facts="$facts;relay_match=$(relay_agrees "$events" "$relay")"
       else
         # No relay at all: whatever name the events file listens for, nothing
@@ -678,13 +786,13 @@ facts_for() {
     }
     [ "$has_guard" = "1" ] && {
       guard=$(file_at "$repo" ".github/workflows/pr-guard-self.yml")
-      pin=$(pin_in "$guard" 'pr-guard\.yml')
-      facts="$facts;guard_pin=$pin;guard_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[pr-guard-self.yml]="$guard"
+      facts="$facts;$(caller_pin_facts guard "$guard" 'pr-guard\.yml')"
     }
     [ "$has_reaper" = "1" ] && {
       reaper=$(file_at "$repo" ".github/workflows/branch-reaper-self.yml")
-      pin=$(pin_in "$reaper" 'branch-reaper\.yml')
-      facts="$facts;reaper_pin=$pin;reaper_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[branch-reaper-self.yml]="$reaper"
+      facts="$facts;$(caller_pin_facts reaper "$reaper" 'branch-reaper\.yml')"
     }
 
     # A 403 AND AN EMPTY LIST ARE THE SAME BYTES HERE, so the exit status is
@@ -709,6 +817,15 @@ facts_for() {
     facts="$facts;checks_match=$(checks_agree "$lane" "$repo")"
     facts="$facts;ruleset=$(api "repos/$OWNER/$repo/rulesets" | jq -r 'if type=="array" then (if length>0 then 1 else 0 end) else empty end' 2>/dev/null)"
   fi
+
+  # Every workflow's fleet pins (#1716), in the tiers whose rule judges them.
+  # `source` calls itself through local paths; `dormant` and `empty` are judged
+  # only for having CI at all. The named callers' texts are reused, not re-read.
+  case "$tier" in
+    pool|lane|checks)
+      [ -n "$workflows" ] && facts="$facts;$(workflow_pin_facts "$repo" "$workflows")"
+      ;;
+  esac
 
   # The source repository is the only one with an unreleased backlog to have:
   # it is what every other repository pins. Collected only here, because these

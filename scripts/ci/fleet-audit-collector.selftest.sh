@@ -478,6 +478,10 @@ eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknow
 # gh's error-document form, which `api` passes through on stdout.
 F_FORK=""
 F_COMPARE=""
+# Per-SHA compare answers and per-path file bodies for the every-pin cases
+# (#1716); a SHA with no entry gets F_COMPARE, a path with no entry nothing.
+declare -A COMPARE_BY_SHA=()
+declare -A FILE_BY_PATH=()
 FORK_PATH_FILE="${TMPDIR:-/tmp}/fleet-audit-collector-forkpath.$$"
 trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE"' EXIT
 api() {
@@ -488,7 +492,10 @@ api() {
     # The provenance cases (#1715) below share this stub rather than redefine it.
     */compare/*)
       echo "$1" >> "$PROV_CALLS"
-      printf '%s' "$F_COMPARE" ;;
+      printf '%s' "${COMPARE_BY_SHA[${1##*...}]:-$F_COMPARE}" ;;
+    */contents/*)
+      echo "$1" >> "$PROV_CALLS"
+      printf '%s' "${FILE_BY_PATH[${1#*/contents/}]:-}" ;;
     *) printf '' ;;
   esac
 }
@@ -613,6 +620,99 @@ rm -f "$PIN_HISTORY_CACHE"/*
 eq "$(pin_in_history "$PROV_SHA")" "" "an unreadable fleet repository makes every provenance unknown"
 eq "$(wc -l < "$PROV_CALLS" | tr -d ' ')" "1" "and makes no compare whose 404 would read as an imposter"
 PIN_HISTORY_CACHE=""
+
+# A compare body holding SEVERAL JSON objects (#1716 item 3) is no single
+# answer: jq prints one status per object, and two words are not a verdict.
+eq "$(history_of_compare '{"status":"behind"}{"status":"behind"}')" "" "concatenated compare objects are unknown, even when they agree"
+eq "$(history_of_compare '{"status":"404"} {"status":"behind"}')" "" "concatenated compare objects that disagree are unknown"
+
+# --- every pin, every workflow (#1716) --------------------------------------------
+#
+# GOOD is in the fleet's history, BAD is an imposter (a fork-only commit: 404).
+GOOD=dddddddddddddddddddddddddddddddddddddddd
+BAD=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+UNK=ffffffffffffffffffffffffffffffffffffffff
+COMPARE_BY_SHA=([$GOOD]='{"status":"behind"}' [$BAD]='{"message":"Not Found","status":"404"}' [$UNK]='{"message":"Resource not accessible by integration","status":"403"}')
+# shellcheck disable=SC2034  # read by pin_in_history
+FLEET_HISTORY_BRANCH=main
+CALLEE="acct/ci-runner-infra/.github/workflows/merge-lane.yml"
+job() { printf '  %s:\n    uses: %s@%s\n' "$1" "$CALLEE" "$2"; }
+
+# The reviewer's reproduction: a commented decoy, in history, above the real pin.
+DECOY="jobs:
+  # uses: $CALLEE@$GOOD
+$(job lane "$BAD")"
+eq "$(pins_in "$DECOY" 'merge-lane\.yml')" "$BAD" "a commented decoy pin is not a pin"
+eq "$(pin_in "$DECOY" 'merge-lane\.yml')" "$BAD" "and pin_in no longer reads the decoy"
+eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "a decoy comment above an imposter pin fails provenance"
+
+# A pin that appears only in a trailing comment is not a pin either.
+TRAIL="    uses: $CALLEE@$GOOD # was $CALLEE@$BAD"
+eq "$(pins_in "$TRAIL" 'merge-lane\.yml')" "$GOOD" "a pin in a trailing comment is not a pin"
+
+# Two jobs call the same callee; the second is the imposter. Worst wins, the
+# stale rule still reads the first, and the finding names the imposter.
+TWO_JOBS="jobs:
+$(job a "$GOOD")
+$(job b "$BAD")"
+eq "$(pins_in "$TWO_JOBS" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "both jobs' pins are read, in order"
+eq "$(caller_pin_facts lane "$TWO_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "one imposter among two jobs fails, naming the imposter"
+UNK_JOBS="jobs:
+$(job a "$GOOD")
+$(job b "$UNK")"
+eq "$(caller_pin_facts lane "$UNK_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=;lane_history_pin=$UNK" \
+   "an unknown among good pins is unknown, never a pass"
+ALL_GOOD="jobs:
+$(job a "$GOOD")
+$(job b "$GOOD")
+$(job c "$(printf '%s' "$GOOD" | tr 'a-f' 'A-F')")"
+eq "$(pins_in "$ALL_GOOD" 'merge-lane\.yml')" "$GOOD" "repeated pins, any case, de-duplicate to one"
+eq "$(caller_pin_facts lane "$ALL_GOOD" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=1;lane_history_pin=$GOOD" \
+   "every pin in history is quiet"
+eq "$(caller_pin_facts lane "name: x" 'merge-lane\.yml')" "lane_pin=;lane_pin_in_history=;lane_history_pin=" \
+   "a caller with no pin has no provenance"
+
+# The scan over every workflow file. merge-lane.yml was already read for the
+# named caller, so it must come from WORKFLOW_TEXT, not a second read.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+OTHER="jobs:
+  deploy:
+    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD"
+WORKFLOW_TEXT=([merge-lane.yml]="$(job lane "$GOOD")")
+FILE_BY_PATH=([.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "$OTHER")\"}"
+              [.github/workflows/ci.yml]="{\"content\":\"$(b64 "name: CI")\"}")
+: > "$PROV_CALLS"
+LIST="merge-lane.yml
+ci.yml
+deploy.yaml
+README.md"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0" \
+   "an imposter pin in an extra workflow file fails, naming the file"
+eq "$(grep -c '/contents/' "$PROV_CALLS")" "2" "only the files not already read are fetched, and non-YAML is skipped"
+eq "$(grep -c 'contents/.github/workflows/merge-lane.yml' "$PROV_CALLS")" "0" "the named caller's text is reused"
+
+FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$GOOD}")\"}"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0" \
+   "every pin in every workflow in history is quiet"
+
+FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$UNK}")\"}"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0" \
+   "an unknown provenance in an extra file is unknown, naming the file"
+
+# shellcheck disable=SC2034  # read by workflow_pin_facts
+WORKFLOW_TEXT=()
+eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na;b.yml\r\n')")" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1" \
+   "an unreadable file and an unsafe name are reported as unscanned, never clean"
+FILE_BY_PATH=()
+COMPARE_BY_SHA=()
+# shellcheck disable=SC2034  # read by pin_in_history
+FLEET_HISTORY_BRANCH=""
 
 # --- the two guards around the collector ---------------------------------------
 #

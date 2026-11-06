@@ -41,6 +41,23 @@ _fleet_say() {
   echo "$1"
 }
 
+# _fleet_workflow_pins <scanned> <verdict> <pin> <files> <unread> <refused> —
+# the every-workflow provenance scan (#1716). Says nothing when the scan did not
+# run; an imposter anywhere fails, an unknown warns, and an unscanned file is a
+# warning of its own — a file the audit could not read is never a clean one.
+_fleet_workflow_pins() {
+  local scanned="$1" hist="$2" pin="$3" files="$4" unread="$5" refused="$6"
+  [ "$scanned" = "1" ] || return 0
+  case "$hist" in
+    1) : ;;
+    0) _fleet_say "fail:workflow-pin-not-in-fleet-history pin=${pin:0:8} files=${files:-?} not-reachable-from-the-fleet-default-branch" ;;
+    *) _fleet_say "warn:workflow-pin-history-unknown pin=${pin:0:8} files=${files:-?}" ;;
+  esac
+  if [ -n "$unread" ] || { [ -n "$refused" ] && [ "$refused" != "0" ]; }; then
+    _fleet_say "warn:workflow-pin-scan-incomplete unread=${unread:-none} refused=${refused:-0}"
+  fi
+}
+
 # _fleet_is_number — a fact that may be compared with `-ge`.
 #
 # `[ "$x" -ge "$y" ]` on a non-numeric operand exits 2, and 2 is falsey, so an
@@ -76,7 +93,17 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #                 default branch, 0 if it is not (an imposter commit from a fork,
 #                 #1715), "" if that could not be established. Likewise
 #                 events_pin_in_history, guard_pin_in_history and
-#                 reaper_pin_in_history for their pins.
+#                 reaper_pin_in_history for their pins. Judged over EVERY
+#                 non-comment pin the file holds for its callee, worst verdict
+#                 wins (#1716); `<caller>_history_pin` names the pin that
+#                 verdict is about, falling back to `<caller>_pin`.
+#   wf_scanned    1 when every workflow file was scanned for fleet pins (#1716);
+#                 absent means not scanned, and the rules below say nothing.
+#   wf_pin_in_history  worst provenance over every `ci-runner-infra/.github/
+#                 workflows/<x>@<sha>` in every workflow: 1 / 0 / "" (unknown)
+#   wf_history_pin, wf_history_files  the pin and the files that verdict names
+#   wf_unread     workflow files whose read came back empty (unscanned)
+#   wf_refused    count of workflow names the collector would not read
 #   relay_match   1 if the review relay's `name:` is what the events file's
 #                 `workflow_run: workflows:` hears, 0 if not (or no relay), ""
 #                 if unread
@@ -163,6 +190,9 @@ fleet_verdict() {
   local has_events="" events_pin="" relay_match="" with_match=""
   local lane_pin_in_history="" events_pin_in_history=""
   local guard_pin_in_history="" reaper_pin_in_history=""
+  local lane_history_pin="" events_history_pin="" guard_history_pin="" reaper_history_pin=""
+  local wf_scanned="" wf_pin_in_history="" wf_history_pin="" wf_history_files=""
+  local wf_unread="" wf_refused=""
   local enabled="" armed="" app_id="" app_key=""
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
@@ -196,6 +226,16 @@ fleet_verdict() {
       events_pin_in_history) events_pin_in_history="$value" ;;
       guard_pin_in_history) guard_pin_in_history="$value" ;;
       reaper_pin_in_history) reaper_pin_in_history="$value" ;;
+      lane_history_pin) lane_history_pin="$value" ;;
+      events_history_pin) events_history_pin="$value" ;;
+      guard_history_pin) guard_history_pin="$value" ;;
+      reaper_history_pin) reaper_history_pin="$value" ;;
+      wf_scanned) wf_scanned="$value" ;;
+      wf_pin_in_history) wf_pin_in_history="$value" ;;
+      wf_history_pin) wf_history_pin="$value" ;;
+      wf_history_files) wf_history_files="$value" ;;
+      wf_unread) wf_unread="$value" ;;
+      wf_refused) wf_refused="$value" ;;
       relay_match) relay_match="$value" ;;
       with_match) with_match="$value" ;;
       enabled) enabled="$value" ;;
@@ -254,6 +294,9 @@ fleet_verdict() {
       # like a healthy quiet one.
       [ "$has_ci" = "0" ] && _fleet_say "fail:checks-repo-has-no-ci reclassify=dormant"
       [ "$has_ci" = "" ] && _fleet_say "warn:ci-unknown could-not-list-workflows"
+      # A checks repository can still call a fleet reusable workflow (#1716).
+      _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
+        "$wf_history_files" "$wf_unread" "$wf_refused"
       [ "$found" = "0" ] && echo "ok:compliant tier=checks"
       return 0
       ;;
@@ -368,6 +411,9 @@ fleet_verdict() {
   # "not armed" alongside "not onboarded" reads as two problems.
   if [ "$has_lane" != "1" ]; then
     _fleet_say "fail:no-merge-lane tier=$tier"
+    # No lane caller is no reason to skip the other workflows' pins (#1716).
+    _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
+      "$wf_history_files" "$wf_unread" "$wf_refused"
   else
     [ "$has_guard" != "1" ] && _fleet_say "warn:no-pr-guard"
     [ "$has_reaper" != "1" ] && _fleet_say "warn:no-branch-reaper"
@@ -414,22 +460,32 @@ fleet_verdict() {
     # above and has no provenance to judge. An unknown is a warning — the
     # collector says unknown both when the compare failed and when the fleet
     # repository itself was unreadable, and neither is evidence of an imposter.
-    local name pin present hist
+    #
+    # The verdict covers every non-comment pin in the caller (#1716), so the pin
+    # it names is `<caller>_history_pin` — the one that made it — not
+    # necessarily the first pin the stale rule above reads.
+    local name pin present hist named
     for name in lane events guard reaper; do
       case "$name" in
-        lane) pin="$lane_pin"; present="$has_lane"; hist="$lane_pin_in_history" ;;
-        events) pin="$events_pin"; present="$has_events"; hist="$events_pin_in_history" ;;
-        guard) pin="$guard_pin"; present="$has_guard"; hist="$guard_pin_in_history" ;;
-        reaper) pin="$reaper_pin"; present="$has_reaper"; hist="$reaper_pin_in_history" ;;
+        lane) pin="$lane_pin"; present="$has_lane"; hist="$lane_pin_in_history"; named="$lane_history_pin" ;;
+        events) pin="$events_pin"; present="$has_events"; hist="$events_pin_in_history"; named="$events_history_pin" ;;
+        guard) pin="$guard_pin"; present="$has_guard"; hist="$guard_pin_in_history"; named="$guard_history_pin" ;;
+        reaper) pin="$reaper_pin"; present="$has_reaper"; hist="$reaper_pin_in_history"; named="$reaper_history_pin" ;;
       esac
       [ "$present" != "1" ] && continue
       [ -z "$pin" ] && continue
+      named="${named:-$pin}"
       case "$hist" in
         1) : ;;
-        0) _fleet_say "fail:${name}-pin-not-in-fleet-history pin=${pin:0:8} not-reachable-from-the-fleet-default-branch" ;;
-        *) _fleet_say "warn:${name}-pin-history-unknown pin=${pin:0:8}" ;;
+        0) _fleet_say "fail:${name}-pin-not-in-fleet-history pin=${named:0:8} not-reachable-from-the-fleet-default-branch" ;;
+        *) _fleet_say "warn:${name}-pin-history-unknown pin=${named:0:8}" ;;
       esac
     done
+
+    # Every other workflow's fleet pins (#1716): any file may call a fleet
+    # reusable workflow, and the four callers above are only four files.
+    _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
+      "$wf_history_files" "$wf_unread" "$wf_refused"
 
     # --- the two-file lane (#1380, #1382) ------------------------------------
     #
