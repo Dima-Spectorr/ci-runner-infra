@@ -460,13 +460,42 @@ mutate "the bracket spellings of an input are missed" \
 mutate "a callee's matrix-built runs-on inputs are never read" \
   's@                    out("#RUNSONMATRIXINPUT", vid, in_name)@                    pass@'
 # #1718: the anchor's host passed whole is the pin, not a lane risk. Matched by
-# substring, `|| vars.POOL` beside it rides the exemption; without the owner
-# check, a non-owner's `runs-on` output does.
+# substring, `|| vars.POOL` beside it rides the exemption. The review round
+# made it trust provenance: each guard below, removed, lets a lane host through.
 mutate "the anchor-host exemption matches a substring" \
   's@WITH_ANCHOR_HOST_ONLY.fullmatch(w_value)@NEEDS_RUNS_ON.search(w_value)@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
-mutate "the anchor-host exemption skips the owner check" \
-  's@if \[ -n "$a_job" \] && owner_job "$file" "$records" "$a_job" </dev/null; then@if [ -n "$a_job" ]; then@'
+mutate "the anchor-host exemption takes any call target" \
+  's@printf .%s. "$a_target" | grep -cE -- "$FLEET_ANCHOR_CALL" >/dev/null \&\&@true \&\&@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the anchor-host exemption takes any owner" \
+  's@lane_owner_matches "${a_target%%/\*}"; then@true; then@'
+mutate "the anchor-host exemption ignores needs" \
+  's@or a_job not in \[str(n) for n in needs\]:@:@'
+mutate "the anchor-host exemption takes a lane repo-label" \
+  's@if a_value.lower().endswith(("-lane", "-util")):@if False:@'
+mutate "the anchor-host exemption takes a computed repo-label" \
+  's@ or not PLAIN_LABEL.fullmatch(a_value):@:@'
+mutate "the anchor-host exemption accepts a local services job" \
+  's@if not isinstance(anchor, dict) or not isinstance(anchor.get("uses"), str):@if not isinstance(anchor, dict):@'
+# The anchor's OWN pool inputs (#1718 re-review): a computed `repo-label` or
+# `hosted-runner` puts the anchor's job wherever it resolves. A label read from
+# a literal job output is a literal only under every guard below.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed anchor pool input is not a computed pool" \
+  's@grep -ciE -- "$ANCHOR_CALL_ANY" >/dev/null \&\&@false \&\&@'
+mutate "a literal job output may be a lane label" \
+  's@    if label.lower().endswith(("-lane", "-util")):@    if False:@'
+mutate "a literal job output need not be in needs" \
+  's@or src not in \[str(n) for n in needs\]:@:@'
+mutate "a computed job output reads as literal" \
+  's@    if not isinstance(label, str) or not PLAIN_LABEL.fullmatch(label):@    if not isinstance(label, str):@'
+mutate "a job output matched only by case reads as literal" \
+  's@if len(keys) != 1 or str(keys\[0\]) != name:@if len(keys) != 1:@'
+mutate "a literal job output is still recorded as computed" \
+  's@                if literal_output(job, w_value):@                if False:@'
+mutate "the anchor's literal-output repo-label proves nothing" \
+  's@            a_value = literal_output(anchor, a_value)@            pass@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -712,8 +741,12 @@ CASES="$(case_list | wc -l)"
 # (#1718, +3), 88 when the security review added five more (#1718: the
 # unreadable callee, the whole-value matrix exception, the escaped leg, the
 # bracket input spelling, the callee's matrix-built input). 90 with the
-# anchor-host exemption's two guards (#1718: whole match, owner check).
-FLOOR=90
+# anchor-host exemption's two guards (#1718: whole match, owner check). 95 when
+# the review made it trust provenance (#1718: target, owner, needs, lane and
+# computed repo-label, local services job; the owner case replaced). 102 when
+# the re-review found the anchor's own pool inputs unchecked (#1718: computed
+# anchor input, and the literal job output's five guards plus its anchor read).
+FLOOR=102
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -326,6 +326,13 @@ MERGE_LANE_CALL='^[^/]+/ci-runner-infra/\.github/workflows/merge-lane\.ya?ml@'"$
 # The fleet lane's owner, resolved once by main() (`resolve_lane_owner`); the
 # self-test sets its own. Empty means unknown, and unknown refuses.
 LANE_OWNER=""
+# The fleet's shared-infra anchor, matched the same way: its published host is
+# the one computed `with:` value a non-lane callee may take (#1718).
+FLEET_ANCHOR_CALL='^[^/]+/ci-runner-infra/\.github/workflows/shared-infra-anchor\.ya?ml@'"$LANE_REF_SHA"'$'
+# Any remote shared-infra anchor, by any owner, repository or ref: its
+# `repo-label` and `hosted-runner` inputs pick the pool its job runs in, so a
+# computed one is a computed pool (#1718 review). Matched case-insensitively.
+ANCHOR_CALL_ANY='^[^./][^/]*/[^/]+/\.github/workflows/shared-infra-anchor\.ya?ml@'
 # Any merge-lane call, local included: arms RUNNER19 (never on `-util`, never
 # a computed runs-on). A local lane may still carry the merge App key.
 MERGE_LANE_CALL_ANY='^([^/]+/ci-runner-infra/|\./)\.github/workflows/merge-lane\.ya?ml(@.*)?$'
@@ -419,11 +426,13 @@ ensure_yaml() {
 #                                    `${{ matrix.<key> }}` over a literal matrix
 #                                    the reader resolved; a non-lane
 #                                    callee's pool input is both hosts (#1718)
-#   #WITHANCHORHOST	<id>	<name>	<job>  beside `#WITHCOMPUTED`: every computed
-#                                    value of the input is, WHOLE, one
-#                                    `${{ needs.<job>.outputs.runs-on }}`; the
-#                                    shell exempts it when <job> is the caller's
-#                                    shared-infra owner (#1718)
+#   #WITHANCHORHOST	<id>	<name>	<job>	<target>  beside `#WITHCOMPUTED`:
+#                                    every computed value of the input is,
+#                                    WHOLE, one `${{ needs.<job>.outputs.runs-on }}`,
+#                                    <job> is in `needs:` and calls <target> with
+#                                    a literal non-lane, non-util `repo-label`
+#                                    (and `hosted-runner`); the shell exempts it
+#                                    when <target> is the fleet anchor (#1718)
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -869,6 +878,90 @@ jobs = doc.get("jobs")
 if not isinstance(jobs, dict):
     sys.exit(0)
 
+
+# The `uses:` target of the anchor a `with:` value names, when that host is
+# provably not a co-tenanted one (#1718 review). Shape alone proves nothing: a
+# job that declares `services:` and echoes `runs-on=["X-lane"]` passes the
+# shape. So the named job must be (1) in this job's `needs:`, (2) a call to a
+# reusable workflow (the shell checks it is the FLEET's shared-infra anchor,
+# by owner and 40-hex SHA), and (3) handed only literal, plain pool labels
+# that end in neither `-lane` nor `-util` on the two inputs the anchor's
+# `runs-on` reads: `repo-label`, and `hosted-runner` for a fork. The fleet
+# anchor's job runs in that pool, so the host it publishes is in that pool;
+# what its own steps could write is RUNNER9's trust in the anchor, not this
+# rule's. A label read from another job's output counts as literal only as
+# `literal_output` proves it. Anything else: None, and the value stays
+# computed (fail-closed).
+ANCHOR_POOL_INPUTS = ("repo-label", "hosted-runner")
+PLAIN_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+NEEDS_OUTPUT_ONLY = re.compile(r"\$\{\{\s*needs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}")
+
+
+# The label a `${{ needs.<job>.outputs.<name> }}` value always resolves to,
+# when <job> is in this job's `needs:` and declares <name> as a plain literal
+# in its `outputs:` map that ends in neither `-lane` nor `-util` — IntegrateIT's
+# `lane.outputs.pool_label: IntegrateIT-shared`. A literal output is fixed in
+# the workflow file: no step writes it. Anything else, a name that matches
+# only by case included: None, and the value stays computed (#1718 review).
+def literal_output(job, value):
+    if not isinstance(value, str):
+        return None
+    m = NEEDS_OUTPUT_ONLY.fullmatch(value.strip())
+    if not m:
+        return None
+    src, name = m.groups()
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    if not isinstance(needs, list) or src not in [str(n) for n in needs]:
+        return None
+    src_job = jobs.get(src)
+    outputs = src_job.get("outputs") if isinstance(src_job, dict) else None
+    if not isinstance(outputs, dict):
+        return None
+    keys = [k for k in outputs if str(k).lower() == name.lower()]
+    if len(keys) != 1 or str(keys[0]) != name:
+        return None
+    label = outputs[keys[0]]
+    if not isinstance(label, str) or not PLAIN_LABEL.fullmatch(label):
+        return None
+    if label.lower().endswith(("-lane", "-util")):
+        return None
+    return label
+
+
+def anchor_call_target(job, a_job):
+    if not a_job:
+        return None
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    if not isinstance(needs, list) or a_job not in [str(n) for n in needs]:
+        return None
+    anchor = jobs.get(a_job)
+    if not isinstance(anchor, dict) or not isinstance(anchor.get("uses"), str):
+        return None
+    a_with = anchor.get("with")
+    if a_with is None:
+        a_with = {}
+    if not isinstance(a_with, dict):
+        return None
+    seen = {}
+    for a_key, a_value in a_with.items():
+        a_name = str(a_key).lower()
+        if a_name not in ANCHOR_POOL_INPUTS:
+            continue
+        if isinstance(a_value, str) and NEEDS_OUTPUT_ONLY.fullmatch(a_value.strip()):
+            a_value = literal_output(anchor, a_value)
+        if a_name in seen or not isinstance(a_value, str) or not PLAIN_LABEL.fullmatch(a_value):
+            return None
+        if a_value.lower().endswith(("-lane", "-util")):
+            return None
+        seen[a_name] = a_value
+    if "repo-label" not in seen:
+        return None
+    return anchor["uses"].strip()
+
 for job_id, job in jobs.items():
     job_id = str(job_id)
     if not isinstance(job, dict):
@@ -1130,6 +1223,8 @@ for job_id, job in jobs.items():
                     continue
                 if not w_matrix_dyn and isinstance(w_value, str) and MATRIX_ONLY_EXPR.fullmatch(w_value.strip()):
                     continue
+                if literal_output(job, w_value):
+                    continue
                 w_text = w_value if isinstance(w_value, str) else json.dumps(w_value, ensure_ascii=False)
                 if "${{" in w_text or "\\" in w_text:
                     w_name = str(w_key).lower()
@@ -1142,8 +1237,9 @@ for job_id, job in jobs.items():
                     w_anchor[w_name] = a_job
             for w_name in w_names:
                 out("#WITHCOMPUTED", vid, w_name)
-                if w_anchor.get(w_name):
-                    out("#WITHANCHORHOST", vid, w_name, w_anchor[w_name])
+                a_target = anchor_call_target(job, w_anchor.get(w_name))
+                if a_target:
+                    out("#WITHANCHORHOST", vid, w_name, w_anchor[w_name], a_target)
 
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
@@ -1769,17 +1865,20 @@ EOF
       computed_inputs="$(printf '%s\n' "$records" | sed -n "s/^#WITHCOMPUTED\t${job_re}\t//p")"
       # One computed value is not a pool: the anchor's own published host,
       # passed WHOLE (`${{ needs.<anchor>.outputs.runs-on }}`), to a callee
-      # that routes on it. That is RUNNER9's pin — the shape every consumer of
-      # the shared-infra anchor takes — and the anchor is the job
-      # `caller_passes_anchor` accepts: an owner of the caller's stack. With
-      # --shared-infra off there is no anchor, and no exemption. A fallback,
-      # another output, or a job that only publishes a pool stays computed.
+      # that routes on it — RUNNER9's pin, the shape SOAP-To-REST and
+      # Specaria-Platform take. Exempt only when the reader proved the anchor
+      # is in this job's `needs:` and was handed a literal non-lane, non-util
+      # pool, AND the call is the FLEET's shared-infra anchor: the lane's
+      # owner, a 40-hex SHA. A job that merely declares `services:` is not
+      # enough (#1718 review): its steps can publish any label, `-lane`
+      # included. With --shared-infra off there is no anchor, and no exemption.
       if [ "$SHARED_INFRA" -eq 1 ] && [ -n "$computed_inputs" ]; then
-        local a_job kept=""
+        local a_target kept=""
         while IFS= read -r c_name; do
           [ -n "$c_name" ] || continue
-          a_job="$(printf '%s\n' "$records" | sed -n "s/^#WITHANCHORHOST\t${job_re}\t$(re_quote "$c_name")\t//p")"
-          if [ -n "$a_job" ] && owner_job "$file" "$records" "$a_job" </dev/null; then
+          a_target="$(printf '%s\n' "$records" | sed -n "s/^#WITHANCHORHOST\t${job_re}\t$(re_quote "$c_name")\t[^\t]*\t//p" | head -1)"
+          if [ -n "$a_target" ] && printf '%s' "$a_target" | grep -cE -- "$FLEET_ANCHOR_CALL" >/dev/null &&
+             lane_owner_matches "${a_target%%/*}"; then
             continue
           fi
           kept="${kept}${c_name}"$'\n'
@@ -1790,6 +1889,12 @@ EOF
       fi
       if [ -n "$computed_inputs" ]; then
         if [ "$(printf '%s\n' "$computed_inputs" | grep -cxF -- "runs-on")" -gt 0 ]; then
+          computed_pool=1
+        fi
+        # The anchor's job lands where these two say; one computed hands it,
+        # and the PR code its stack runs, to whatever the value resolves to.
+        if printf '%s' "$call_target" | grep -ciE -- "$ANCHOR_CALL_ANY" >/dev/null &&
+           [ "$(printf '%s\n' "$computed_inputs" | grep -cxE -- 'repo-label|hosted-runner')" -gt 0 ]; then
           computed_pool=1
         fi
         case "$call_target" in
@@ -4916,24 +5021,58 @@ jobs:
   expect_si_callee() {
     local name="$1" want="$2" callee_body="$3"
     local with_value="${4:-\${{ needs.anchor.outputs.runs-on \}\}}"
-    local got out_text wf="$tmp/.github/workflows"
+    local got out_text wf="$tmp/.github/workflows" anchor_block
+    # The anchor as SOAP-To-REST and Specaria-Platform write it: the fleet's
+    # anchor, by owner and SHA, handed a literal pool (#1718). SI_ANCHOR
+    # replaces the call target and inputs; SI_ANCHOR=local is a job of the
+    # caller's own that declares `services:` and publishes whatever it likes.
+    # SI_NEEDS is the consumer's `needs:`, SI_SHARED the --shared-infra flag.
+    case "${SI_ANCHOR:-}" in
+      local)
+        anchor_block="$(printf '%s\n' '  anchor:' \
+          '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
+          '    outputs:' '      runs-on: ${{ steps.pin.outputs.runs-on }}' \
+          '    services:' '      db: {image: "postgres:16"}' '    steps: [{id: pin, run: "true"}]')" ;;
+      '')
+        anchor_block="$(printf '%s\n' \
+          '  # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/shared-infra-anchor.yml, #1718): the fleet anchor' \
+          '  # shared-infra-owner(anchor): pins the run host' '  anchor:' \
+          '    uses: Example-Owner/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@0123456789abcdef0123456789abcdef01234567' \
+          '    with:' '      repo-label: ExampleRepo-shared')" ;;
+      *)
+        # Declared like the default, so RUNNER7 stays quiet and the case
+        # isolates the lane verdict.
+        local si_callee
+        si_callee="$(printf '%s\n' "$SI_ANCHOR" | sed -n 's/^ *uses: *\([^@]*\)@.*/\1/p' | head -1)"
+        anchor_block="$(printf '%s\n' \
+          "  # remote-reusable-allowed($si_callee, #1718): the fleet anchor" \
+          '  # shared-infra-owner(anchor): pins the run host' '  anchor:' "$SI_ANCHOR")" ;;
+    esac
     mkdir -p "$wf"
-    printf '%s\n' 'on: [pull_request]' 'jobs:' '  anchor:' \
-      '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
-      '    outputs:' '      runs-on: ${{ steps.pin.outputs.runs-on }}' \
-      '    services:' '      db: {image: "postgres:16"}' '    steps: [{id: pin, run: "true"}]' \
+    printf '%s\n' 'on: [pull_request]' 'jobs:' "$anchor_block" \
       '  setup:' '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
-      '    outputs:' '      pool: ${{ steps.p.outputs.pool }}' '    steps: [{id: p, run: "true"}]' \
-      '  scan:' '    needs: [anchor, setup]' '    uses: ./.github/workflows/callee.yml' \
+      '    outputs:' '      pool: ${{ steps.p.outputs.pool }}' '      label: ExampleRepo-shared' '      lanelabel: ExampleRepo-lane' '    steps: [{id: p, run: "true"}]' \
+      '  scan:' "    needs: [${SI_NEEDS:-anchor, setup}]" '    uses: ./.github/workflows/callee.yml' \
       '    with:' "      runner: $with_value" > "$wf/caller.yml"
     printf '%s\n' "$callee_body" > "$wf/callee.yml"
-    out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA=1; SHARED_INFRA_OWNERS=""
+    out_text="$(fail=0; ALLOW_DYNAMIC=1; SHARED_INFRA="${SI_SHARED:-1}"; SHARED_INFRA_OWNERS=""
       compute_reachable "$wf/caller.yml" "$wf/callee.yml" >/dev/null
       check_file "$wf/caller.yml" "" blocked
       check_file "$wf/callee.yml" "" blocked
       shared_infra_owner_verdict 2>&1)"
     got="$(printf '%s\n' "$out_text" | sed -n 's/.*::error::\[\([A-Z0-9]*\)\].*/\1/p' | sort -u | tr '\n' ' ')"
     got="$(printf '%s' "$got" | sed 's/ *$//')"
+    # SI_SCAN_LANE=1: the consumer itself must be the job flagged, not only
+    # an anchor that was handed a lane label of its own.
+    if [ -n "${SI_SCAN_LANE:-}" ] &&
+       ! printf '%s\n' "$out_text" | grep -q "\[RUNNER18\][^']*job 'scan'"; then
+      got="$got (scan not flagged)"
+    fi
+    # SI_ANCHOR_LANE=1: the anchor job itself must be flagged as well.
+    if [ -n "${SI_ANCHOR_LANE:-}" ] &&
+       ! printf '%s\n' "$out_text" | grep -q "\[RUNNER18\][^']*job 'anchor'"; then
+      got="$got (anchor not flagged)"
+    fi
     rm -rf "$wf"
     if [ "$got" != "$want" ]; then
       echo "FAIL $name: want ids [$want], got [$got]"
@@ -5380,6 +5519,64 @@ jobs:
     "$required_callee" '${{ needs.anchor.outputs.other }}'
   expect_si_callee "a non-owner's runs-on output is still a lane risk" "RUNNER18 RUNNER20 RUNNER9" \
     "$required_callee" '${{ needs.setup.outputs.runs-on }}'
+
+  # #1718 review: the exemption trusts where the host COMES FROM, not the
+  # shape of the reference. A job of the caller's own with `services:` can
+  # publish `["X-lane"]` from a step; the fleet anchor handed a lane, util or
+  # computed pool, pinned by tag, owned by someone else, missing from
+  # `needs:`, or with --shared-infra off, proves nothing either.
+  local fleet_anchor_uses='    uses: Example-Owner/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@0123456789abcdef0123456789abcdef01234567'
+  SI_SCAN_LANE=1 SI_ANCHOR=local expect_si_callee "a local services anchor's host is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ExampleRepo-lane')" \
+    expect_si_callee "the fleet anchor handed a lane pool is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      REPO-LABEL: ExampleRepo-Util')" \
+    expect_si_callee "the fleet anchor handed a util pool is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ${{ vars.POOL }}')" \
+    expect_si_callee "the fleet anchor handed a computed pool is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ExampleRepo-shared' '      hosted-runner: ExampleRepo-lane')" \
+    expect_si_callee "the fleet anchor handed a lane hosted-runner is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' '    uses: Example-Owner/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@v5' '    with:' '      repo-label: ExampleRepo-shared')" \
+    expect_si_callee "the fleet anchor pinned by tag is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' '    uses: Other-Owner/ci-runner-infra/.github/workflows/shared-infra-anchor.yml@0123456789abcdef0123456789abcdef01234567' '    with:' '      repo-label: ExampleRepo-shared')" \
+    expect_si_callee "an anchor under another owner is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_NEEDS="setup" expect_si_callee "an anchor missing from needs is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_SCAN_LANE=1 SI_SHARED=0 expect_si_callee "with --shared-infra off the anchor host is a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+
+  # #1718 re-review: the anchor's OWN pool inputs. Computed, they hand the
+  # anchor's job, and the pull request's code its stack runs, to whatever they
+  # resolve to: `-lane` included. A label read from a literal job output in
+  # `needs:` (IntegrateIT's `lane.outputs.pool_label`) is a literal.
+  local fleet_anchor_needs='    needs: [setup]'
+  SI_SCAN_LANE=1 SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ${{ vars.POOL }}')" \
+    expect_si_callee "the fleet anchor handed a computed pool is itself a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      REPO-LABEL: ${{ vars.POOL }}')" \
+    expect_si_callee "a computed REPO-LABEL is a lane risk in any case" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_needs" "$fleet_anchor_uses" '    with:' '      repo-label: ExampleRepo-shared' '      hosted-runner: ${{ needs.setup.outputs.pool }}')" \
+    expect_si_callee "the fleet anchor handed a computed hosted-runner is a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_needs" "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.label }}')" \
+    expect_si_callee "a pool read from a literal job output is a literal pool" "" \
+    "$required_callee"
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_needs" "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.lanelabel }}')" \
+    expect_si_callee "a literal lane output is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.label }}')" \
+    expect_si_callee "a literal output of a job not in needs is computed" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_needs" "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.LABEL }}')" \
+    expect_si_callee "an output matched only by case is computed" "RUNNER18 RUNNER20" \
+    "$required_callee"
 
   rm -rf "$tmp"
   return "$status"
