@@ -424,6 +424,13 @@ mutate "RUNNER20 judged on the -util host instead" \
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "RUNNER20 never crosses a local call" \
   's@REACHABLE_NONLANE="$nl_seed"@REACHABLE_NONLANE=""@'
+# #1714: a reusable's `with: runs-on: ${{ matrix.x }}` names its slot in the
+# matrix. Never reading the matrix lets a -lane leg past RUNNER18; never
+# counting a computed matrix lets any leg past it.
+mutate "a matrix-fed with: runs-on is never resolved" \
+  's@if w_matrix_refs:@if False:@'
+mutate "a computed matrix behind with: runs-on is trusted" \
+  's@if w_matrix_dyn and any@if False and any@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -663,8 +670,9 @@ CASES="$(case_list | wc -l)"
 # yields, with the three host-label cases (#1703) — it had drifted ten below.
 # 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
 # its two suffixes (+2) in place of the "asked of -lane too" case (-1). 77 when
-# RUNNER20 became an allowlist (+1, the denylist case).
-FLOOR=77
+# RUNNER20 became an allowlist (+1, the denylist case). 79 with the matrix-fed
+# `with: runs-on:` cases (#1714, +2).
+FLOOR=79
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

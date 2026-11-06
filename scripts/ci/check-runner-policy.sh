@@ -400,9 +400,13 @@ ensure_yaml() {
 #   #CONTAINER\t<id>                 the job declares `container:`
 #   #SERVICES\t<id>                  the job declares `services:`
 #   #WITHRUNSON\t<id>\t<label>        one slot-shaped label a `uses:` job passes
-#                                    in any `with:` value, literal or expression
+#                                    in any `with:` value, literal or expression,
+#                                    or in the job's matrix when a value reads
+#                                    `matrix.*` (#1714)
 #   #WITHDYNSLOT	<id>	<util|lane>   a `with:` expression that builds a slot
-#                                    (`${{ x }}-util`, `format('{0}-lane', …)`)
+#                                    (`${{ x }}-util`, `format('{0}-lane', …)`),
+#                                    or a `with: runs-on:` read from a computed
+#                                    matrix (both kinds: undecidable)
 #   #WITHEXPR	<id>                  the `with: runs-on:` value is computed
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
@@ -525,6 +529,8 @@ SLOT_TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_.][A-Za-z0-9_.-]*-(?:[Uu
 # carries an expression: `${{ github.event.repository.name }}-util` and
 # `format('{0}-util', …)` build a slot SLOT_TOKEN cannot see whole.
 DYN_SLOT = re.compile(r"-([Uu][Tt][Ii][Ll]|[Ll][Aa][Nn][Ee])(?![A-Za-z0-9_.-])")
+# A `matrix.<key>` reference in a `with:` value of a `uses:` job (#1714).
+MATRIX_REF = re.compile(r"(?<![A-Za-z0-9_.-])matrix\.")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -991,6 +997,32 @@ for job_id, job in jobs.items():
                     for m in SLOT_TOKEN.finditer(w_text):
                         if m.group(0) not in w_seen:
                             w_seen.append(m.group(0))
+            # A value that reads `matrix.*` names no slot of its own: the slot
+            # is in the job's `strategy.matrix`, one leg per entry. Read every
+            # slot-shaped string anywhere in the matrix (`include:`/`exclude:`
+            # too) — a superset, fail-closed — so `with: runs-on: ${{
+            # matrix.pool }}` over `pool: [X-lane]` is the lane host (#1714).
+            # A matrix the gate cannot read (computed: `${{ fromJSON(…) }}`, or
+            # a value inside it that is an expression) could hold either
+            # suffix, so a `runs-on` input reading it is both hosts.
+            w_matrix_refs = [
+                (str(w_key).lower(), w_value)
+                for w_key, w_value in with_block.items()
+                if "${{" in (w_value if isinstance(w_value, str) else json.dumps(w_value))
+                and MATRIX_REF.search(w_value if isinstance(w_value, str) else json.dumps(w_value))
+            ]
+            w_matrix_dyn = False
+            if w_matrix_refs:
+                w_matrix = (job.get("strategy") or {}).get("matrix")
+                if isinstance(w_matrix, dict):
+                    for w_text in w_strings(w_matrix):
+                        if "${{" in w_text:
+                            w_matrix_dyn = True
+                        for m in SLOT_TOKEN.finditer(w_text):
+                            if m.group(0) not in w_seen:
+                                w_seen.append(m.group(0))
+                else:
+                    w_matrix_dyn = True
             for w_label in w_seen:
                 out("#WITHRUNSON", vid, w_label)
             # A slot BUILT at run time has no whole token to read. Any value
@@ -1005,6 +1037,10 @@ for job_id, job in jobs.items():
                         kind = m.group(1).lower()
                         if kind not in w_dyn:
                             w_dyn.append(kind)
+            if w_matrix_dyn and any(w_key == "runs-on" for w_key, _ in w_matrix_refs):
+                for kind in ("util", "lane"):
+                    if kind not in w_dyn:
+                        w_dyn.append(kind)
             for kind in w_dyn:
                 out("#WITHDYNSLOT", vid, kind)
             # The input name without regard to case: `RUNS-ON:` must not be a
@@ -2996,6 +3032,65 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       runs-on: ExampleRepo-lane'
+
+  # …and through a matrix (#1714): `${{ matrix.pool }}` names no slot, the
+  # matrix does. Every slot-shaped string in it counts, `include:` too.
+  expect "a with: runs-on read from a matrix leg on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo, ExampleRepo-lane]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  expect "a matrix include: leg on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        include:
+          - pool: ExampleRepo-lane
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  # A matrix the gate cannot read could hold either suffix, so it is read as
+  # both: RUNNER18 fires because this is not the lane call. Forks allowed, so
+  # RUNNER17 is the proof the util/lane host was counted at all.
+  expect "a with: runs-on read from a computed matrix is both hosts" "RUNNER17 RUNNER18" "ExampleRepo" allowed \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix: ${{ fromJSON(vars.POOLS) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  expect "a matrix of pool labels only stays clean" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  expect "a non-runs-on input over a computed matrix stays clean" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix: ${{ fromJSON(vars.SUITES) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      suite: ${{ matrix.suite }}'
 
   # A file NAMED merge-lane.yml in some other repository is not the fleet's.
   # The fleet owner and a full SHA, so the repository name is the only thing
