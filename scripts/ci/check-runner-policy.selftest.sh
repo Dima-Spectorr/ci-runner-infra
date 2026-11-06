@@ -496,6 +496,13 @@ mutate "a literal job output is still recorded as computed" \
   's@                if literal_output(job, w_value):@                if False:@'
 mutate "the anchor's literal-output repo-label proves nothing" \
   's@            a_value = literal_output(anchor, a_value)@            pass@'
+# #1718 re-review: a callee reading `inputs` by no fixed name routes on any.
+mutate "a callee reading inputs by no fixed name routes on none" \
+  's@    return any(not FIXED_INPUT.match(text, m.end()) for m in ANY_INPUTS.finditer(text))@    return False@'
+mutate "the caller ignores a callee that reads inputs by no fixed name" \
+  's@if \[ -n "$computed_inputs" \] \&\&@if false \&\&@'
+mutate "whitespace before an input reference hides its name" \
+  's@inputs[\\]s[*](?:[\\][.][\\]s[*]|@inputs(?:[.]|@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -746,7 +753,9 @@ CASES="$(case_list | wc -l)"
 # computed repo-label, local services job; the owner case replaced). 102 when
 # the re-review found the anchor's own pool inputs unchecked (#1718: computed
 # anchor input, and the literal job output's five guards plus its anchor read).
-FLOOR=102
+# 105 when the second re-review found `inputs` read by no fixed name (#1718:
+# the record, the caller's read of it, whitespace in a named reference).
+FLOOR=105
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

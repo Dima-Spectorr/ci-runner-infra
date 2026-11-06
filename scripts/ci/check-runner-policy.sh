@@ -400,7 +400,12 @@ ensure_yaml() {
 #   #RUNSONMATRIXINPUT\t<id>\t<name> runs-on reads the job's own matrix, and
 #                                    that matrix reads `inputs.<name>` — the
 #                                    callee side of a computed pool (#1718)
-#   #JOB\t<id>                       a job exists (or one resolved matrix leg,
+#   #RUNSONANYINPUT\t<id>            runs-on, or the matrix it reads, reads
+#                                    `inputs` by no fixed name
+#                                    (`fromJSON(toJSON(inputs)).x`,
+#                                    `inputs[format(…)]`): it may route on ANY
+#                                    input (#1718 re-review)
+#   #JOB\t<id>                      a job exists (or one resolved matrix leg,
 #                                    as `<job>~leg<n>` — see the matrix note above)
 #   #REUSABLE\t<id>                  the job is a `uses:` call (takes no timeout)
 #   #TIMEOUT\t<id>\t<value>          the JOB's timeout-minutes, never a step's
@@ -531,8 +536,22 @@ NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
 # a pull-request workflow in its own right.
 # Every spelling an expression reads one by: `inputs.x`, `inputs['x']`,
 # `inputs["x"]`, in any case (expressions are case-insensitive) — the bracket
-# forms were a way for a callee to route on an input unseen (#1718).
-INPUTS_REF = re.compile(r"(?i)inputs(?:\.|\[\s*['\"])([A-Za-z0-9_-]+)")
+# forms were a way for a callee to route on an input unseen (#1718), and so
+# was whitespace around the dot or bracket (`inputs [ 'x' ]`, re-review).
+INPUTS_REF = re.compile(r"(?i)inputs\s*(?:\.\s*|\[\s*['\"])([A-Za-z0-9_-]+)")
+
+# `inputs` read by no fixed name: `fromJSON(toJSON(inputs)).pool`,
+# `inputs[format('{0}', 'pool')]`, `toJSON(inputs)`. INPUTS_REF sees no name in
+# any of them, so a callee routing that way looked as if it routed on nothing
+# and a caller's computed value passed (#1718 re-review). Every `inputs`
+# identifier must be followed by `.name` or `['name']`; anything else may read
+# any input.
+ANY_INPUTS = re.compile(r"(?i)(?<![A-Za-z0-9_.-])inputs(?![A-Za-z0-9_-])")
+FIXED_INPUT = re.compile(r"\s*(?:\.\s*[A-Za-z0-9_-]+|\[\s*'[A-Za-z0-9_-]+'\s*\])")
+
+
+def reads_inputs_unnamed(text):
+    return any(not FIXED_INPUT.match(text, m.end()) for m in ANY_INPUTS.finditer(text))
 
 # The literals in a `runs-on` expression that can actually BECOME the runner:
 # the operands of a short-circuit. GitHub Actions quotes strings with single
@@ -1278,6 +1297,8 @@ for job_id, job in jobs.items():
                 out("#RUNSONANCHORHOST", vid, host_anchor.group(1))
             for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(text)):
                 out("#RUNSONINPUT", vid, in_name)
+            if reads_inputs_unnamed(text):
+                out("#RUNSONANYINPUT", vid)
             # A `runs-on` read from the job's own matrix routes on whatever
             # `inputs.*` that matrix is built from (`p: ['${{ inputs.pool }}']`
             # with `runs-on: ${{ matrix.p }}`). A record of its own, so the
@@ -1288,6 +1309,8 @@ for job_id, job in jobs.items():
                 m_text = json.dumps(strategy, ensure_ascii=False) if strategy is not None else ""
                 for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(m_text)):
                     out("#RUNSONMATRIXINPUT", vid, in_name)
+                if reads_inputs_unnamed(m_text):
+                    out("#RUNSONANYINPUT", vid)
             # Hoisted out of the loop above. The literals belong to the
             # EXPRESSION, not to each reference inside it, and scanning per
             # reference emitted the same literal once per
@@ -1909,6 +1932,12 @@ EOF
             callee_records=""
             [ -f "$callee_path" ] && callee_records="$(read_workflow "$callee_path")"
             if [ -z "$callee_records" ] || [ "$(printf '%s\n' "$callee_records" | grep -c '^#ERR	')" -gt 0 ]; then
+              computed_pool=1
+            fi
+            # A callee that reads `inputs` by no fixed name may route on any
+            # of them, so every computed one is a pool.
+            if [ -n "$computed_inputs" ] &&
+               [ "$(printf '%s\n' "$callee_records" | grep -c '^#RUNSONANYINPUT	')" -gt 0 ]; then
               computed_pool=1
             fi
             if [ "$computed_pool" -eq 0 ]; then
@@ -4501,6 +4530,38 @@ jobs:
     runs-on: ${{ matrix.p }}
     timeout-minutes: 5
     steps: [{run: "true"}]'
+
+  # #1718 re-review: `inputs` read by NO fixed name may read any input, so
+  # every computed one is a pool — through `toJSON(inputs)`, a computed index,
+  # whitespace around the bracket, or a matrix built either way.
+  local any_caller='on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      pool: ${{ vars.P }}'
+  local any_head='on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+jobs:
+  build:'
+  local any_tail='    timeout-minutes: 5
+    steps: [{run: "true"}]'
+  expect_pair "a callee routing on fromJSON(toJSON(inputs)) makes it both hosts" "RUNNER17 RUNNER18" \
+    "$any_caller" "$(printf '%s\n' "$any_head" '    # dynamic-runner-allowed(build, #1718): the caller scopes the pool' \
+      '    runs-on: ${{ fromJSON(toJSON(inputs)).pool }}' "$any_tail")"
+  expect_pair "a callee routing on a computed inputs index makes it both hosts" "RUNNER17 RUNNER18" \
+    "$any_caller" "$(printf '%s\n' "$any_head" '    # dynamic-runner-allowed(build, #1718): the caller scopes the pool' \
+      "    runs-on: \${{ inputs[format('{0}{1}', 'po', 'ol')] }}" "$any_tail")"
+  expect_pair "a callee routing on inputs [ pool ] with spaces makes it both hosts" "RUNNER17 RUNNER18" \
+    "$any_caller" "$(printf '%s\n' "$any_head" '    # dynamic-runner-allowed(build, #1718): the caller scopes the pool' \
+      "    runs-on: \${{ inputs [ 'pool' ] }}" "$any_tail")"
+  expect_pair "a callee routing on a matrix built from toJSON(inputs) makes it both hosts" "RUNNER17 RUNNER18" \
+    "$any_caller" "$(printf '%s\n' "$any_head" '    strategy:' '      matrix:' \
+      "        p: ['\${{ fromJSON(toJSON(inputs)).pool }}']" \
+      '    # dynamic-runner-allowed(build, #1718): the caller scopes the pool' \
+      '    runs-on: ${{ matrix.p }}' "$any_tail")"
 
   # --- the lane owner's resolution (#1712) ------------------------------------
   # The flag wins, even empty (an explicit empty refuses, never falls back);
