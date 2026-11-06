@@ -435,16 +435,30 @@ mutate "a matrix read in another case is missed" \
   's@r"(?i)(?<!@r"(?<!@'
 # #1718: a computed pool handed to a callee that is not the merge lane is both
 # hosts. Never counting it lets `${{ vars.POOL }}` past RUNNER18; never reading
-# the local callee lets a renamed `pool:` input past it; calling a bare matrix
-# leg computed undoes #1714 for every literal matrix.
+# the local callee lets a renamed `pool:` input past it (as does trusting an
+# unreadable callee, a bracket `inputs['pool']`, or a callee matrix built from
+# the input); calling a bare matrix leg computed undoes #1714 for every literal
+# matrix, while letting literal text beside it pass builds `X-la` + `ne`; an
+# escaped matrix leg decodes to a slot the reader never saw.
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "a computed pool to a non-lane callee is trusted" \
   's@      if \[ "$computed_pool" -eq 1 \]; then@      if false; then@'
 # shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "a local callee's runs-on inputs are never read" \
-  's@if \[ "$computed_pool" -eq 0 \] && \[ -f "$callee_path" \]; then@if false; then@'
+  's@if \[ "$computed_pool" -eq 0 \]; then@if false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "an unreadable local callee routes on nothing" \
+  's@if \[ -z "$callee_records" \] || @if false \&\& @'
 mutate "a bare matrix leg is called computed" \
-  's@                    w_text = MATRIX_ONLY_EXPR.sub("", w_text)@                    pass@'
+  's@if not w_matrix_dyn and isinstance(w_value, str) and MATRIX_ONLY_EXPR.fullmatch(w_value.strip()):@if False:@'
+mutate "a matrix reference with literal text beside it is a bare leg" \
+  's@MATRIX_ONLY_EXPR.fullmatch(w_value.strip())@MATRIX_ONLY_EXPR.search(w_value)@'
+mutate "an escaped matrix leg is trusted" \
+  's@^                        if "\\\\" in w_text:$@                        if False:@'
+mutate "the bracket spellings of an input are missed" \
+  's@r"(?i)inputs(?:\\.|@r"(?i)inputs(?:\\.|NEVER@'
+mutate "a callee's matrix-built runs-on inputs are never read" \
+  's@                    out("#RUNSONMATRIXINPUT", vid, in_name)@                    pass@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -687,8 +701,10 @@ CASES="$(case_list | wc -l)"
 # RUNNER20 became an allowlist (+1, the denylist case). 79 with the matrix-fed
 # `with: runs-on:` cases (#1714, +3) — the list held 80 then, one above the 79
 # this line used to say. 83 with the computed-pool cases for a non-lane callee
-# (#1718, +3).
-FLOOR=83
+# (#1718, +3), 88 when the security review added five more (#1718: the
+# unreadable callee, the whole-value matrix exception, the escaped leg, the
+# bracket input spelling, the callee's matrix-built input).
+FLOOR=88
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

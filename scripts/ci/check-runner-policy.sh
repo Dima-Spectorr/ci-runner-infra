@@ -388,7 +388,11 @@ ensure_yaml() {
 #   #NONLANETRIG\t<name>             a trigger outside workflow_run, schedule,
 #                                    workflow_dispatch and workflow_call (RUNNER20)
 #   #CALLINPUTREQ\t<name>            a `workflow_call` input declared REQUIRED
-#   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>`
+#   #RUNSONINPUT\t<id>\t<name>       runs-on reads `inputs.<name>` (or
+#                                    `inputs['<name>']`, `inputs["<name>"]`)
+#   #RUNSONMATRIXINPUT\t<id>\t<name> runs-on reads the job's own matrix, and
+#                                    that matrix reads `inputs.<name>` — the
+#                                    callee side of a computed pool (#1718)
 #   #JOB\t<id>                       a job exists (or one resolved matrix leg,
 #                                    as `<job>~leg<n>` — see the matrix note above)
 #   #REUSABLE\t<id>                  the job is a `uses:` call (takes no timeout)
@@ -410,9 +414,10 @@ ensure_yaml() {
 #   #WITHEXPR	<id>                  the `with: runs-on:` value is computed
 #   #WITHCOMPUTED	<id>	<name>        a `with:` input (name lower-cased) whose
 #                                    value is computed — an expression or a
-#                                    backslash escape, anywhere in it — other
-#                                    than a bare `${{ matrix.<key> }}` over a
-#                                    matrix the reader resolved; a non-lane
+#                                    backslash escape, anywhere in it — unless
+#                                    the whole value is a bare
+#                                    `${{ matrix.<key> }}` over a literal matrix
+#                                    the reader resolved; a non-lane
 #                                    callee's pool input is both hosts (#1718)
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
@@ -510,7 +515,10 @@ NEEDS_OUTPUT = re.compile(r"needs\.([A-Za-z0-9_-]+)\.outputs\.")
 # only be handed the anchor's pool array as an input. Whether that counts as a
 # pin is decided in RUNNER9 — it takes a required input and a file that is not
 # a pull-request workflow in its own right.
-INPUTS_REF = re.compile(r"inputs\.([A-Za-z0-9_-]+)")
+# Every spelling an expression reads one by: `inputs.x`, `inputs['x']`,
+# `inputs["x"]`, in any case (expressions are case-insensitive) — the bracket
+# forms were a way for a callee to route on an input unseen (#1718).
+INPUTS_REF = re.compile(r"(?i)inputs(?:\.|\[\s*['\"])([A-Za-z0-9_-]+)")
 
 # The literals in a `runs-on` expression that can actually BECOME the runner:
 # the operands of a short-circuit. GitHub Actions quotes strings with single
@@ -1031,6 +1039,11 @@ for job_id, job in jobs.items():
                 w_matrix = w_strategy.get("matrix") if isinstance(w_strategy, dict) else None
                 if isinstance(w_matrix, dict):
                     for w_text in w_strings(w_matrix):
+                        # A backslash in a leg is an escape the callee may
+                        # decode (a JSON escape spelling `-lane`), as undecidable as an
+                        # expression (#1718).
+                        if "\\" in w_text:
+                            w_matrix_dyn = True
                         if "${{" in w_text:
                             w_matrix_dyn = True
                             # A leg BUILT at run time (`${{ x }}-lane`) is
@@ -1086,18 +1099,20 @@ for job_id, job in jobs.items():
             # the merge lane (#1718): its `runs-on` input, or any input a local
             # callee's `runs-on` reads, could resolve to `-lane` at run time,
             # so the caller is read as both hosts. Judged as `#WITHEXPR` is,
-            # with one exception: a bare `${{ matrix.<key> }}` over a matrix
-            # the reader resolved above is already counted by its legs, and
-            # calling it computed would undo #1714 for every literal matrix.
-            # Anything else in the value — a fallback, `toJSON(matrix)`, a
-            # computed matrix — keeps it computed (fail-closed).
+            # with one exception: a value that is, WHOLE, one bare
+            # `${{ matrix.<key> }}` over a matrix the reader resolved above is
+            # already counted by its legs, and calling it computed would undo
+            # #1714 for every literal matrix. Anything else keeps it computed
+            # (fail-closed): literal text beside the reference (`${{ matrix.a
+            # }}ne` over `a: [X-la]` builds `X-lane`), two references, a list
+            # item, a fallback, `toJSON(matrix)`, a computed matrix.
             w_names = []
             for w_key, w_value in with_block.items():
                 if w_value is None:
                     continue
+                if not w_matrix_dyn and isinstance(w_value, str) and MATRIX_ONLY_EXPR.fullmatch(w_value.strip()):
+                    continue
                 w_text = w_value if isinstance(w_value, str) else json.dumps(w_value, ensure_ascii=False)
-                if not w_matrix_dyn:
-                    w_text = MATRIX_ONLY_EXPR.sub("", w_text)
                 if "${{" in w_text or "\\" in w_text:
                     w_name = str(w_key).lower()
                     if w_name not in w_names:
@@ -1142,6 +1157,16 @@ for job_id, job in jobs.items():
                 out("#RUNSONANCHORHOST", vid, host_anchor.group(1))
             for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(text)):
                 out("#RUNSONINPUT", vid, in_name)
+            # A `runs-on` read from the job's own matrix routes on whatever
+            # `inputs.*` that matrix is built from (`p: ['${{ inputs.pool }}']`
+            # with `runs-on: ${{ matrix.p }}`). A record of its own, so the
+            # RUNNER9 pin question that reads `#RUNSONINPUT` is unchanged; a
+            # caller's computed value for it is a computed pool (#1718).
+            if MATRIX_REF.search(text):
+                strategy = job.get("strategy")
+                m_text = json.dumps(strategy, ensure_ascii=False) if strategy is not None else ""
+                for in_name in dict.fromkeys(m.group(1) for m in INPUTS_REF.finditer(m_text)):
+                    out("#RUNSONMATRIXINPUT", vid, in_name)
             # Hoisted out of the loop above. The literals belong to the
             # EXPRESSION, not to each reference inside it, and scanning per
             # reference emitted the same literal once per
@@ -1715,7 +1740,7 @@ EOF
     # `needs.*.outputs` value the fleet passes. The merge lane is left to
     # RUNNER19's computed-runs-on refusal above, so nothing is reported twice.
     if [ "$merge_lane_any" -eq 0 ] && [ -n "$call_target" ]; then
-      local computed_inputs callee_path callee_inputs computed_pool=0 c_name
+      local computed_inputs callee_path callee_records callee_inputs computed_pool=0 c_name
       computed_inputs="$(printf '%s\n' "$records" | sed -n "s/^#WITHCOMPUTED\t${job_re}\t//p")"
       if [ -n "$computed_inputs" ]; then
         if [ "$(printf '%s\n' "$computed_inputs" | grep -cxF -- "runs-on")" -gt 0 ]; then
@@ -1724,11 +1749,19 @@ EOF
         case "$call_target" in
           ./*)
             # Resolved as compute_reachable resolves a call: from the
-            # repository root two levels above the workflow directory. A
-            # callee that cannot be read leaves the `runs-on` rule alone.
+            # repository root two levels above the workflow directory. The
+            # callee's pool inputs are those its jobs' `runs-on` reads, directly
+            # or through their own matrix. A callee that cannot be read — no
+            # such file, or a document that does not load — could route on any
+            # input, so every computed one is a pool (fail-closed).
             callee_path="$(cd "$(dirname "$file")/../.." 2>/dev/null && pwd)/${call_target#./}"
-            if [ "$computed_pool" -eq 0 ] && [ -f "$callee_path" ]; then
-              callee_inputs="$(read_workflow "$callee_path" | sed -n 's/^#RUNSONINPUT\t[^\t]*\t//p' | tr '[:upper:]' '[:lower:]')"
+            callee_records=""
+            [ -f "$callee_path" ] && callee_records="$(read_workflow "$callee_path")"
+            if [ -z "$callee_records" ] || [ "$(printf '%s\n' "$callee_records" | grep -c '^#ERR	')" -gt 0 ]; then
+              computed_pool=1
+            fi
+            if [ "$computed_pool" -eq 0 ]; then
+              callee_inputs="$(printf '%s\n' "$callee_records" | sed -n 's/^#RUNSONINPUT\t[^\t]*\t//p; s/^#RUNSONMATRIXINPUT\t[^\t]*\t//p' | tr '[:upper:]' '[:lower:]')"
               while IFS= read -r c_name; do
                 [ -n "$c_name" ] || continue
                 if [ "$(printf '%s\n' "$callee_inputs" | grep -cxF -- "$c_name")" -gt 0 ]; then
@@ -3214,8 +3247,69 @@ jobs:
   gate:
     uses: ./.github/workflows/build.yml
     with:
+      runs-on: ExampleRepo'
+
+  # A local callee that cannot be read could route on any input, so every
+  # computed one is a pool (fail-closed); build.yml does not exist here.
+  expect "a computed input to an unreadable local callee is a pool" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
       runs-on: ExampleRepo
       suite: ${{ vars.SUITE }}'
+
+  # The bare-matrix exception is for a value that is WHOLE one matrix
+  # reference. Literal text beside it builds a slot from legs no single one
+  # of which is slot-shaped (`ExampleRepo-la` + `ne`), so it is computed.
+  expect "a matrix reference with a literal suffix is a computed pool" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        a: [ExampleRepo-la]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.a }}ne'
+
+  expect "two matrix references in one value are a computed pool" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        a: [ExampleRepo-la]
+        b: [ne]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.a }}${{ matrix.b }}'
+
+  expect "a matrix reference with a suffix in a list item is a computed pool" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        a: [ExampleRepo-la]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ["${{ matrix.a }}ne"]'
+
+  # A backslash in a matrix leg is an escape the callee may decode into a
+  # slot, so the matrix is computed and the runs-on input reading it is both
+  # hosts: RUNNER18 (not the lane call).
+  expect "an escaped matrix leg behind with: runs-on is both hosts" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: ['"'"'"ExampleRepo\u002dlane"'"'"']
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
 
   # Every way an expression reads the matrix, not only `matrix.<key>`:
   # index syntax, any case, and the whole matrix handed over as JSON.
@@ -3264,8 +3358,10 @@ jobs:
     with:
       pool: ${{ matrix.pool }}'
 
-  # A computed strategy is read as no matrix, not a reader crash.
-  expect "a computed strategy behind a non-runs-on input stays clean" "" "ExampleRepo" blocked \
+  # A computed strategy is read as no matrix, not a reader crash (RUNNER0).
+  # The callee does not exist here, so it could route on `suite:` and the
+  # computed value is a pool (#1718, fail-closed): RUNNER18, nothing else.
+  expect "a computed strategy behind a non-runs-on input to an unreadable callee is a pool" "RUNNER18" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:
   gate:
@@ -3285,7 +3381,8 @@ jobs:
     with:
       runs-on: ${{ matrix.pool }}'
 
-  expect "a non-runs-on input over a computed matrix stays clean" "" "ExampleRepo" blocked \
+  # Same for a computed matrix: unreadable callee, so `suite:` may be its pool.
+  expect "a non-runs-on input over a computed matrix to an unreadable callee is a pool" "RUNNER18" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:
   gate:
@@ -4175,7 +4272,7 @@ jobs:
   # #1718: a LOCAL callee is read for the inputs its `runs-on` uses, so a
   # computed value behind a renamed input (`pool:`) is both hosts. The pair
   # runs with forks allowed and no scope, so RUNNER17 joins RUNNER18.
-  expect_pair "a computed input a local callee routes on is both hosts" "RUNNER17 RUNNER18" \
+  expect_pair "a computed input a local callee routes on in another case is both hosts" "RUNNER17 RUNNER18" \
 'on: [workflow_dispatch]
 jobs:
   call:
@@ -4195,7 +4292,7 @@ jobs:
 
   # …and a computed input the callee does NOT route on stays clean: that is
   # every ordinary `needs.*.outputs` value the fleet passes.
-  expect_pair "a computed input a local callee does not route on stays clean" "" \
+  expect_pair "a computed input a callee on a literal pool only reads in steps stays clean" "" \
 'on: [workflow_dispatch]
 jobs:
   call:
@@ -4211,6 +4308,47 @@ jobs:
     runs-on: [self-hosted, linux, gcp, ExampleRepo]
     timeout-minutes: 5
     steps: [{run: "echo ${{ inputs.suite }}"}]'
+
+  # The bracket spellings name an input too: `inputs['"'"'pool'"'"']`.
+  expect_pair "a callee routing on inputs[pool] makes the computed input both hosts" "RUNNER17 RUNNER18" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      pool: ${{ vars.P }}' \
+'on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+jobs:
+  build:
+    # dynamic-runner-allowed(build, #1718): the caller scopes the pool
+    runs-on: ${{ inputs['"'"'pool'"'"'] }}
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and a callee that routes through its OWN matrix built from the input.
+  expect_pair "a callee routing on a matrix built from an input makes it both hosts" "RUNNER17 RUNNER18" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      pool: ${{ vars.P }}' \
+'on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+jobs:
+  build:
+    strategy:
+      matrix:
+        p: ['"'"'${{ inputs.pool }}'"'"']
+    # dynamic-runner-allowed(build, #1718): the caller scopes the pool
+    runs-on: ${{ matrix.p }}
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
 
   # --- the lane owner's resolution (#1712) ------------------------------------
   # The flag wins, even empty (an explicit empty refuses, never falls back);
