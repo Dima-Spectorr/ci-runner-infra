@@ -433,6 +433,77 @@ mutate "a computed matrix behind with: runs-on is trusted" \
   's@if w_matrix_dyn and any@if False and any@'
 mutate "a matrix read in another case is missed" \
   's@r"(?i)(?<!@r"(?<!@'
+# #1718: a computed pool handed to a callee that is not the merge lane is both
+# hosts. Never counting it lets `${{ vars.POOL }}` past RUNNER18; never reading
+# the local callee lets a renamed `pool:` input past it (as does trusting an
+# unreadable callee, a bracket `inputs['pool']`, or a callee matrix built from
+# the input); calling a bare matrix leg computed undoes #1714 for every literal
+# matrix, while letting literal text beside it pass builds `X-la` + `ne`; an
+# escaped matrix leg decodes to a slot the reader never saw.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed pool to a non-lane callee is trusted" \
+  's@      if \[ "$computed_pool" -eq 1 \]; then@      if false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a local callee's runs-on inputs are never read" \
+  's@if \[ "$computed_pool" -eq 0 \]; then@if false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "an unreadable local callee routes on nothing" \
+  's@if \[ -z "$callee_records" \] || @if false \&\& @'
+mutate "a bare matrix leg is called computed" \
+  's@if not w_matrix_dyn and isinstance(w_value, str) and MATRIX_ONLY_EXPR.fullmatch(w_value.strip()):@if False:@'
+mutate "a matrix reference with literal text beside it is a bare leg" \
+  's@MATRIX_ONLY_EXPR.fullmatch(w_value.strip())@MATRIX_ONLY_EXPR.search(w_value)@'
+mutate "an escaped matrix leg is trusted" \
+  's@^                        if "\\\\" in w_text:$@                        if False:@'
+mutate "the bracket spellings of an input are missed" \
+  's@(?:[\\][.][\\]s[*]|@&NEVER@'
+mutate "a callee's matrix-built runs-on inputs are never read" \
+  's@                    out("#RUNSONMATRIXINPUT", vid, in_name)@                    pass@'
+# #1718: the anchor's host passed whole is the pin, not a lane risk. Matched by
+# substring, `|| vars.POOL` beside it rides the exemption. The review round
+# made it trust provenance: each guard below, removed, lets a lane host through.
+mutate "the anchor-host exemption matches a substring" \
+  's@WITH_ANCHOR_HOST_ONLY.fullmatch(w_value)@NEEDS_RUNS_ON.search(w_value)@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the anchor-host exemption takes any call target" \
+  's@printf .%s. "$a_target" | grep -cE -- "$FLEET_ANCHOR_CALL" >/dev/null \&\&@true \&\&@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the anchor-host exemption takes any owner" \
+  's@lane_owner_matches "${a_target%%/\*}"; then@true; then@'
+mutate "the anchor-host exemption ignores needs" \
+  's@or a_job not in \[str(n) for n in needs\]:@:@'
+mutate "the anchor-host exemption takes a lane repo-label" \
+  's@if a_value.lower().endswith(("-lane", "-util")):@if False:@'
+mutate "the anchor-host exemption takes a computed repo-label" \
+  's@ or not PLAIN_LABEL.fullmatch(a_value):@:@'
+mutate "the anchor-host exemption accepts a local services job" \
+  's@if not isinstance(anchor, dict) or not isinstance(anchor.get("uses"), str):@if not isinstance(anchor, dict):@'
+# The anchor's OWN pool inputs (#1718 re-review): a computed `repo-label` or
+# `hosted-runner` puts the anchor's job wherever it resolves. A label read from
+# a literal job output is a literal only under every guard below.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed anchor pool input is not a computed pool" \
+  's@grep -ciE -- "$ANCHOR_CALL_ANY" >/dev/null \&\&@false \&\&@'
+mutate "a literal job output may be a lane label" \
+  's@    if label.lower().endswith(("-lane", "-util")):@    if False:@'
+mutate "a literal job output need not be in needs" \
+  's@or src not in \[str(n) for n in needs\]:@:@'
+mutate "a computed job output reads as literal" \
+  's@    if not isinstance(label, str) or not PLAIN_LABEL.fullmatch(label):@    if not isinstance(label, str):@'
+mutate "a job output matched only by case reads as literal" \
+  's@if len(keys) != 1 or str(keys\[0\]) != name:@if len(keys) != 1:@'
+mutate "a literal job output is still recorded as computed" \
+  's@                if literal_output(job, w_value):@                if False:@'
+mutate "the anchor's literal-output repo-label proves nothing" \
+  's@            a_value = literal_output(anchor, a_value)@            pass@'
+# #1718 re-review: a callee reading `inputs` by no fixed name routes on any.
+mutate "a callee reading inputs by no fixed name routes on none" \
+  's@    return any(not FIXED_INPUT.match(text, m.end()) for m in ANY_INPUTS.finditer(text))@    return False@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the caller ignores a callee that reads inputs by no fixed name" \
+  's@if \[ -n "$computed_inputs" \] \&\&@if false \&\&@'
+mutate "whitespace before an input reference hides its name" \
+  's@inputs[\\]s[*](?:[\\][.][\\]s[*]|@inputs(?:[.]|@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -673,8 +744,19 @@ CASES="$(case_list | wc -l)"
 # 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
 # its two suffixes (+2) in place of the "asked of -lane too" case (-1). 77 when
 # RUNNER20 became an allowlist (+1, the denylist case). 79 with the matrix-fed
-# `with: runs-on:` cases (#1714, +3).
-FLOOR=80
+# `with: runs-on:` cases (#1714, +3) — the list held 80 then, one above the 79
+# this line used to say. 83 with the computed-pool cases for a non-lane callee
+# (#1718, +3), 88 when the security review added five more (#1718: the
+# unreadable callee, the whole-value matrix exception, the escaped leg, the
+# bracket input spelling, the callee's matrix-built input). 90 with the
+# anchor-host exemption's two guards (#1718: whole match, owner check). 95 when
+# the review made it trust provenance (#1718: target, owner, needs, lane and
+# computed repo-label, local services job; the owner case replaced). 102 when
+# the re-review found the anchor's own pool inputs unchecked (#1718: computed
+# anchor input, and the literal job output's five guards plus its anchor read).
+# 105 when the second re-review found `inputs` read by no fixed name (#1718:
+# the record, the caller's read of it, whitespace in a named reference).
+FLOOR=105
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
