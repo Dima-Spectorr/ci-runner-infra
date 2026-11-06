@@ -65,6 +65,25 @@ So a pin that could not be read is `warn:lane-pin-unreadable`, not silence; a
 ruleset that could not be compared is `warn:required-checks-uncomparable`, not a
 pass; an unrecognised tier is `fail:unknown-tier`, not a default.
 
+### Pin provenance (#1715)
+
+A 40-hex pin is not proof the code came from this repository. GitHub resolves
+`<owner>/ci-runner-infra/.github/workflows/<callee>@<sha>` for a commit that
+exists only in a **fork** of it (an "imposter commit"), and RUNNER18 checks only
+the owner and the SHA's shape. So every caller's pin — `merge-lane.yml`,
+`merge-lane-events.yml`, the guard and the reaper — is also compared against
+this repository's default branch (`compare/<default-branch>...<sha>`, one call
+per distinct SHA per run):
+
+- `fail:<caller>-pin-not-in-fleet-history` — the compare answers `ahead` or
+  `diverged`, or 404s: the pinned commit is not reachable from the default
+  branch. Reported independently of `<caller>-pin-stale`; an old release that
+  *is* in the history is only stale.
+- `warn:<caller>-pin-history-unknown` — the compare failed in any other way, or
+  the audit's token cannot read this repository at all. The latter is checked
+  first, once per run, because under such a token every compare is a 404 and
+  would otherwise read as an imposter in every repository.
+
 ### The two-file lane
 
 A repository on the split lane (`docs/merge-lane.md`, "Wiring a repository")

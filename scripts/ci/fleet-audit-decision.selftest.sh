@@ -27,6 +27,9 @@ OLD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 # under test.
 HEALTHY_POOL="tier=pool;has_lane=1;has_guard=1;has_reaper=1"
 HEALTHY_POOL="$HEALTHY_POOL;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;want_pin=$WANT"
+# Every pin is in the fleet's history (#1715); the collector always supplies it.
+IN_HISTORY="lane_pin_in_history=1;guard_pin_in_history=1;reaper_pin_in_history=1"
+HEALTHY_POOL="$HEALTHY_POOL;$IN_HISTORY"
 HEALTHY_POOL="$HEALTHY_POOL;enabled=true;armed=true;app_id=1;app_key=1"
 HEALTHY_POOL="$HEALTHY_POOL;checks_match=1;ruleset=1;runners=4;online=4"
 HEALTHY_POOL="$HEALTHY_POOL;corpses=0;demand=0;settled=0;page=50"
@@ -68,7 +71,7 @@ swap() {
 # --- the compliant case, and the invariant that it is never silent ------------
 has "ok:compliant" "a healthy pool repository is compliant" "$HEALTHY_POOL"
 has "ok:compliant" "a healthy lane repository is compliant" \
-  "tier=lane;has_lane=1;has_guard=1;has_reaper=1;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;want_pin=$WANT;enabled=true;armed=true;app_id=1;app_key=1;checks_match=1;ruleset=1"
+  "tier=lane;has_lane=1;has_guard=1;has_reaper=1;lane_pin=$WANT;guard_pin=$WANT;reaper_pin=$WANT;want_pin=$WANT;$IN_HISTORY;enabled=true;armed=true;app_id=1;app_key=1;checks_match=1;ruleset=1"
 
 # THE INVARIANT THE WHOLE AUDIT RESTS ON. An empty result and a clean result
 # must never render the same, in any tier — including a tier nobody recognised.
@@ -144,15 +147,52 @@ hasnt "lane-pin-stale" "an unreadable pin is not ALSO reported as stale" "$(swap
 hasnt "guard-pin-unreadable" "a missing caller is not reported for its missing pin" \
   "$(swap has_guard 0 | sed "s/;guard_pin=[^;]*/;guard_pin=/")"
 
+# --- pin provenance (#1715) ---------------------------------------------------
+# GitHub resolves a SHA that exists only in a FORK of the fleet repository, so a
+# well-formed pin is not proof the code was reviewed here. Reachability from the
+# fleet's default branch is — and the collector hands it over as a fact.
+has "fail:lane-pin-not-in-fleet-history" "a lane pin outside the fleet's history is a failure" \
+  "$(swap lane_pin_in_history 0)"
+hasnt "pin-not-in-fleet-history" "a lane pin in the fleet's history is not reported" "$HEALTHY_POOL"
+hasnt "pin-history-unknown" "nor warned about" "$HEALTHY_POOL"
+has "warn:lane-pin-history-unknown" "an unknown provenance is a warning, not silence" \
+  "$(swap lane_pin_in_history '')"
+hasnt "fail:lane-pin-not-in-fleet-history" "an unknown provenance is never an imposter" \
+  "$(swap lane_pin_in_history '')"
+has "warn:lane-pin-history-unknown" "an absent provenance fact is an unknown, not a pass" \
+  "$(printf '%s' "$HEALTHY_POOL" | sed 's/;lane_pin_in_history=[^;]*//')"
+has "warn:lane-pin-history-unknown" "a malformed provenance fact is an unknown, not a pass" \
+  "$(swap lane_pin_in_history yes)"
+# A stale pin that IS in the history is an old release, not foreign code.
+STALE_IN_HISTORY="$(swap lane_pin "$OLD")"
+has "fail:lane-pin-stale" "a stale in-history pin is still stale" "$STALE_IN_HISTORY"
+hasnt "pin-not-in-fleet-history" "and is not reported as foreign" "$STALE_IN_HISTORY"
+hasnt "pin-history-unknown" "nor as of unknown provenance" "$STALE_IN_HISTORY"
+# Provenance does not depend on the expected release being known.
+has "fail:lane-pin-not-in-fleet-history" "an imposter pin fails even when the expected pin is unknown" \
+  "$(swap lane_pin_in_history 0 | sed 's/;want_pin=[^;]*/;want_pin=/')"
+has "fail:guard-pin-not-in-fleet-history" "a guard pin outside the history is a failure" \
+  "$(swap guard_pin_in_history 0)"
+has "fail:reaper-pin-not-in-fleet-history" "a reaper pin outside the history is a failure" \
+  "$(swap reaper_pin_in_history 0)"
+# An unreadable pin is already a warning; it has no provenance to add a second.
+hasnt "pin-history-unknown" "an unreadable pin gets no provenance finding" \
+  "$(swap lane_pin '' | sed 's/;lane_pin_in_history=[^;]*/;lane_pin_in_history=/')"
+# An absent caller has no pin and no provenance.
+hasnt "guard-pin-history" "a missing caller is not judged for provenance" \
+  "$(swap has_guard 0 | sed 's/;guard_pin=[^;]*/;guard_pin=/;s/;guard_pin_in_history=[^;]*/;guard_pin_in_history=/')"
+
 # --- the two-file lane (#1382) ----------------------------------------------------
 # The healthy pool with a healthy events file beside the pool caller. Each case
 # is this string with one fact changed.
-TWO_FILE="$HEALTHY_POOL;has_events=1;events_pin=$WANT;relay_match=1;with_match=1"
+TWO_FILE="$HEALTHY_POOL;has_events=1;events_pin=$WANT;events_pin_in_history=1;relay_match=1;with_match=1"
 two() { printf '%s' "$TWO_FILE" | sed "s/;$1=[^;]*/;$1=$2/"; }
 has "ok:compliant" "a healthy two-file lane is compliant" "$TWO_FILE"
 has "fail:events-pin-stale" "a stale pin in merge-lane-events.yml is a failure" "$(two events_pin "$OLD")"
 hasnt "lane-pin-stale" "a stale events pin is not reported against the pool caller" "$(two events_pin "$OLD")"
 has "warn:events-pin-unreadable" "an events file with an unreadable pin is reported" "$(two events_pin '')"
+has "fail:events-pin-not-in-fleet-history" "an events pin outside the fleet's history is a failure" \
+  "$(two events_pin_in_history 0)"
 has "fail:relay-name-mismatch" "a relay renamed away from what the events file hears is a failure" \
   "$(two relay_match 0)"
 has "warn:relay-name-unreadable" "an unread relay name is a warning, not a pass" "$(two relay_match '')"
