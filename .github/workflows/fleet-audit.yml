@@ -107,6 +107,18 @@ jobs:
           UTILITY_HOST_REPOS: ${{ vars.UTILITY_HOST_REPOS }}
         run: |
           set -uo pipefail
+          # The pin scan DECODES every workflow with PyYAML (#1716): escaped
+          # YAML spells a fleet call no text match sees. A PRECONDITION: with
+          # no parser the job stops here, and the script itself fails every
+          # scanned repository (`workflow-pin-yaml-parser-unavailable`), so a
+          # run without PyYAML can never report a repository compliant.
+          python3 -I -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml &&
+              python3 -I -c 'import yaml'
+          } || {
+            echo 'fleet-audit: PyYAML is not importable and python3-yaml did not install; the pin scan cannot decode workflows' >&2
+            exit 1
+          }
           # `tee`, so the findings are in the job log even when the report step
           # is skipped — a report that only exists as a comment disappears the
           # first time the comment step is the thing that breaks.

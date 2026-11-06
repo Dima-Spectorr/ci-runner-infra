@@ -478,6 +478,12 @@ eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknow
 # gh's error-document form, which `api` passes through on stdout.
 F_FORK=""
 F_COMPARE=""
+F_TREE=""
+F_META=""
+# Per-SHA compare answers and per-path file bodies for the every-pin cases
+# (#1716); a SHA with no entry gets F_COMPARE, a path with no entry nothing.
+declare -A COMPARE_BY_SHA=()
+declare -A FILE_BY_PATH=()
 FORK_PATH_FILE="${TMPDIR:-/tmp}/fleet-audit-collector-forkpath.$$"
 trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE"' EXIT
 api() {
@@ -488,7 +494,16 @@ api() {
     # The provenance cases (#1715) below share this stub rather than redefine it.
     */compare/*)
       echo "$1" >> "$PROV_CALLS"
-      printf '%s' "$F_COMPARE" ;;
+      printf '%s' "${COMPARE_BY_SHA[${1##*...}]:-$F_COMPARE}" ;;
+    */contents/*)
+      echo "$1" >> "$PROV_CALLS"
+      printf '%s' "${FILE_BY_PATH[${1#*/contents/}]:-}" ;;
+    # The workflows listing (#1716) and the repository it hangs off; both
+    # default to empty, which is the unreadable-listing case further down.
+    */git/trees/*)
+      echo "$1" >> "$PROV_CALLS"
+      printf '%s' "$F_TREE" ;;
+    repos/acct/svc-a) printf '%s' "$F_META" ;;
     *) printf '' ;;
   esac
 }
@@ -614,6 +629,430 @@ eq "$(pin_in_history "$PROV_SHA")" "" "an unreadable fleet repository makes ever
 eq "$(wc -l < "$PROV_CALLS" | tr -d ' ')" "1" "and makes no compare whose 404 would read as an imposter"
 PIN_HISTORY_CACHE=""
 
+# A compare body holding SEVERAL JSON objects (#1716 item 3) is no single
+# answer: jq prints one status per object, and two words are not a verdict.
+eq "$(history_of_compare '{"status":"behind"}{"status":"behind"}')" "" "concatenated compare objects are unknown, even when they agree"
+eq "$(history_of_compare '{"status":"404"} {"status":"behind"}')" "" "concatenated compare objects that disagree are unknown"
+
+# --- every pin, every workflow (#1716) --------------------------------------------
+#
+# GOOD is in the fleet's history, BAD is an imposter (a fork-only commit: 404).
+GOOD=dddddddddddddddddddddddddddddddddddddddd
+BAD=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+UNK=ffffffffffffffffffffffffffffffffffffffff
+COMPARE_BY_SHA=([$GOOD]='{"status":"behind"}' [$BAD]='{"message":"Not Found","status":"404"}' [$UNK]='{"message":"Resource not accessible by integration","status":"403"}')
+# shellcheck disable=SC2034  # read by pin_in_history
+FLEET_HISTORY_BRANCH=main
+CALLEE="acct/ci-runner-infra/.github/workflows/merge-lane.yml"
+job() { printf '  %s:\n    uses: %s@%s\n' "$1" "$CALLEE" "$2"; }
+
+# The reviewer's reproduction: a commented decoy, in history, above the real pin.
+# Comments are NOT stripped (a line-based strip cannot see quoting, below), so
+# the decoy is judged as a pin too — it can only add a pin, never hide one, and
+# the worst verdict, the imposter, wins.
+DECOY="jobs:
+  # uses: $CALLEE@$GOOD
+$(job lane "$BAD")"
+eq "$(pins_in "$DECOY" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a commented decoy is read as well as the real pin"
+eq "$(pin_in "$DECOY" 'merge-lane\.yml')" "$GOOD" "pin_in is the first pin, decoy or not"
+eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "a decoy comment above an imposter pin still fails provenance, naming the imposter"
+
+# A pin in a trailing comment is judged too: noise, never a silent pass.
+TRAIL="    uses: $CALLEE@$GOOD # was $CALLEE@$BAD"
+eq "$(pins_in "$TRAIL" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a pin in a trailing comment is judged too"
+
+# The security review's two probes (round 2): a ` #` inside a quoted string, and
+# a `#`-led line inside a multi-line double-quoted flow scalar. Comment
+# stripping hid the imposter in both.
+PROBE1="jobs: {x: {name: \"a #\", uses: $CALLEE@$BAD}}"
+eq "$(pins_in "$PROBE1" 'merge-lane\.yml')" "$BAD" "a ' #' inside a quoted flow-mapping value does not hide the pin"
+PROBE2="jobs: {x: {name: \"a
+  # b\", uses: $CALLEE@$BAD}}"
+eq "$(pins_in "$PROBE2" 'merge-lane\.yml')" "$BAD" "a '#'-led line inside a quoted multi-line scalar does not hide the pin"
+
+# A ref that only STARTS like a SHA is a branch or tag: not a pin, but a not-a-sha.
+eq "$(pins_in "    uses: $CALLEE@${GOOD}x" 'merge-lane\.yml')" "" "<40 hex>x is not a SHA pin"
+eq "$(pins_in "    uses: \"$CALLEE@$BAD\"" 'merge-lane\.yml')" "$BAD" "a quoted SHA pin is still a pin"
+for REF in v5 main 1234567 "${GOOD}x" refs/pull/1/head "refs/pull/1/${GOOD}x" ""; do
+  eq "$(refs_not_sha_in "    uses: $CALLEE@$REF")" "$CALLEE@$REF" "a fleet ref '@${REF:-<empty>}' is reported as not canonical"
+done
+eq "$(refs_not_sha_in "    uses: '$CALLEE@v5' # tag")" "$CALLEE@v5" "a quoted tag ref stops at the quote"
+eq "$(refs_not_sha_in "    uses: $CALLEE@$GOOD")" "" "a 40-hex SHA ref is not reported"
+eq "$(refs_not_sha_in "    uses: actions/checkout@v4")" "" "a non-fleet ref by tag is not this rule's business"
+
+# An escape in a double-quoted scalar can spell a fleet reference neither
+# extractor sees: `\x69` for `i`, and a backslash-newline joining two halves.
+eq "$(obfuscated_in "    uses: \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\"")" "1" "a \\x69 escape on a uses line is obfuscated"
+CONT="    uses: \"$CALLEE@bbbbbbbbbbbbbbbbbbbb\\
+      bbbbbbbbbbbbbbbbbbbb\""
+eq "$(obfuscated_in "$CONT")" "1" "a backslash continuation on a uses line is obfuscated"
+eq "$(pins_in "$CONT" 'merge-lane\.yml')" "" "and the split pin is invisible to the extractor, which is why it warns"
+NEXT="    uses: >-
+      \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\""
+eq "$(obfuscated_in "$NEXT")" "1" "an escape on the value line after a bare uses: is obfuscated"
+ORDINARY="name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: printf 'a\\tb\\n' | grep -E '\\s'
+      - run: |
+          echo \"done\" \\
+            && true
+  lane:
+    uses: $CALLEE@$GOOD"
+eq "$(obfuscated_in "$ORDINARY")" "" "an ordinary workflow with backslashes in run: text does not warn"
+
+# Two jobs call the same callee; the second is the imposter. Worst wins, the
+# stale rule still reads the first, and the finding names the imposter.
+TWO_JOBS="jobs:
+$(job a "$GOOD")
+$(job b "$BAD")"
+eq "$(pins_in "$TWO_JOBS" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "both jobs' pins are read, in order"
+eq "$(caller_pin_facts lane "$TWO_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "one imposter among two jobs fails, naming the imposter"
+UNK_JOBS="jobs:
+$(job a "$GOOD")
+$(job b "$UNK")"
+eq "$(caller_pin_facts lane "$UNK_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$UNK;lane_pin_in_history=;lane_history_pin=$UNK" \
+   "an unknown among good pins is unknown, never a pass"
+ALL_GOOD="jobs:
+$(job a "$GOOD")
+$(job b "$GOOD")
+$(job c "$(printf '%s' "$GOOD" | tr 'a-f' 'A-F')")"
+eq "$(pins_in "$ALL_GOOD" 'merge-lane\.yml')" "$GOOD" "repeated pins, any case, de-duplicate to one"
+eq "$(caller_pin_facts lane "$ALL_GOOD" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD;lane_pin_in_history=1;lane_history_pin=$GOOD" \
+   "every pin in history is quiet"
+eq "$(caller_pin_facts lane "name: x" 'merge-lane\.yml')" "lane_pin=;lane_pins=;lane_pin_in_history=;lane_history_pin=" \
+   "a caller with no pin has no provenance"
+
+# GitHub resolves the owner/repository in any case, so a mixed-case path is the
+# same fleet call: an imposter behind it must fail, not slip past the match.
+MIXED="jobs:
+$(job a "$GOOD")
+  b:
+    uses: Acct/CI-Runner-Infra/.GitHub/Workflows/merge-lane.yml@$(printf '%s' "$BAD" | tr 'a-f' 'A-F')"
+eq "$(pins_in "$MIXED" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a mixed-case path is matched, and its SHA lowercased"
+eq "$(caller_pin_facts lane "$MIXED" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "a mixed-case path with an imposter SHA fails"
+eq "$(pins_in "$MIXED" 'merge-lane\.yml' | grep -cvE '^[0-9a-f]{40}$')" "0" "every extracted pin passes the is_sha shape"
+
+# The scan over every workflow file. merge-lane.yml was already read for the
+# named caller, so it must come from WORKFLOW_TEXT, not a second read.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+OTHER="jobs:
+  deploy:
+    uses: ACCT/Ci-Runner-Infra/.github/workflows/pr-guard.yml@$BAD"
+WORKFLOW_TEXT=(["merge-lane.yml"]="$(job lane "$GOOD")")
+FILE_BY_PATH=([.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "$OTHER")\"}"
+              [.github/workflows/ci.yml]="{\"content\":\"$(b64 "name: CI")\"}")
+: > "$PROV_CALLS"
+LIST="merge-lane.yml
+ci.yml
+deploy.yaml
+README.md"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "an imposter pin in an extra workflow file fails, naming the file"
+eq "$(grep -c '/contents/' "$PROV_CALLS")" "2" "only the files not already read are fetched, and non-YAML is skipped"
+eq "$(grep -c 'contents/.github/workflows/merge-lane.yml' "$PROV_CALLS")" "0" "the named caller's text is reused"
+
+FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$GOOD}")\"}"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "every pin in every workflow in history is quiet"
+
+FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$UNK}")\"}"
+eq "$(workflow_pin_facts svc-a "$LIST")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "an unknown provenance in an extra file is unknown, naming the file"
+
+# shellcheck disable=SC2034  # read by workflow_pin_facts
+WORKFLOW_TEXT=()
+eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na\tb.yml\r\n')")" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "an unreadable file and a name with a control character are reported as unscanned, never clean"
+# Round 6: `;` `,` `=` in a name are READ, and written into the facts encoded,
+# so a file name can neither be refused into a warning nor forge a fact.
+: > "$PROV_CALLS"
+eq "$(workflow_pin_facts svc-a "$(printf 'a;wf_pin_in_history=1,b.yml')")" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=a%3Bwf_pin_in_history%3D1%2Cb.yml;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "a name holding ; = , is read and named encoded, never refused and never a forged fact"
+eq "$(grep -cx 'repos/acct/svc-a/contents/.github/workflows/a%3Bwf_pin_in_history%3D1%2Cb.yml' "$PROV_CALLS")" "1" \
+   "the read puts the name in the URL percent-encoded"
+
+# Upper-case extensions run exactly like lower-case ones, so they are scanned;
+# a tag-pinned and an escaped fleet call are named in their own facts.
+FILE_BY_PATH=([.github/workflows/CI.YML]="{\"content\":\"$(b64 "$OTHER")\"}"
+              [.github/workflows/tag.Yaml]="{\"content\":\"$(b64 "    uses: $CALLEE@v5")\"}"
+              [.github/workflows/esc.yml]="{\"content\":\"$(b64 "    uses: \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\"")\"}")
+eq "$(workflow_pin_facts svc-a "$(printf 'CI.YML\ntag.Yaml\nesc.yml\nnotes.TXT')")" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=CI.YML,esc.yml;wf_unread=;wf_refused=0;wf_not_sha=tag.Yaml;wf_obfuscated=esc.yml;wf_unparsed=;wf_no_parser=0" \
+   "an upper-case .YML is scanned, a tag ref is not-a-sha, an escape is obfuscated AND decoded"
+
+# Security review round 3: escaped YAML spelled a fleet call no grep saw. Each
+# probe is decoded by the parser and must FAIL (all four pin `@main`). The YAML
+# is written byte for byte as the reviewer's files, single-quoted here so bash
+# leaves every backslash alone.
+# shellcheck disable=SC2016
+P1='jobs:
+  a:
+    "\x75ses": "acme/ci-runner-in\x66ra/.git\x68ub/workflows/merge-lane.yml@main"'
+P2='jobs:
+  a:
+    uses: # pinned
+      "acme/ci-runner-in\x66ra/.github\x2fworkflows/merge-lane.yml@main"'
+P3='jobs:
+  a:
+    ? uses
+    : "acme/ci-runner-in\x66ra/.github\x2fworkflows/merge-lane.yml@main"'
+P4='jobs:
+  a: {"us\u0065s": "acme/ci-runner-\u0069nfra/.github\u002fworkflows/merge-lane.yml@main"}'
+P5='jobs:
+  a:
+    "\x75ses": "acme/ci-runner-infra/.github/workflows/merge-lane.yml@'"$BAD"'"'
+FILE_BY_PATH=([.github/workflows/p1.yml]="{\"content\":\"$(b64 "$P1")\"}"
+              [.github/workflows/p2.yml]="{\"content\":\"$(b64 "$P2")\"}"
+              [.github/workflows/p3.yml]="{\"content\":\"$(b64 "$P3")\"}"
+              [.github/workflows/p4.yml]="{\"content\":\"$(b64 "$P4")\"}")
+eq "$(workflow_pin_facts svc-a "$(printf 'p1.yml\np2.yml\np3.yml\np4.yml')" | grep -o 'wf_not_sha=[^;]*')" \
+   "wf_not_sha=p1.yml,p2.yml,p3.yml,p4.yml" "every escaped, next-line and explicit-key fleet call is decoded and fails as not-a-sha"
+for P in "$P1" "$P2" "$P3" "$P4"; do
+  eq "$(decoded_fleet_refs "$P")" "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main" "the parser decodes the probe to the fleet ref it spells"
+done
+FILE_BY_PATH=([.github/workflows/p5.yml]="{\"content\":\"$(b64 "$P5")\"}")
+eq "$(workflow_pin_facts svc-a p5.yml | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+   "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=p5.yml" "an escaped imposter SHA is decoded and fails provenance"
+
+# A file the parser cannot load is judged on its text alone and named, and a
+# missing parser skips the decoded layer for every file — both partial scans.
+FILE_BY_PATH=([.github/workflows/bad.yml]="{\"content\":\"$(b64 'jobs: [unclosed')\"}")
+eq "$(workflow_pin_facts svc-a bad.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=bad.yml;wf_no_parser=0" \
+   "a workflow the parser cannot load is reported as unparsed"
+FILE_BY_PATH=([.github/workflows/p4.yml]="{\"content\":\"$(b64 "$P4")\"}")
+# shellcheck disable=SC2317,SC2329  # the override is called by workflow_pin_facts
+eq "$(ensure_yaml() { return 1; }; workflow_pin_facts svc-a p4.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=;wf_no_parser=1" \
+   "no YAML parser is reported, never a clean scan"
+eq "$(decoded_fleet_refs "$(printf 'a: &x [*x, "ci-runner-infra/.github/workflows/y.yml@v1"]')")" "ci-runner-infra/.github/workflows/y.yml@v1" \
+   "a recursive alias does not hang the decoder"
+
+# Security review round 4: the matching is INVERTED. Every candidate fleet
+# reference must fully match the canonical form, so a shape the old allow-list
+# did not know — each pinned to the imposter — can no longer read clean. The
+# YAML is the reviewer's probe files byte for byte, the SHA swapped for BAD.
+# Each shape either fails as not-a-sha or is a canonical pin that provenance
+# then fails; nothing in between.
+declare -A R4=()
+R4[PLUS]='    uses: acme/ci-runner-infra/.github/workflows/merge+lane.yml@'"$BAD"
+R4[TILDE]='    uses: acme/ci-runner-infra/.github/workflows/m~l.yml@'"$BAD"
+R4[UNI]='    uses: acme/ci-runner-infra/.github/workflows/mergé.yml@'"$BAD"
+R4[SPACE]='    uses: acme/ci-runner-infra/.github/workflows/merge lane.yml@'"$BAD"
+R4[NOEXT]='    uses: acme/ci-runner-infra/.github/workflows/merge-lane@'"$BAD"
+R4[DSL1]='    uses: acme/ci-runner-infra//.github/workflows/merge-lane.yml@'"$BAD"
+R4[DSL2]='    uses: acme/ci-runner-infra/.github//workflows/merge-lane.yml@'"$BAD"
+R4[DSL3]='    uses: acme/ci-runner-infra/.github/workflows//merge-lane.yml@'"$BAD"
+# shellcheck disable=SC2016
+R4[ESPLUS]='    "\x75ses": "acme/ci-runner-\x69nfra\x2f.github\x2fworkflows\x2fm\x2bl.yml@'"$BAD"'"'
+r4() { printf 'on: push\njobs:\n  a:\n%s\n' "$1"; }
+r4_facts() { FILE_BY_PATH=([.github/workflows/p.yml]="{\"content\":\"$(b64 "$(r4 "$1")")\"}"); workflow_pin_facts svc-a p.yml; }
+for R in PLUS TILDE UNI NOEXT ESPLUS; do
+  eq "$(r4_facts "${R4[$R]}" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+     "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=p.yml" "round 4 ${R,,}: a canonical-form pin to an imposter fails provenance"
+done
+for R in SPACE DSL1 DSL2 DSL3; do
+  eq "$(r4_facts "${R4[$R]}" | grep -o 'wf_not_sha=[^;]*')" "wf_not_sha=p.yml" "round 4 ${R,,}: a non-canonical fleet reference fails as not-a-sha"
+done
+# The same shapes with NO parser: the text layer alone still refuses them.
+for R in PLUS TILDE UNI NOEXT; do
+  eq "$(pins_in "${R4[$R]}" '[^/@[:space:]]+')" "$BAD" "round 4 ${R,,}: the text layer reads the pin without the parser"
+done
+for R in SPACE DSL1 DSL2 DSL3; do
+  eq "$(refs_not_sha_in "${R4[$R]}" | grep -c .)" "1" "round 4 ${R,,}: the text layer reports it as not canonical without the parser"
+done
+eq "$(decoded_fleet_refs "$(r4 "${R4[SPACE]}")")" "acme/ci-runner-infra/.github/workflows/merge lane.yml@$BAD" \
+   "a uses value is decoded WHOLE, so a space stays inside the candidate"
+# shellcheck disable=SC2016
+R4_SQ="    uses: 'acme/ci-runner-infra/.github/workflows/m''l.yml@x'"
+eq "$(r4_facts "$R4_SQ" | grep -o 'wf_not_sha=[^;]*')" "wf_not_sha=p.yml" "a quote inside a single-quoted uses value cannot split the decoded candidate"
+
+# The round-4 probes that already failed keep their verdicts (each pins @main).
+# shellcheck disable=SC2016
+R4[BOM]=$'\xef\xbb\xbf''on: push
+jobs:
+  a:
+    uses: "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main"'
+# shellcheck disable=SC2016
+R4[MERGE]='on: push
+jobs:
+  a:
+    <<: {uses: "acme/ci-runner-\x69nfra/.github/workflows/merge-lane.yml@main"}
+    runs-on: x'
+# shellcheck disable=SC2016
+R4[SLASHESC]='on: push
+jobs:
+  a:
+    uses: "acme/ci-runner-infra\/.github\/workflows\/merge-lane.yml@main"'
+# shellcheck disable=SC2016
+R4[SURR]='on: push
+jobs:
+  a:
+    name: "\ud800"
+    uses: "acme/ci-runner-\x69nfra/.github/workflows/merge-lane.yml@main"'
+# The NUL probe: bash drops the byte (as file_at's `$(…)` does in production).
+R4[NUL]="$(printf 'on: push\njobs:\n  a:\n    uses: "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main"\n\0\n' 2>/dev/null)"
+for R in BOM MERGE SLASHESC SURR NUL; do
+  FILE_BY_PATH=([.github/workflows/p.yml]="{\"content\":\"$(b64 "${R4[$R]}")\"}")
+  eq "$(workflow_pin_facts svc-a p.yml | grep -o 'wf_not_sha=[^;]*;wf_obfuscated=[^;]*;wf_unparsed=[^;]*')" \
+     "wf_not_sha=p.yml;wf_obfuscated=$(case $R in MERGE|SLASHESC|SURR) echo p.yml ;; esac);wf_unparsed=" \
+     "round 4 ${R,,}: still fails as not-a-sha"
+done
+eq "$(r4_facts "    uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@$GOOD" | grep -o 'wf_pins=[^;]*;wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*;wf_unread=[^;]*;wf_refused=[^;]*;wf_not_sha=[^;]*')" \
+   "wf_pins=1;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=" "round 4 base: a canonical pin in history is quiet"
+
+# Prose that names a fleet workflow with no `@` is not a call; a comment that
+# pins one still counts, and a docs URL is not a candidate.
+PROSE='# This job calls acme/ci-runner-infra/.github/workflows/merge-lane.yml (see
+# https://github.com/acme/ci-runner-infra/blob/main/.github/workflows/merge-lane.yml)
+jobs:
+  a:
+    uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@'"$GOOD"'
+    with: {note: "acme/ci-runner-infra/.github/workflows/merge-lane.yml is the lane"}'
+eq "$(r4_facts "$PROSE" | grep -o 'wf_pins=[^;]*;wf_pin_in_history=[^;]*;.*wf_not_sha=[^;]*')" \
+   "wf_pins=1;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=" "prose and a docs URL with no @ are not calls"
+eq "$(refs_not_sha_in "    # uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@v5")" "acme/ci-runner-infra/.github/workflows/merge-lane.yml@v5" \
+   "a commented fleet reference by tag still fails"
+
+# The decoder's bounds: an oversize workflow and a decoder that fails are unparsed.
+eq "$(DECODE_MAX_BYTES=10 decoded_fleet_refs "jobs: {a: {uses: x}}")" "#ERR" "a workflow over the size cap is not decoded"
+# shellcheck disable=SC2030,SC2031
+eq "$(PY_BIN=false decoded_fleet_refs "jobs: {}")" "#ERR" "a decoder that fails reports #ERR"
+
+# A workflows listing that could not be read is unscanned in every tier that
+# scans, never a clean scan with nothing in it.
+FILE_BY_PATH=()
+for TIER in checks pool lane; do
+  eq "$(facts_for svc-a "$TIER" "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+     "an unreadable workflows listing is reported in the $TIER tier"
+done
+eq "$(facts_for svc-a dormant "$GOOD" | grep -c 'wf_')" "0" "a dormant repository is not scanned"
+
+# Round 5: the listing is the git tree, never the contents API, which stops at
+# 1000 entries in alphabetical order. 1000 decoys, then an imposter sorted
+# after them: the tree returns all of them, and the imposter is read and fails.
+tree_body() { # <truncated-json> <entries-json…>
+  local t="$1" out="" e; shift
+  for e in "$@"; do out="${out:+$out,}$e"; done
+  printf '{"sha":"x","tree":[%s],"truncated":%s}' "$out" "$t"
+}
+blob() { printf '{"path":"%s","mode":"100644","type":"blob","sha":"x"}' "$1"; }
+DECOYS=()
+for i in $(seq -w 0 999); do DECOYS+=("$(blob "a0$i.txt")"); done
+F_META='{"default_branch":"main"}'
+F_TREE=$(tree_body false "${DECOYS[@]}" "$(blob zz-imposter.yml)")
+FILE_BY_PATH=([.github/workflows/zz-imposter.yml]="{\"content\":\"$(b64 "jobs:
+  z:
+    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD")\"}")
+: > "$PROV_CALLS"
+CAP_FACTS=$(facts_for svc-a checks "$GOOD")
+eq "$(printf '%s' "$CAP_FACTS" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+   "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=zz-imposter.yml" \
+   "an imposter behind 1000 decoy files is read and fails"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$CAP_FACTS") | grep -c 'ok:compliant')" "0" \
+   "a repository with an imposter behind 1000 decoys never reads compliant"
+eq "$(grep -cx 'repos/acct/svc-a/git/trees/main%3A.github%2Fworkflows' "$PROV_CALLS")" "1" \
+   "the listing reads the default branch's tree, fully URL-encoded"
+eq "$(grep -cx 'repos/acct/svc-a/contents/.github/workflows' "$PROV_CALLS")" "0" \
+   "the capped contents listing is never used"
+
+# A truncated tree is unscanned, never a scan of the part that arrived.
+F_TREE=$(tree_body true "${DECOYS[@]:0:5}")
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+   "a truncated workflows tree is an unreadable listing"
+F_TREE=$(tree_body true "$(blob zz-imposter.yml)")
+eq "$(facts_for svc-a checks "$GOOD" | grep -c 'wf_pins=')" "0" "a truncated tree with a workflow in it is still not scanned"
+# A tree with no `truncated` key at all is not known to be whole either.
+F_TREE='{"sha":"x","tree":[]}'
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+   "a tree with no truncated flag is an unreadable listing"
+# A refusal body from the trees call on a readable repository: no workflows dir.
+F_TREE='{"message":"Not Found","status":"404"}'
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*')" "has_ci=0" "a missing workflows tree on a readable repository is no CI"
+
+# A subdirectory is not a workflow: GitHub runs only top-level files there.
+F_TREE=$(tree_body false "$(blob zz-imposter.yml)" '{"path":"nested.yml","mode":"040000","type":"tree","sha":"y"}')
+: > "$PROV_CALLS"
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_history_files=[^;]*;wf_unread=[^;]*')" "wf_history_files=zz-imposter.yml;wf_unread=" \
+   "a subdirectory entry is skipped, the top-level file is scanned"
+eq "$(grep -c 'nested.yml' "$PROV_CALLS")" "0" "a subdirectory is never read as a workflow"
+# A control character in a name is refused, never split into two names.
+F_TREE=$(tree_body false '{"path":"a\nzz-imposter.yml","mode":"100644","type":"blob","sha":"z"}')
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_unread=[^;]*;wf_refused=[^;]*')" "wf_unread=;wf_refused=1" \
+   "a name holding a newline is refused, not split"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$(facts_for svc-a checks "$GOOD")") | grep -c '^fail:workflow-pin-unscanned refused=1$')" "1" \
+   "a refused name FAILS the repository, never a warning on a green run"
+
+# Security review round 6: a name with a space, `+`, `@` or non-ASCII was
+# refused (a warning, and the run went green with an imposter inside). GitHub
+# runs such files — orbisgis/h2gis has `.github/workflows/CI build.yml` — so
+# each is read through its percent-encoded path and judged like any other.
+IMPOSTER_WF="{\"content\":\"$(b64 "jobs:
+  z:
+    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD")\"}"
+declare -A R6=([SPACE]='ci build.yml|ci%20build.yml' [UNI]='café.yml|caf%C3%A9.yml'
+               [PLUS]='ci+x.yml|ci%2Bx.yml' [AT]='ci@x.yml|ci%40x.yml')
+for R in SPACE UNI PLUS AT; do
+  R6_NAME="${R6[$R]%%|*}" R6_ENC="${R6[$R]#*|}"
+  F_TREE=$(tree_body false "$(blob "$R6_NAME")")
+  FILE_BY_PATH=([.github/workflows/$R6_ENC]="$IMPOSTER_WF")
+  : > "$PROV_CALLS"
+  R6_FACTS=$(facts_for svc-a checks "$GOOD")
+  eq "$(printf '%s' "$R6_FACTS" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*;wf_unread=[^;]*;wf_refused=[^;]*')" \
+     "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=$R6_ENC;wf_unread=;wf_refused=0" \
+     "round 6 ${R,,}: \`$R6_NAME\` is read and its imposter pin reaches the provenance check"
+  eq "$(grep -cx "repos/acct/svc-a/contents/.github/workflows/$R6_ENC" "$PROV_CALLS")" "1" \
+     "round 6 ${R,,}: the read URL carries the name percent-encoded"
+  # shellcheck source=/dev/null
+  eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$R6_FACTS") | grep -c '^fail:workflow-pin-not-in-fleet-history')" "1" \
+     "round 6 ${R,,}: the repository FAILS"
+done
+
+# Round 6: more workflow files than FLEET_MAX_WORKFLOWS is unscanned — no file
+# is read, the listing reads as unreadable with the count, and the rule fails.
+F_TREE=$(tree_body false "$(blob a.yml)" "$(blob b.YAML)" "$(blob c.yml)" "$(blob notes.txt)")
+FILE_BY_PATH=()
+: > "$PROV_CALLS"
+OVER_FACTS=$(FLEET_MAX_WORKFLOWS=2; facts_for svc-a checks "$GOOD")
+eq "$(printf '%s' "$OVER_FACTS" | grep -o 'wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=3;wf_max_workflows=2')" \
+   "wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=3;wf_max_workflows=2" \
+   "three workflow files over a ceiling of two is unscanned, with the count"
+eq "$(grep -c '/contents/' "$PROV_CALLS")" "0" "over the ceiling, no workflow file is read"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$OVER_FACTS") | grep -c '^fail:workflow-pin-unscanned workflows-over-ceiling count=3 max=2$')" "1" \
+   "a repository over the workflow ceiling FAILS"
+# shellcheck disable=SC2034  # read by facts_for
+eq "$( (FLEET_MAX_WORKFLOWS=3; facts_for svc-a checks "$GOOD") | grep -c 'wf_over_ceiling')" "0" \
+   "exactly at the ceiling, the scan runs"
+
+# Round 6: an empty tree response on a repository that answered is an
+# unreadable listing (and fails), never "no workflows".
+F_TREE=""
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*;.*wf_scanned=1;wf_listing_unreadable=1')" \
+   "has_ci=;want_pin=$GOOD;wf_scanned=1;wf_listing_unreadable=1" \
+   "an empty trees response on a readable repository is unreadable, not no-CI"
+F_TREE=$(tree_body false)
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*')" "has_ci=0" "a whole tree with no files is no CI"
+F_TREE=""
+F_META=""
+FILE_BY_PATH=()
+COMPARE_BY_SHA=()
+# shellcheck disable=SC2034  # read by pin_in_history
+FLEET_HISTORY_BRANCH=""
+
 # --- the two guards around the collector ---------------------------------------
 #
 # Neither is a judgement inside backlog_facts(), and both fail the way this
@@ -630,6 +1069,11 @@ eq "$(load abc)" "40" "a scan cap that is not a number falls back to the default
 eq "$(load '')"  "40" "an empty scan cap falls back to the default"
 eq "$(load 7)"   "7"  "a numeric scan cap is honoured"
 eq "$(load 0)"   "0"  "zero is a whole number, and still caps the walk at zero"
+load_max() { FLEET_AUDIT_LIB=1 FLEET_OWNER=acct FLOATING_TAG=v9 FLEET_MAX_WORKFLOWS="$1" \
+  bash -c 'source "$0" && printf "%s" "$FLEET_MAX_WORKFLOWS"' "$HERE/fleet-audit.sh" 2>/dev/null; }
+eq "$(load_max abc)" "500" "a workflow ceiling that is not a number falls back to 500"
+eq "$(load_max '')"  "500" "an unset workflow ceiling is 500"
+eq "$(load_max 20)"  "20"  "a numeric workflow ceiling is honoured"
 
 # The library guard has to mean the same thing however the file was entered.
 # EXECUTED with the variable set, a bare top-level `return` is an error that

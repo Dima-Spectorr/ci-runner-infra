@@ -65,24 +65,155 @@ So a pin that could not be read is `warn:lane-pin-unreadable`, not silence; a
 ruleset that could not be compared is `warn:required-checks-uncomparable`, not a
 pass; an unrecognised tier is `fail:unknown-tier`, not a default.
 
-### Pin provenance (#1715)
+### Pin provenance (#1715, #1716)
 
 A 40-hex pin is not proof the code came from this repository. GitHub resolves
 `<owner>/ci-runner-infra/.github/workflows/<callee>@<sha>` for a commit that
 exists only in a **fork** of it (an "imposter commit"), and RUNNER18 checks only
-the owner and the SHA's shape. So every caller's pin — `merge-lane.yml`,
-`merge-lane-events.yml`, the guard and the reaper — is also compared against
-this repository's default branch (`compare/<default-branch>...<sha>`, one call
-per distinct SHA per run):
+the owner and the SHA's shape. So every pin is also compared against this
+repository's default branch (`compare/<default-branch>...<sha>`, one call per
+distinct SHA per run, cached across repositories).
+
+**Every pin, not the first.** A caller can hold several pins — a second job
+calling the same callee, or a commented-out line above the real one. **Comments
+are not stripped**: a line-based comment strip cannot see YAML quoting, and both
+`{name: "a #", uses: …@<imposter>}` and a `#`-led line inside a multi-line
+double-quoted scalar hid the real pin from it. So every match in the file —
+commented or not — is a pin; a commented decoy can only *add* a pin to judge,
+never hide one (a stale or foreign SHA in a comment is reported: visible noise,
+never a silent pass). Every pin is de-duplicated and judged, and the **worst
+verdict wins**: any pin not in the
+history fails, else any unknown warns, else the caller is quiet. The finding
+names the pin that made the verdict. `<caller>-pin-stale` judges every pin the
+same way: any pin that is not the expected release is stale, and the finding
+names it.
+
+**Case does not hide a pin.** GitHub resolves the owner and repository in any
+case (measured 2026-11-06: `compare` against `CI-Runner-Infra` and against an
+upper-case SHA both answer), so the match is case-insensitive on the path and
+the SHA is lowercased before it is checked and compared.
+
+The named callers — `merge-lane.yml`, `merge-lane-events.yml`, the guard and
+the reaper — report per caller:
 
 - `fail:<caller>-pin-not-in-fleet-history` — the compare answers `ahead` or
   `diverged`, or 404s: the pinned commit is not reachable from the default
   branch. Reported independently of `<caller>-pin-stale`; an old release that
   *is* in the history is only stale.
-- `warn:<caller>-pin-history-unknown` — the compare failed in any other way, or
-  the audit's token cannot read this repository at all. The latter is checked
-  first, once per run, because under such a token every compare is a 404 and
-  would otherwise read as an imposter in every repository.
+- `warn:<caller>-pin-history-unknown` — the compare failed in any other way
+  (including a body that is not exactly one JSON object), or the audit's token
+  cannot read this repository at all. The latter is checked first, once per
+  run, because under such a token every compare is a 404 and would otherwise
+  read as an imposter in every repository.
+
+**Every workflow, not four.** Any workflow can call a fleet reusable workflow,
+so in the `pool`, `lane` and `checks` tiers every `.github/workflows/*.yml` /
+`*.yaml` in the repository — the extension in **any case**, since `CI.YML` runs
+exactly like `ci.yml` — is read, from the listing the audit already takes,
+reusing the named callers' texts, so the extra cost is one read per other
+workflow file.
+
+**Find every candidate, then demand the canonical form.** The scan does not
+list the shapes that count as a fleet call — a list let every shape outside it
+read clean (`merge+lane.yml`, `m~l.yml`, `mergé.yml`, `merge lane.yml`,
+`ci-runner-infra//.github/…`, which GitHub resolves by dropping the empty
+segment, and `…/workflows/merge-lane@<sha>` with no extension, each pinned to an
+imposter). Instead every **candidate** is found — a token that names
+`ci-runner-infra` (any case), also names `.github` and `workflows`, and runs to
+an `@` — and each must **fully** match
+
+    ^[A-Za-z0-9-]+/ci-runner-infra/\.github/workflows/[^/@\s]+@[0-9a-f]{40}$
+
+(case-insensitive; the SHA is lowercased before it is compared). A candidate
+that does not match fails as `workflow-pin-not-a-sha`; one that does is a pin,
+and is judged for provenance as above. A new shape can only fail.
+
+In the file's text a token starts after whitespace, a quote, a bracket, a brace
+or a comma, runs through anything but `@` and quotes — so a space, `+`, `~`, a
+doubled slash or a non-ASCII byte stays inside it — and its ref ends at
+whitespace, a quote, a comma, a bracket or a brace. **Prose is not a call:** a
+line that names `ci-runner-infra/.github/workflows/<x>` with no `@` after it (a
+comment saying which callee a job uses, a docs URL such as
+`…/ci-runner-infra/blob/main/.github/workflows/x.yml`) yields no candidate,
+because a reusable-workflow call must carry `@<ref>`. A line that does carry an
+`@` after the name is judged even in a comment, so a comment writing `…@v5`, or
+an e-mail address after the name on the same line, fails — visible noise in the
+consumer's own file, never a silent pass.
+
+**Decoded, not only read.** YAML is not text: `"\x75ses"` is the key `uses`,
+`\x2f` is `/`, a `uses:` value can sit on the line after a comment, and
+`? uses` / `: "…"` is an explicit key — each spelled a fleet call no text match
+saw. So every workflow is also loaded with PyYAML (the parser
+`check-runner-policy.sh` already uses). The **value of any `uses` key** that
+names the fleet's workflows is a candidate **whole** — it is exactly what
+GitHub reads, so a space or quote inside it fails the match instead of
+splitting it; every other string the documents yield (keys and values, aliases
+resolved) is tokenized like a text line. The literal scan stays as the first
+layer, so a commented pin (which a parser drops) still counts. The decoder is
+bounded: a workflow over 1 MiB is not decoded, and a decode that runs past 30
+seconds is killed — both are reported unparsed. The audit job makes PyYAML a
+**precondition**: it installs `python3-yaml` when the runner lacks it and stops
+if it still cannot import it.
+
+- `fail:workflow-pin-not-a-sha files=<a.yml,…>` — a candidate fleet reference
+  not in the canonical form: a tag (`@v5`), a branch (`@main`), a short SHA,
+  `refs/pull/<n>/head`, `<40 hex>x`, an empty ref, a doubled slash, whitespace
+  in the callee name. Whatever such a ref points at today runs, so its
+  provenance cannot be judged.
+- `warn:workflow-pin-obfuscated files=<a.yml,…>` — a YAML double-quoted escape
+  can spell a fleet reference no extractor sees (`c\x69-runner-infra`, or a
+  backslash-newline joining two halves of a SHA). The rule, chosen to stay quiet
+  on real workflows: a backslash on a line holding a `uses:` key, the text
+  `runner-infra` or `.github/workflows` (any case), or on the value line after
+  a bare `uses:`. A `uses:` value never needs a backslash.
+**Any name, read as it is.** GitHub runs a workflow file whatever its name —
+`ci build.yml`, `café.yml`, `ci+x.yml`, `ci@x.yml` (orbisgis/h2gis has an
+active `.github/workflows/CI build.yml`). Each path segment is percent-encoded
+(`jq @uri`) when it goes into an API URL, and every file name the audit writes
+into a fact or a finding is written the same way (`ci%20build.yml`), so `;`,
+`,` or `=` in a name can never forge or split a fact. Only a name holding a
+**control character** is not read, and it fails as unscanned (below).
+
+**Unscanned is red.** The audit exits non-zero only on a `fail:`, so every
+outcome where a file GitHub may run was not judged is a `fail:` — never a
+`warn:` on a green run.
+
+- `fail:workflow-pin-unscanned workflows-listing-unreadable` — the
+  workflows listing itself could not be read, or came back `truncated`. Only a
+  whole tree with no files, or GitHub's `Not Found` for the directory on a
+  repository that answered, means "no workflows"; an empty or malformed tree
+  response is unreadable. Nothing was scanned, so nothing else in the scan is
+  judged, and the repository fails. The listing is the git tree of `<default branch>:.github/workflows`
+  (`git/trees`), never the contents API: that one returns at most 1000 entries,
+  alphabetically and without paging, so 1000 decoy files would hide a `zz.yml`
+  behind them. Only top-level files (`blob` entries) are workflows — GitHub
+  runs nothing from a subdirectory of `.github/workflows`, so those are skipped.
+- `fail:workflow-pin-unscanned workflows-over-ceiling count=<n> max=<m>` — the
+  repository holds more than `FLEET_MAX_WORKFLOWS` (default **500**; a
+  non-numeric value falls back to it) `.yml`/`.yaml` files. Each costs one
+  contents read, so the ceiling bounds the run's API spend; over it no file is
+  read, and the repository is unscanned exactly like a truncated listing.
+- `fail:workflow-pin-unscanned refused=<n>` — `<n>` names held a control
+  character and were not read. An unscanned file is never a clean one.
+
+- `fail:workflow-pin-not-in-fleet-history pin=<sha8> files=<a.yml,b.yml>` — some
+  pin is not reachable from the default branch; `files` names every file that
+  holds such a pin. A named caller's imposter is reported here as well as on its
+  own line.
+- `warn:workflow-pin-history-unknown pin=<sha8> files=…` — no imposter, but some
+  pin's provenance could not be established.
+- `fail:workflow-pin-unread files=<a.yml,…>` — a file whose read came back
+  empty (deleted mid-run, or over 1 MB, where the contents API returns no
+  `content`). GitHub still runs it unseen, so — like an unparsed file — it
+  fails; padding a workflow past 1 MB cannot demote an imposter to a warning.
+- `fail:workflow-pin-unparsed files=<a.yml,…>` — a file the YAML parser could
+  not load (or that exceeded the decoder's bounds). GitHub may still run it, and
+  an escaped or explicit-key `uses` in it is invisible to the text scan, so it
+  fails. Its literal text is still judged, so a visible bad pin is reported too;
+  strings decoded before the failure are discarded, not half-trusted.
+- `fail:workflow-pin-yaml-parser-unavailable decoded-layer-skipped` — no PyYAML
+  was found, so no file was decoded. A run without the parser can never report a
+  repository compliant.
 
 ### The two-file lane
 
@@ -201,7 +332,8 @@ bash scripts/ci/fleet-audit.sh IntegrateIT
 Exit status is `0` when nothing failed, `1` on any `fail:` finding, `2` when the
 audit could not run at all. `FLEET_OWNER`, `FLEET_MANIFEST`, `DEMAND_MAX_AGE`
 and `QUEUED_PAGE` are all overridable; the defaults match what the controller
-actually uses. So are `BACKLOG_MAX_HOURS`, `RELEASED_SURFACE`, `BACKLOG_SCAN_MAX`
+actually uses. So are `BACKLOG_MAX_HOURS`, `RELEASED_SURFACE`, `BACKLOG_SCAN_MAX`,
+`FLEET_MAX_WORKFLOWS` (the per-repository workflow-file ceiling, default 500)
 and `FLOATING_TAG` — the last of these exists so the backlog code can be
 exercised by hand against a tag known to be behind main:
 

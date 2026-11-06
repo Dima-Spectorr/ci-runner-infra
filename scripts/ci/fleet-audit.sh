@@ -79,6 +79,19 @@ if ! _fleet_is_number "$BACKLOG_SCAN_MAX"; then
        "using $BACKLOG_SCAN_MAX_DEFAULT" >&2
   BACKLOG_SCAN_MAX="$BACKLOG_SCAN_MAX_DEFAULT"
 fi
+# The most workflow files (.yml/.yaml, any case) one repository's pin scan reads
+# (#1716). Each costs a contents read, so a repository with thousands of them
+# would buy that many calls. Over the ceiling the scan does not run and the
+# repository is UNSCANNED — wf_listing_unreadable, like a truncated listing —
+# which fails. A non-numeric value falls back to the default, for the reason
+# above: an override must never remove the bound.
+FLEET_MAX_WORKFLOWS_DEFAULT=500
+FLEET_MAX_WORKFLOWS="${FLEET_MAX_WORKFLOWS:-$FLEET_MAX_WORKFLOWS_DEFAULT}"
+if ! _fleet_is_number "$FLEET_MAX_WORKFLOWS"; then
+  echo "fleet-audit: FLEET_MAX_WORKFLOWS=\"$FLEET_MAX_WORKFLOWS\" is not a whole number;" \
+       "using $FLEET_MAX_WORKFLOWS_DEFAULT" >&2
+  FLEET_MAX_WORKFLOWS="$FLEET_MAX_WORKFLOWS_DEFAULT"
+fi
 # The tag the backlog is measured from. Empty — the normal case — derives it
 # from VERSION's major, which is the ref consumers pin. An override exists so
 # the collector can be exercised by hand against a tag that is known to be
@@ -107,21 +120,265 @@ UTILITY_HOST_REPOS="${UTILITY_HOST_REPOS:-}"
 # for every repository in the fleet.
 api() { gh api "$1" </dev/null 2>/dev/null; }
 
-# file_at <repo> <path> — the decoded contents of one file, or empty.
+# uri_seg <text> — <text> percent-encoded as ONE path segment (everything but
+# A-Z a-z 0-9 - _ . ~, UTF-8 bytes for non-ASCII). A workflow name is consumer
+# input: GitHub runs `ci build.yml`, `café.yml`, `ci+x.yml` and `ci@x.yml`, so
+# such a name is encoded, never refused (#1716 round 6). The same encoding is
+# how a name is written into a fact, so `;` `,` `=` in a file name can never
+# forge or split a fact.
+uri_seg() { printf '%s' "$1" | jq -sRr @uri 2>/dev/null | tr -d '\r'; }
+
+# file_at <repo> <path> — the decoded contents of one file, or empty. Every
+# segment of <path> is URL-encoded, so a name holding a space, `+`, `@`, `#`,
+# `?`, `%` or non-ASCII reaches the API as the file it is.
+#
+# Split in bash, not with jq's `split("/")`: Git Bash rewrites a `/` in an
+# argument to a native path, which turned every `/` into `%2F` there.
 file_at() {
-  local body
-  body=$(api "repos/$OWNER/$1/contents/$2" | jq -r '.content // empty' 2>/dev/null) || return 0
+  local body path="" rest="$2" seg
+  while :; do
+    seg="${rest%%/*}"
+    path="${path:+$path/}$(uri_seg "$seg")"
+    [ "$rest" = "$seg" ] && break
+    rest="${rest#*/}"
+  done
+  [ -z "$path" ] && return 0
+  body=$(api "repos/$OWNER/$1/contents/$path" | jq -r '.content // empty' 2>/dev/null) || return 0
   [ -z "$body" ] && return 0
   # `tr -d` first: the API wraps base64 at 60 columns, and on this platform the
   # newlines arrive as CRLF, which `base64 -d` rejects 45 bytes in.
   printf '%s' "$body" | tr -d '\r\n' | base64 -d 2>/dev/null
 }
 
-# pin_in <file-contents> <callee> — the sha a caller pins for one callee.
+# --- fleet references: find every candidate, then demand the canonical form ---
+#
+# THE MATCHING IS INVERTED (#1716, security review round 4). Listing the shapes
+# that count as a fleet call — `[A-Za-z0-9._-]+\.ya?ml@`, single slashes — let
+# every shape outside the list read clean: `merge+lane.yml`, `m~l.yml`,
+# `mergé.yml`, `merge lane.yml`, `ci-runner-infra//.github/…` (GitHub drops the
+# empty segment) and `…/workflows/merge-lane@<sha>` (no extension), each pinned
+# to an imposter, were COMPLIANT. So the scan now finds every CANDIDATE — any
+# token that names `ci-runner-infra` (any case) and runs to an `@` — keeps the
+# ones that also name `.github` and `workflows`, and requires each to FULLY
+# match FLEET_CANON_ERE. A candidate that does not is `workflow-pin-not-a-sha`;
+# one that does goes on to provenance. A new shape can only fail, never pass.
+#
+# THE TOKEN. It starts at the first character after whitespace, a quote, a
+# bracket, a brace or a comma before `ci-runner-infra`, runs through anything
+# but `@` and quotes (so a space, `+`, `~`, a doubled slash or a non-ASCII byte
+# stays INSIDE it and fails the canonical match), then takes the ref after the
+# `@` up to whitespace, a quote, a comma, a bracket or a brace. Bytes, not
+# characters (LC_ALL=C), so a non-UTF-8 file cannot make grep skip a line.
+#
+# PROSE IS NOT A CALL. A line that names `ci-runner-infra/.github/workflows/<x>`
+# with no `@` after it on the same line — a comment saying which callee a job
+# uses, a docs URL (`…/ci-runner-infra/blob/main/.github/workflows/x.yml`) — is
+# not a reference GitHub could resolve (a reusable-workflow call must carry
+# `@<ref>`), so it yields no token and is not judged. A line that does carry an
+# `@` after the name is judged even in a comment (see pins_in), so prose that
+# writes `…/x.yml@v5`, or mentions an e-mail address after the name, fails:
+# visible noise in the consumer's own file, never a silent pass.
+FLEET_TOKEN_ERE="[^][[:space:]\"'{},]*ci-runner-infra[^@\"']*@[^][[:space:]\"',{}]*"
+# Matched case-insensitively (grep -i): GitHub resolves the owner and the
+# repository in any case, and the SHA is lowercased before it is compared.
+FLEET_CANON_ERE='^[A-Za-z0-9-]+/ci-runner-infra/\.github/workflows/[^/@[:space:]]+@[0-9a-f]{40}$'
+
+# fleet_tokens_in <text> — every candidate fleet reference in free text, one per
+# line, in order (duplicates kept; callers de-duplicate).
+fleet_tokens_in() {
+  printf '%s\n' "$1" | tr -d '\r' | LC_ALL=C grep -oiE "$FLEET_TOKEN_ERE" \
+    | LC_ALL=C grep -iF '.github' | LC_ALL=C grep -iF 'workflows'
+}
+
+# fleet_canonical / fleet_noncanonical — filter a token list (stdin) to the
+# tokens that do / do not fully match FLEET_CANON_ERE.
+fleet_canonical() { LC_ALL=C grep -iE "$FLEET_CANON_ERE"; }
+fleet_noncanonical() { LC_ALL=C grep -viE "$FLEET_CANON_ERE"; }
+
+# pins_in <file-contents> <callee-regex> — EVERY sha a file pins for the callee,
+# one per line, lowercased, de-duplicated in first-appearance order (#1716).
+# Only canonical tokens are pins; the callee regex is matched against the file
+# name segment of one.
+#
+# EVERY MATCH, COMMENTS INCLUDED. A commented decoy pin (in history) above the
+# real `uses:` line (an imposter) read as the pin when only the first match was
+# taken. Stripping comments was tried and is WRONG: line-based YAML comment
+# detection cannot see quoting, so `{name: "a #", uses: …@<imposter>}` and a
+# `#`-led line inside a multi-line double-quoted scalar hid the real pin. With
+# every match judged and the worst verdict winning, a decoy can only ADD a pin
+# to judge, never hide one. A commented pin is therefore judged too (stale or
+# foreign, it is reported) — visible noise, never a silent pass.
+#
+# THE SHA MUST END THERE. `@<40 hex>` followed by another ref character (`x`,
+# `/`, `.`, `-`, `_`) is not a SHA pin — it is a branch or tag that starts like
+# one — so it is not returned here; refs_not_sha_in reports it.
+#
+# CASE-INSENSITIVE on the path, and the SHA is lowercased. GitHub resolves an
+# owner/repository in any case (measured 2026-11-06: `compare` on
+# `CI-Runner-Infra` and on an upper-case SHA both answer `identical`), so a
+# `CI-Runner-Infra/...@<sha>` pin is the same fleet call and must not slip past
+# a lower-case match. Lowercasing is what lets the SHA pass is_sha and be
+# compared; it is correct whether or not Actions itself accepts upper-case hex.
+pins_in() {
+  fleet_tokens_in "$1" | fleet_canonical \
+    | LC_ALL=C grep -iE "/\.github/workflows/$2@[0-9a-f]{40}$" \
+    | sed -E 's/.*@//' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+}
+
+# canonical_shas <token-list> — the lowercased SHA of every canonical token,
+# de-duplicated in first-appearance order.
+canonical_shas() {
+  printf '%s\n' "$1" | fleet_canonical | sed -E 's/.*@//' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+}
+
+# refs_not_sha_in <file-contents> — every candidate fleet reference that is NOT
+# in canonical form, whole, one per line, de-duplicated: a tag, a branch,
+# `refs/pull/N/head`, a short SHA, `<40 hex>x`, an empty ref, a doubled slash,
+# a callee name with a character outside the canonical set's reach.
+refs_not_sha_in() {
+  fleet_tokens_in "$1" | fleet_noncanonical | awk '!seen[$0]++'
+}
+
+# obfuscated_in <file-contents> — 1 when a line could spell a fleet reference
+# through a YAML double-quoted escape, nothing otherwise. A backslash in such a
+# scalar can write any character (`c\x69-runner-infra`) or join two lines
+# (`@bbbb\` + newline + `bbbb`), and neither pins_in nor refs_not_sha_in can see
+# through it. The rule, chosen to be quiet on real workflows: a backslash on a
+# line that (case-insensitively) holds a `uses:` key, the text `runner-infra`
+# or `.github/workflows`, or that follows a `uses:` whose value starts on the
+# next line. A `uses:` value never needs a backslash, and the other two strings
+# appear in shell `run:` text far less often than escapes do in general.
+obfuscated_in() {
+  printf '%s\n' "$1" | tr -d '\r' | awk '
+    { l = tolower($0); bs = index($0, "\\") > 0
+      if (bs && (l ~ /uses[ \t"'\'']*:/ || l ~ /runner-infra/ || l ~ /\.github\/workflows/ || next_is_value)) found = 1
+      if (l ~ /uses[ \t"'\'']*:[ \t]*([>|][-+0-9]*)?[ \t]*$/) next_is_value = 1
+      else if (l !~ /^[ \t]*$/) next_is_value = 0 }
+    END { if (found) print 1 }'
+}
+
+# --- the decoded layer (#1716, security review round 3) -----------------------
+# Every check above reads the file AS TEXT, and YAML is not text: `"uses"`
+# is the key `uses`, `ci-runner-infra` is `ci-runner-infra`, `\x2f` is `/`,
+# a `uses:` value can sit under a comment on the next line, and `? uses` /
+# `: "…"` is an explicit key. Each of those spelled a fleet call no grep saw.
+# So every workflow is also DECODED with a real YAML parser. Two kinds of string
+# leave it (decoded_fleet_refs):
+#   - the VALUE of any `uses` key (any case, surrounding whitespace ignored)
+#     that names `ci-runner-infra`, `.github` and `workflows`: that string IS
+#     what GitHub reads, so it is a candidate WHOLE — a space, a quote or an
+#     `@`-less value inside it fails the canonical match rather than splitting
+#     the token. (Only a str value: a `!!binary` or other tagged node is not a
+#     call GitHub accepts.)
+#   - every other string (keys and values, anchors resolved, every document in
+#     the stream) that names `ci-runner-infra`: free text, tokenized exactly
+#     like a raw line (fleet_tokens_in).
+# The literal scan stays as the first layer, so a commented pin (which a parser
+# drops) is still judged.
+#
+# The parser is PyYAML, the reader check-runner-policy.sh already depends on;
+# py_usable/ensure_yaml are that script's (copied, not sourced: sourcing it
+# runs the gate). The audit job makes PyYAML a precondition and stops if it
+# cannot install it. A missing parser, or a file it cannot load, FAILS the
+# repository (`workflow-pin-yaml-parser-unavailable`, `workflow-pin-unparsed`):
+# GitHub runs a file the audit could not decode, so it can never read clean.
+export PY_BIN="${PY_BIN:-}"
+py_usable() {
+  command -v "$1" >/dev/null 2>&1 &&
+    "$1" -I -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1
+}
+
+ensure_yaml() {
+  local c
+  if [ -n "$PY_BIN" ]; then
+    py_usable "$PY_BIN" && return 0
+    PY_BIN=""
+  fi
+  for c in python3 /usr/bin/python3 /usr/bin/python /usr/local/bin/python3 python; do
+    if py_usable "$c"; then
+      PY_BIN="$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The decoder. The workflow arrives on stdin (no argv size limit). Each string
+# leaves on its own line with its whitespace collapsed (so a newline inside a
+# value cannot split it), prefixed `U ` for a whole `uses` value and `S ` for
+# free text; a document that does not load prints `#ERR` alone. The walk is
+# breadth-first in document order and tracks containers by id, because a YAML
+# alias can make the structure recursive.
+DECODE_PY='
+import sys
+from collections import deque
+import yaml
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(newline="\n", encoding="utf-8")
+def names_fleet(s):
+    return "ci-runner-infra" in s.lower()
+def names_call(s):
+    low = s.lower()
+    return "ci-runner-infra" in low and ".github" in low and "workflows" in low
+try:
+    docs = list(yaml.safe_load_all(sys.stdin.buffer.read().decode("utf-8")))
+except Exception:
+    print("#ERR")
+    sys.exit(0)
+seen, queue = set(), deque(docs)
+while queue:
+    node = queue.popleft()
+    if isinstance(node, (dict, list)):
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (isinstance(key, str) and key.strip().lower() == "uses"
+                        and isinstance(value, str) and names_call(value)):
+                    print("U " + " ".join(value.split()))
+                queue.append(key)
+                queue.append(value)
+        else:
+            queue.extend(node)
+    elif isinstance(node, str) and names_fleet(node):
+        print("S " + " ".join(node.split()))
+'
+
+# The decoder's bounds. A workflow larger than this is not decoded (it is
+# reported unparsed), and a decode that runs longer than DECODE_TIMEOUT seconds is killed and
+# reported the same way. Neither bound can make a file read clean.
+DECODE_MAX_BYTES=1048576
+DECODE_TIMEOUT=30
+
+# decoded_fleet_refs <file-contents> — the candidate fleet references the
+# parser sees, one per line, de-duplicated, or `#ERR` when the document does not
+# load (or is too large, or the decode timed out). Needs ensure_yaml.
+decoded_fleet_refs() {
+  local bytes out
+  bytes=$(printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' ')
+  if [ "${bytes:-0}" -gt "$DECODE_MAX_BYTES" ]; then
+    echo "#ERR"
+    return 0
+  fi
+  # `head -c` as well as the size check: the check guards the verdict (a cut
+  # document could load and silently drop its tail), the cap guards the parser.
+  out=$(printf '%s' "$1" | head -c "$DECODE_MAX_BYTES" \
+          | timeout "$DECODE_TIMEOUT" "${PY_BIN:-python3}" -I -c "$DECODE_PY" 2>/dev/null) || out="#ERR"
+  if printf '%s\n' "$out" | grep -cx '#ERR' >/dev/null; then
+    echo "#ERR"
+    return 0
+  fi
+  {
+    printf '%s\n' "$out" | sed -n 's/^U //p'
+    fleet_tokens_in "$(printf '%s\n' "$out" | sed -n 's/^S //p')"
+  } | grep -v '^$' | awk '!seen[$0]++'
+}
+
+# pin_in <file-contents> <callee> — the first pin. Both the stale rule and
+# provenance judge EVERY pin, through `<caller>_pins` and pins_history.
 pin_in() {
-  printf '%s' "$1" \
-    | grep -oE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}" \
-    | head -1 | grep -oE '[0-9a-f]{40}$'
+  pins_in "$1" "$2" | sed -n 1p
 }
 
 # --- pin provenance (#1715) ------------------------------------------------------
@@ -180,6 +437,134 @@ pin_in_history() {
   verdict=$(history_of_compare "$(api "repos/$OWNER/ci-runner-infra/compare/$branch...$sha")")
   [ -n "$cache" ] && [ -d "$cache" ] && printf '%s' "$verdict" > "$cache/$sha"
   printf '%s' "$verdict"
+}
+
+# pins_history <sha-list> — "<verdict> <sha>" for a newline-separated list:
+# the WORST verdict and the pin it names. Any pin not in history is 0; else any
+# unknown is empty; else 1, naming the first pin. Nothing for an empty list.
+pins_history() {
+  local sha v worst=1 named="" first=""
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    [ -z "$first" ] && first="$sha"
+    v=$(pin_in_history "$sha")
+    case "$v" in
+      1) : ;;
+      0) worst=0; named="$sha"; break ;;
+      *) [ "$worst" = "1" ] && { worst=""; named="$sha"; } ;;
+    esac
+  done <<< "${1:-}"
+  [ -z "$first" ] && return 0
+  printf '%s %s' "$worst" "${named:-$first}"
+}
+
+# caller_pin_facts <prefix> <file-contents> <callee-regex> — the named caller's
+# facts: `<prefix>_pin` (the first pin), `<prefix>_pins` (EVERY pin,
+# comma-separated, which the stale rule judges — worst wins), its provenance
+# over every pin, and `<prefix>_history_pin`, the pin that verdict names.
+caller_pin_facts() {
+  local pins r
+  pins=$(pins_in "$2" "$3")
+  r=$(pins_history "$pins")
+  printf '%s_pin=%s;%s_pins=%s;%s_pin_in_history=%s;%s_history_pin=%s' \
+    "$1" "$(printf '%s\n' "$pins" | sed -n 1p)" \
+    "$1" "$(printf '%s\n' "$pins" | paste -sd, -)" \
+    "$1" "${r%% *}" "$1" "${r#* }"
+}
+
+# --- every workflow's fleet pins (#1716) -----------------------------------------
+#
+# The named callers above are four files. Any other workflow can call a fleet
+# reusable workflow at an imposter SHA, so every `.github/workflows/*.y(a)ml`
+# is read, every candidate fleet reference in it must be canonical, and every
+# canonical one is judged for provenance. Cost: one read per workflow file not already
+# read for the named callers (WORKFLOW_TEXT), plus one compare per DISTINCT SHA
+# in the run (pin_in_history's cache) — the listing is the one facts_for has.
+declare -A WORKFLOW_TEXT=()
+
+# workflow_pin_facts <repo> <workflow-names> — the scan's facts:
+#   wf_scanned=1, wf_pins (count of file/pin pairs), wf_pin_in_history (worst
+#   verdict: 0 / "" / 1), wf_history_pin (the pin it names), wf_history_files
+#   (the files holding a pin with that verdict), wf_unread (files whose read
+#   came back empty — an unread file is unscanned, never clean), wf_refused
+#   (count of names holding a control character — the only names not read;
+#   unscanned, so the rule FAILS them), wf_not_sha
+#   (files holding a candidate fleet reference not in canonical form —
+#   FLEET_CANON_ERE), wf_obfuscated (files where an escape could spell one —
+#   obfuscated_in), wf_unparsed (files the YAML parser could not load: their
+#   literal text is still judged, and the file FAILS), wf_no_parser (1 when no
+#   PyYAML was found, so no file was decoded: FAILS).
+#   facts_for adds wf_listing_unreadable=1 instead when the listing failed,
+#   came back truncated, or held more than FLEET_MAX_WORKFLOWS workflows.
+#   Every file name in a fact is uri_seg-encoded.
+workflow_pin_facts() {
+  local repo="$1" names="$2" name label text tokens pins sha v count=0 refused=0
+  local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
+  local unparsed="" no_parser=0 decoded
+  ensure_yaml || no_parser=1
+  while IFS= read -r name; do
+    name="${name%$'\r'}"
+    # Any case: `CI.YML` runs exactly like `ci.yml`, so it is scanned too.
+    case "${name,,}" in *.yml|*.yaml) ;; *) continue ;; esac
+    # ONLY a control character is refused (facts_for marks one `#CTRL `,
+    # because a newline would otherwise split the name in two). Every other
+    # name — a space, `+`, `@`, non-ASCII — is read: GitHub runs such files
+    # (#1716 round 6). A refused name is unscanned, which the rule FAILS.
+    case "$name" in
+      '#CTRL '*|*[[:cntrl:]]*) refused=$((refused + 1)); continue ;;
+    esac
+    label=$(uri_seg "$name")
+    [ -z "$label" ] && { refused=$((refused + 1)); continue; }
+    if [ -n "${WORKFLOW_TEXT[$name]+set}" ]; then
+      text="${WORKFLOW_TEXT[$name]}"
+    else
+      text=$(file_at "$repo" ".github/workflows/$name")
+    fi
+    if [ -z "$text" ]; then
+      unread="${unread:+$unread,}$label"
+      continue
+    fi
+    # The literal text's candidates first (comments count), then the parser's.
+    # The decoded candidates are ALREADY tokens and are not re-tokenized: a
+    # whole `uses` value may hold a quote or a space that would split it.
+    tokens=$(fleet_tokens_in "$text")
+    if [ "$no_parser" = "0" ]; then
+      decoded=$(decoded_fleet_refs "$text")
+      if printf '%s\n' "$decoded" | grep -cx '#ERR' >/dev/null; then
+        # A file that does not load yields NO decoded candidates, even when
+        # the decoder printed some before it failed (a decode killed by the
+        # timeout): strings from a document the parser rejected are not what
+        # GitHub would read, so half of them is neither a verdict nor safe to
+        # pass. The file is FAILED as unparsed instead, and its literal text is
+        # still judged above, so a visible bad pin in it is reported as well.
+        unparsed="${unparsed:+$unparsed,}$label"
+      else
+        tokens="$tokens"$'\n'"$decoded"
+      fi
+    fi
+    tokens=$(printf '%s\n' "$tokens" | grep -v '^$' | awk '!seen[$0]++')
+    [ -n "$(printf '%s\n' "$tokens" | fleet_noncanonical)" ] && not_sha="${not_sha:+$not_sha,}$label"
+    [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$label"
+    pins=$(canonical_shas "$tokens")
+    while IFS= read -r sha; do
+      [ -z "$sha" ] && continue
+      count=$((count + 1))
+      v=$(pin_in_history "$sha")
+      case "$v" in
+        1) : ;;
+        0) [ -z "$bad" ] && bad="$sha"
+           case ",$bad_files," in *",$label,"*) ;; *) bad_files="${bad_files:+$bad_files,}$label" ;; esac ;;
+        *) [ -z "$unk" ] && unk="$sha"
+           case ",$unk_files," in *",$label,"*) ;; *) unk_files="${unk_files:+$unk_files,}$label" ;; esac ;;
+      esac
+    done <<< "$pins"
+  done <<< "$names"
+  local verdict=1 named="" files=""
+  if [ -n "$bad" ]; then verdict=0; named="$bad"; files="$bad_files"
+  elif [ -n "$unk" ]; then verdict=""; named="$unk"; files="$unk_files"
+  fi
+  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s;wf_not_sha=%s;wf_obfuscated=%s;wf_unparsed=%s;wf_no_parser=%s' \
+    "$count" "$verdict" "$named" "$files" "$unread" "$refused" "$not_sha" "$obf" "$unparsed" "$no_parser"
 }
 
 # --- the two-file lane (#1380, #1382) ------------------------------------------
@@ -625,11 +1010,71 @@ fork_pr_facts() {
 
 facts_for() {
   local repo="$1" tier="$2" want="$3"
-  local lane guard reaper events relay workflows
+  local lane guard reaper events relay workflows=""
   local has_lane=0 has_guard=0 has_reaper=0 has_events=0 has_relay=0 has_ci=""
+  # Per repository: the texts already read, so the workflow scan does not read
+  # them twice. facts_for runs in `$(…)`, but a direct call must not inherit
+  # another repository's files.
+  WORKFLOW_TEXT=()
 
-  workflows=$(api "repos/$OWNER/$repo/contents/.github/workflows" | jq -r '.[].name // empty' 2>/dev/null)
-  if [ -n "$workflows" ]; then
+  # THE LISTING COMES FROM THE GIT TREE, NEVER THE CONTENTS API (#1716). The
+  # contents API returns at most 1000 entries of a directory, alphabetically,
+  # with no paging: 1000 decoy files followed by `zz.yml` pinned to an imposter
+  # hid that file from the scan, and the repository read compliant. The trees
+  # API returns the whole directory or says `truncated: true`, and a truncated
+  # (or malformed) listing is unscanned — wf_listing_unreadable — never clean.
+  # The ref is `<default branch>:.github/workflows`, fully URL-encoded (GitHub
+  # 404s an unencoded `:` or `/` there), i.e. the tree file_at reads from.
+  # Only `blob` entries are workflows: GitHub runs top-level files of
+  # .github/workflows and nothing in a subdirectory, so a `tree` entry (or a
+  # submodule `commit`) is not a workflow and is skipped. A name holding a
+  # control character is emitted as `#CTRL ` + the name with each one turned
+  # to `?` (a newline would otherwise split it in two), and workflow_pin_facts
+  # refuses it — unscanned, which fails. Every other name is read as it is
+  # (#1716 round 6). By code point, not `gsub`: Oniguruma reads `\u0000-…` in
+  # a class as a range over ordinary letters and mangled every name.
+  #
+  # More than FLEET_MAX_WORKFLOWS workflow files is treated like truncation:
+  # the scan does not run, and the repository is unscanned (wf_over_ceiling).
+  #
+  # Only a whole tree with no files, or GitHub's own `Not Found` for the
+  # directory, means "no workflows". Any other unreadable answer (an empty
+  # body, a 5xx, a malformed one) leaves has_ci unknown, so the scan below
+  # reports the listing unreadable instead of reading it as no CI.
+  local branch tree listing listing_truncated=0 listing_absent=0 wf_count=0 over_ceiling=""
+  branch=$(api "repos/$OWNER/$repo" | jq -r '.default_branch // empty' 2>/dev/null | tr -d '\r')
+  if [ -n "$branch" ]; then
+    tree=$(api "repos/$OWNER/$repo/git/trees/$(printf '%s' "$branch:.github/workflows" | jq -sRr @uri | tr -d '\r')")
+    listing=$(printf '%s' "$tree" | jq -r 'if type=="object" and (.tree|type)=="array"
+        then (if .truncated == false then "#OK" else "#TRUNCATED" end),
+             (.tree[] | select(.type=="blob") | .path | strings
+              | if (explode | any(. < 32 or . == 127))
+                then "#CTRL " + (explode | map(if . < 32 or . == 127 then 63 else . end) | implode)
+                else . end)
+        else empty end' 2>/dev/null | tr -d '\r')
+    case "$listing" in
+      '#TRUNCATED'*) listing_truncated=1 ;;
+      '#OK'*) ;;
+      *) printf '%s' "$tree" | jq -e 'type=="object" and .message=="Not Found"' >/dev/null 2>&1 \
+           && listing_absent=1 ;;
+    esac
+    workflows=$(printf '%s\n' "$listing" | sed '1d')
+    wf_count=$(printf '%s\n' "$workflows" | grep -ciE '\.ya?ml$') || wf_count=0
+    if [ "$wf_count" -gt "$FLEET_MAX_WORKFLOWS" ]; then
+      listing_truncated=1
+      over_ceiling="$wf_count"
+    fi
+  fi
+  if [ "$listing_truncated" = "1" ]; then
+    # Some of the directory is missing, so the scan below never runs on it.
+    # The named callers are still looked for among the names that did arrive.
+    has_ci=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane.yml' >/dev/null && has_lane=1
+    printf '%s\n' "$workflows" | grep -cx 'pr-guard-self.yml' >/dev/null && has_guard=1
+    printf '%s\n' "$workflows" | grep -cx 'branch-reaper-self.yml' >/dev/null && has_reaper=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-events.yml' >/dev/null && has_events=1
+    printf '%s\n' "$workflows" | grep -cx 'merge-lane-review-relay.yml' >/dev/null && has_relay=1
+  elif [ -n "$workflows" ]; then
     has_ci=1
     # `grep -cx … >/dev/null`, never `grep -qx`. Under `pipefail` a `-q` reader
     # exits on its first match while the in-process writer is still going, the
@@ -645,7 +1090,13 @@ facts_for() {
     # two must not render alike. The repository itself answers: a repository
     # that exists with a default branch and no `.github` directory is the
     # former, and a 404 on the repository is the latter.
-    api "repos/$OWNER/$repo" | jq -e '.default_branch' >/dev/null 2>&1 && has_ci=0
+    # Only a whole tree with no files, or `Not Found` for the directory, is
+    # "no workflows"; an empty or malformed tree response leaves has_ci
+    # unknown, so the scan reports the listing unreadable (#1716 round 6).
+    if [ -n "$branch" ]; then
+      case "$listing" in '#OK'*) has_ci=0 ;; esac
+      [ "$listing_absent" = "1" ] && has_ci=0
+    fi
   fi
 
   local facts="tier=$tier;has_lane=$has_lane;has_guard=$has_guard;has_reaper=$has_reaper"
@@ -653,22 +1104,23 @@ facts_for() {
 
   if [ "$has_lane" = "1" ]; then
     lane=$(file_at "$repo" ".github/workflows/merge-lane.yml")
+    WORKFLOW_TEXT[merge-lane.yml]="$lane"
     # Every pin also carries whether it is in the fleet's history (#1715): one
     # cached compare per distinct SHA, so the guard and reaper ride along free.
-    local pin
-    pin=$(pin_in "$lane" 'merge-lane\.yml')
-    facts="$facts;lane_pin=$pin;lane_pin_in_history=$(pin_in_history "$pin")"
+    # EVERY non-comment pin is judged, worst verdict wins (#1716).
+    facts="$facts;$(caller_pin_facts lane "$lane" 'merge-lane\.yml')"
     facts="$facts;has_events=$has_events"
     [ "$has_events" = "1" ] && {
       # The events file calls the same callee, so it carries the same kind of
       # pin — and drifts from merge-lane.yml's exactly the way the guard and
       # reaper pins drifted from each other.
       events=$(file_at "$repo" ".github/workflows/merge-lane-events.yml")
-      pin=$(pin_in "$events" 'merge-lane\.yml')
-      facts="$facts;events_pin=$pin;events_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[merge-lane-events.yml]="$events"
+      facts="$facts;$(caller_pin_facts events "$events" 'merge-lane\.yml')"
       facts="$facts;with_match=$(with_agrees "$lane" "$events")"
       if [ "$has_relay" = "1" ]; then
         relay=$(file_at "$repo" ".github/workflows/merge-lane-review-relay.yml")
+        WORKFLOW_TEXT[merge-lane-review-relay.yml]="$relay"
         facts="$facts;relay_match=$(relay_agrees "$events" "$relay")"
       else
         # No relay at all: whatever name the events file listens for, nothing
@@ -678,13 +1130,13 @@ facts_for() {
     }
     [ "$has_guard" = "1" ] && {
       guard=$(file_at "$repo" ".github/workflows/pr-guard-self.yml")
-      pin=$(pin_in "$guard" 'pr-guard\.yml')
-      facts="$facts;guard_pin=$pin;guard_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[pr-guard-self.yml]="$guard"
+      facts="$facts;$(caller_pin_facts guard "$guard" 'pr-guard\.yml')"
     }
     [ "$has_reaper" = "1" ] && {
       reaper=$(file_at "$repo" ".github/workflows/branch-reaper-self.yml")
-      pin=$(pin_in "$reaper" 'branch-reaper\.yml')
-      facts="$facts;reaper_pin=$pin;reaper_pin_in_history=$(pin_in_history "$pin")"
+      WORKFLOW_TEXT[branch-reaper-self.yml]="$reaper"
+      facts="$facts;$(caller_pin_facts reaper "$reaper" 'branch-reaper\.yml')"
     }
 
     # A 403 AND AN EMPTY LIST ARE THE SAME BYTES HERE, so the exit status is
@@ -709,6 +1161,24 @@ facts_for() {
     facts="$facts;checks_match=$(checks_agree "$lane" "$repo")"
     facts="$facts;ruleset=$(api "repos/$OWNER/$repo/rulesets" | jq -r 'if type=="array" then (if length>0 then 1 else 0 end) else empty end' 2>/dev/null)"
   fi
+
+  # Every workflow's fleet pins (#1716), in the tiers whose rule judges them.
+  # `source` calls itself through local paths; `dormant` and `empty` are judged
+  # only for having CI at all. The named callers' texts are reused, not re-read.
+  case "$tier" in
+    pool|lane|checks)
+      if [ "$listing_truncated" = "0" ] && [ -n "$workflows" ]; then
+        facts="$facts;$(workflow_pin_facts "$repo" "$workflows")"
+      elif [ "$has_ci" != "0" ]; then
+        # The listing failed or was truncated (has_ci=0 is a readable
+        # repository with no workflows, which has nothing to scan). Unscanned
+        # is never clean: the rule FAILS it. Over the workflow ceiling the
+        # count and the ceiling ride along so the finding can say which.
+        facts="$facts;wf_scanned=1;wf_listing_unreadable=1"
+        [ -n "$over_ceiling" ] && facts="$facts;wf_over_ceiling=$over_ceiling;wf_max_workflows=$FLEET_MAX_WORKFLOWS"
+      fi
+      ;;
+  esac
 
   # The source repository is the only one with an unreleased backlog to have:
   # it is what every other repository pins. Collected only here, because these

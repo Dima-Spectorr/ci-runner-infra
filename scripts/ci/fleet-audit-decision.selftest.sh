@@ -182,6 +182,110 @@ hasnt "pin-history-unknown" "an unreadable pin gets no provenance finding" \
 hasnt "guard-pin-history" "a missing caller is not judged for provenance" \
   "$(swap has_guard 0 | sed 's/;guard_pin=[^;]*/;guard_pin=/;s/;guard_pin_in_history=[^;]*/;guard_pin_in_history=/')"
 
+# --- every pin, every workflow (#1716) ------------------------------------------
+# The collector judges EVERY pin in a caller, worst wins, and names
+# the pin that made the verdict — which need not be the first one the stale
+# rule reads (a second job, or the real line under a commented decoy).
+IMPOSTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+has "fail:lane-pin-not-in-fleet-history pin=eeeeeeee" "a caller's verdict names the imposter pin, not its first pin" \
+  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER"
+has "warn:guard-pin-history-unknown pin=eeeeeeee" "an unknown verdict names the pin it is about" \
+  "$(swap guard_pin_in_history '');guard_history_pin=$IMPOSTER"
+hasnt "fail:lane-pin-stale" "the first pin is still the expected release, so it is not stale" \
+  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER;lane_pins=$WANT"
+# Two pins in one caller, the second an older release: stale, naming it.
+has "fail:lane-pin-stale pin=bbbbbbbb" "two pins, one stale, is stale and names the stale pin" \
+  "$HEALTHY_POOL;lane_pins=$WANT,$OLD"
+has "fail:guard-pin-stale pin=bbbbbbbb" "the stale pin need not be the first" \
+  "$HEALTHY_POOL;guard_pins=$WANT,$OLD"
+hasnt "pin-stale" "every pin at the expected release is not stale" \
+  "$HEALTHY_POOL;lane_pins=$WANT;guard_pins=$WANT;reaper_pins=$WANT"
+
+# The scan over every workflow file.
+WF_OK="wf_scanned=1;wf_pins=5;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0"
+wf() { printf '%s;%s' "$1" "$(printf '%s' "$WF_OK" | sed "s/$2=[^;]*/$2=$3/")"; }
+has "ok:compliant" "every pin in every workflow in history is quiet" "$HEALTHY_POOL;$WF_OK"
+hasnt "workflow-pin" "and says nothing about the scan" "$HEALTHY_POOL;$WF_OK"
+hasnt "workflow-pin" "a scan that did not run says nothing (old collectors)" "$HEALTHY_POOL"
+has "fail:workflow-pin-not-in-fleet-history pin=eeeeeeee files=deploy.yml,ci.yml" \
+  "an imposter pin in an extra workflow file fails, naming the files" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history 0 | sed "s/wf_history_pin=/wf_history_pin=$IMPOSTER/;s/wf_history_files=/wf_history_files=deploy.yml,ci.yml/")"
+has "warn:workflow-pin-history-unknown" "an unknown provenance in an extra file is a warning" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history '')"
+has "warn:workflow-pin-history-unknown" "a malformed scan verdict is unknown, not a pass" \
+  "$(wf "$HEALTHY_POOL" wf_pin_in_history yes)"
+has "fail:workflow-pin-unread files=gone.yml,big.yml" "an unread workflow file (over 1 MB, or gone) fails, naming it" \
+  "$(wf "$HEALTHY_POOL" wf_unread gone.yml,big.yml)"
+hasnt "ok:compliant" "an unread workflow file is never compliant" \
+  "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
+hasnt "workflow-pin-unscanned" "an unread file is its own failure, not an unscanned-listing one" \
+  "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
+has "fail:workflow-pin-unread files=big.yml" "an unread file fails in the checks tier too" \
+  "$(wf "tier=checks;has_ci=1" wf_unread big.yml)"
+has "fail:workflow-pin-unscanned refused=1" "a refused workflow name is unscanned, and FAILS (round 6)" \
+  "$(wf "$HEALTHY_POOL" wf_refused 1)"
+hasnt "ok:compliant" "a refused workflow name is never compliant" \
+  "$(wf "$HEALTHY_POOL" wf_refused 1)"
+hasnt "warn:workflow-pin" "no unscanned outcome is a warning any more" \
+  "$(wf "$HEALTHY_POOL" wf_refused 2);wf_listing_unreadable=1"
+has "fail:workflow-pin-unscanned refused=yes" "a malformed refused count is unscanned, never quiet" \
+  "$(wf "$HEALTHY_POOL" wf_refused yes)"
+hasnt "workflow-pin-unread" "an empty unread fact is quiet" "$HEALTHY_POOL;$WF_OK"
+has "fail:workflow-pin-not-in-fleet-history" "a checks repository's imposter pin fails too" \
+  "$(wf "tier=checks;has_ci=1" wf_pin_in_history 0)"
+has "ok:compliant tier=checks" "a checks repository whose pins are all in history is compliant" \
+  "tier=checks;has_ci=1;$WF_OK"
+has "fail:workflow-pin-not-in-fleet-history" "a repository with no lane caller is still scanned" \
+  "$(wf "tier=lane;has_lane=0" wf_pin_in_history 0)"
+hasnt "workflow-pin" "the source repository is not judged by the scan" \
+  "$(wf "$HEALTHY_SOURCE" wf_pin_in_history 0)"
+
+# Round 2 of the security review: a fleet ref that is not a SHA fails, an
+# escape that could spell one warns, and a listing that could not be read is
+# unscanned — in every tier the scan runs in.
+HEALTHY_LANE="${HEALTHY_POOL/tier=pool/tier=lane}"
+for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;has_ci=1"; do
+  T="${BASE%%;*}"; T="${T#tier=}"; case "$BASE" in *has_lane=0*) T="$T-no-lane" ;; esac
+  has "fail:workflow-pin-not-a-sha files=tag.yml,CI.YML" "a tag or branch fleet ref fails ($T)" \
+    "$BASE;$WF_OK;wf_not_sha=tag.yml,CI.YML"
+  has "warn:workflow-pin-obfuscated files=esc.yml" "an escape on a uses line warns ($T)" \
+    "$BASE;$WF_OK;wf_obfuscated=esc.yml"
+  has "fail:workflow-pin-unscanned workflows-listing-unreadable" "an unreadable listing is unscanned and fails ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1"
+  hasnt "ok:compliant" "an unreadable listing is never compliant ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1"
+  # Round 6: a refused name and a repository over the workflow ceiling are
+  # unscanned too, and every unscanned outcome is a `fail:`, never a `warn:`.
+  has "fail:workflow-pin-unscanned refused=3" "a refused name fails ($T)" \
+    "$BASE;$WF_OK;wf_refused=3"
+  hasnt "ok:compliant" "a refused name is never compliant ($T)" "$BASE;$WF_OK;wf_refused=3"
+  has "fail:workflow-pin-unscanned workflows-over-ceiling count=501 max=500" "a repository over the workflow ceiling fails ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=501;wf_max_workflows=500"
+  hasnt "ok:compliant" "a repository over the workflow ceiling is never compliant ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=501;wf_max_workflows=500"
+  hasnt "warn:workflow-pin-scan-incomplete" "no unscanned outcome is a warning ($T)" \
+    "$BASE;wf_scanned=1;wf_refused=1;wf_listing_unreadable=1"
+  hasnt "workflow-pin-unscanned" "a whole listing with no refused name is quiet ($T)" "$BASE;$WF_OK"
+  hasnt "workflow-pin-not-a-sha" "an empty not-a-sha fact is quiet ($T)" "$BASE;$WF_OK;wf_not_sha="
+  hasnt "workflow-pin-obfuscated" "an empty obfuscated fact is quiet ($T)" "$BASE;$WF_OK;wf_obfuscated="
+  # Round 3/4: a file the parser cannot load, or a run with no parser, FAILS —
+  # GitHub runs a file the audit could not decode, so it never reads clean.
+  has "fail:workflow-pin-unparsed files=bad.yml,x.yaml" "a file the parser cannot load fails ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml,x.yaml;wf_no_parser=0"
+  hasnt "ok:compliant" "a file the parser cannot load is never compliant ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
+  hasnt "workflow-pin-unscanned" "an unparsed file is its own failure, not an unscanned one ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
+  has "fail:workflow-pin-yaml-parser-unavailable" "a missing YAML parser fails ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
+  hasnt "ok:compliant" "a run with no YAML parser is never compliant ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
+  hasnt "workflow-pin-unscanned" "a parsed scan with every file loaded is quiet ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=0"
+done
+hasnt "workflow-pin" "the source repository ignores the new facts too" \
+  "$HEALTHY_SOURCE;$WF_OK;wf_not_sha=a.yml;wf_obfuscated=b.yml;wf_listing_unreadable=1"
+
 # --- the two-file lane (#1382) ----------------------------------------------------
 # The healthy pool with a healthy events file beside the pool caller. Each case
 # is this string with one fact changed.
