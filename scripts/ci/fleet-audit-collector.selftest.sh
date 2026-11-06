@@ -747,25 +747,25 @@ ci.yml
 deploy.yaml
 README.md"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
    "an imposter pin in an extra workflow file fails, naming the file"
 eq "$(grep -c '/contents/' "$PROV_CALLS")" "2" "only the files not already read are fetched, and non-YAML is skipped"
 eq "$(grep -c 'contents/.github/workflows/merge-lane.yml' "$PROV_CALLS")" "0" "the named caller's text is reused"
 
 FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$GOOD}")\"}"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
    "every pin in every workflow in history is quiet"
 
 FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$UNK}")\"}"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
    "an unknown provenance in an extra file is unknown, naming the file"
 
 # shellcheck disable=SC2034  # read by workflow_pin_facts
 WORKFLOW_TEXT=()
 eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na;b.yml\r\n')")" \
-   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1;wf_not_sha=;wf_obfuscated=" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
    "an unreadable file and an unsafe name are reported as unscanned, never clean"
 
 # Upper-case extensions run exactly like lower-case ones, so they are scanned;
@@ -774,8 +774,54 @@ FILE_BY_PATH=([.github/workflows/CI.YML]="{\"content\":\"$(b64 "$OTHER")\"}"
               [.github/workflows/tag.Yaml]="{\"content\":\"$(b64 "    uses: $CALLEE@v5")\"}"
               [.github/workflows/esc.yml]="{\"content\":\"$(b64 "    uses: \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\"")\"}")
 eq "$(workflow_pin_facts svc-a "$(printf 'CI.YML\ntag.Yaml\nesc.yml\nnotes.TXT')")" \
-   "wf_scanned=1;wf_pins=1;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=CI.YML;wf_unread=;wf_refused=0;wf_not_sha=tag.Yaml;wf_obfuscated=esc.yml" \
-   "an upper-case .YML is scanned, a tag ref is not-a-sha, an escape is obfuscated"
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=CI.YML,esc.yml;wf_unread=;wf_refused=0;wf_not_sha=tag.Yaml;wf_obfuscated=esc.yml;wf_unparsed=;wf_no_parser=0" \
+   "an upper-case .YML is scanned, a tag ref is not-a-sha, an escape is obfuscated AND decoded"
+
+# Security review round 3: escaped YAML spelled a fleet call no grep saw. Each
+# probe is decoded by the parser and must FAIL (all four pin `@main`). The YAML
+# is written byte for byte as the reviewer's files, single-quoted here so bash
+# leaves every backslash alone.
+# shellcheck disable=SC2016
+P1='jobs:
+  a:
+    "\x75ses": "acme/ci-runner-in\x66ra/.git\x68ub/workflows/merge-lane.yml@main"'
+P2='jobs:
+  a:
+    uses: # pinned
+      "acme/ci-runner-in\x66ra/.github\x2fworkflows/merge-lane.yml@main"'
+P3='jobs:
+  a:
+    ? uses
+    : "acme/ci-runner-in\x66ra/.github\x2fworkflows/merge-lane.yml@main"'
+P4='jobs:
+  a: {"us\u0065s": "acme/ci-runner-\u0069nfra/.github\u002fworkflows/merge-lane.yml@main"}'
+P5='jobs:
+  a:
+    "\x75ses": "acme/ci-runner-infra/.github/workflows/merge-lane.yml@'"$BAD"'"'
+FILE_BY_PATH=([.github/workflows/p1.yml]="{\"content\":\"$(b64 "$P1")\"}"
+              [.github/workflows/p2.yml]="{\"content\":\"$(b64 "$P2")\"}"
+              [.github/workflows/p3.yml]="{\"content\":\"$(b64 "$P3")\"}"
+              [.github/workflows/p4.yml]="{\"content\":\"$(b64 "$P4")\"}")
+eq "$(workflow_pin_facts svc-a "$(printf 'p1.yml\np2.yml\np3.yml\np4.yml')" | grep -o 'wf_not_sha=[^;]*')" \
+   "wf_not_sha=p1.yml,p2.yml,p3.yml,p4.yml" "every escaped, next-line and explicit-key fleet call is decoded and fails as not-a-sha"
+for P in "$P1" "$P2" "$P3" "$P4"; do
+  eq "$(decoded_fleet_refs "$P")" "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main" "the parser decodes the probe to the fleet ref it spells"
+done
+FILE_BY_PATH=([.github/workflows/p5.yml]="{\"content\":\"$(b64 "$P5")\"}")
+eq "$(workflow_pin_facts svc-a p5.yml | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+   "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=p5.yml" "an escaped imposter SHA is decoded and fails provenance"
+
+# A file the parser cannot load is judged on its text alone and named, and a
+# missing parser skips the decoded layer for every file — both partial scans.
+FILE_BY_PATH=([.github/workflows/bad.yml]="{\"content\":\"$(b64 'jobs: [unclosed')\"}")
+eq "$(workflow_pin_facts svc-a bad.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=bad.yml;wf_no_parser=0" \
+   "a workflow the parser cannot load is reported as unparsed"
+FILE_BY_PATH=([.github/workflows/p4.yml]="{\"content\":\"$(b64 "$P4")\"}")
+# shellcheck disable=SC2317  # the override is called by workflow_pin_facts
+eq "$(ensure_yaml() { return 1; }; workflow_pin_facts svc-a p4.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=;wf_no_parser=1" \
+   "no YAML parser is reported, never a clean scan"
+eq "$(decoded_fleet_refs "$(printf 'a: &x [*x, "ci-runner-infra/.github/workflows/y.yml@v1"]')")" "ci-runner-infra/.github/workflows/y.yml@v1" \
+   "a recursive alias does not hang the decoder"
 
 # A workflows listing that could not be read is unscanned in every tier that
 # scans, never a clean scan with nothing in it.

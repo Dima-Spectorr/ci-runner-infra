@@ -243,6 +243,13 @@ for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;
     "$BASE;wf_scanned=1;wf_listing_unreadable=1"
   hasnt "workflow-pin-not-a-sha" "an empty not-a-sha fact is quiet ($T)" "$BASE;$WF_OK;wf_not_sha="
   hasnt "workflow-pin-obfuscated" "an empty obfuscated fact is quiet ($T)" "$BASE;$WF_OK;wf_obfuscated="
+  # Round 3: the decoded layer's own partial scans.
+  has "warn:workflow-pin-scan-incomplete unread=none refused=0 unparsed=bad.yml" "a file the parser cannot load is unscanned ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
+  has "warn:workflow-pin-scan-incomplete yaml-parser-unavailable" "a missing YAML parser is a partial scan ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
+  hasnt "workflow-pin-scan-incomplete" "a parsed scan with every file loaded is quiet ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=0"
 done
 hasnt "workflow-pin" "the source repository ignores the new facts too" \
   "$HEALTHY_SOURCE;$WF_OK;wf_not_sha=a.yml;wf_obfuscated=b.yml;wf_listing_unreadable=1"

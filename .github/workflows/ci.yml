@@ -939,7 +939,14 @@ jobs:
       # aggregate, which IS the required name, so the assertions gate merges
       # without anything outside this file having to change.
       - name: fleet-audit collector self-test
-        run: bash scripts/ci/fleet-audit-collector.selftest.sh
+        run: |
+          # The pin scan's decoded layer needs PyYAML (#1716); same guard as
+          # the other PyYAML readers in this pipeline.
+          python3 -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          }
+          bash scripts/ci/fleet-audit-collector.selftest.sh
 
       # The lost-pass retry (#1463) also runs from a schedule on the default
       # branch, and it ACTS — a dispatch in another repository. Its rule and its

@@ -115,6 +115,16 @@ workflow file. Every `ci-runner-infra/.github/workflows/<x>@<sha>` in it is
 judged the same way. A pin is a SHA only when the 40 hex characters end the
 ref: `@<40 hex>x` is a branch or tag that starts like one.
 
+**Decoded, not only read.** YAML is not text: `"\x75ses"` is the key `uses`,
+`/` is `/`, a `uses:` value can sit on the line after a comment, and
+`? uses` / `: "…"` is an explicit key — each spelled a fleet call no text match
+saw. So every workflow is also loaded with PyYAML (the parser
+`check-runner-policy.sh` already uses; the audit job installs `python3-yaml`
+when the runner lacks it), and every string the documents yield — keys and
+values, aliases resolved — that names `ci-runner-infra/.github/workflows/` is
+judged by the same rules. The literal scan stays as the first layer, so a
+commented pin (which a parser drops) still counts.
+
 - `fail:workflow-pin-not-a-sha files=<a.yml,…>` — a fleet reference whose ref is
   not exactly a 40-hex SHA: a tag (`@v5`), a branch (`@main`), a short SHA,
   `refs/pull/<n>/head`, `<40 hex>x`, or nothing at all. Whatever the ref points
@@ -136,9 +146,12 @@ ref: `@<40 hex>x` is a branch or tag that starts like one.
   own line.
 - `warn:workflow-pin-history-unknown pin=<sha8> files=…` — no imposter, but some
   pin's provenance could not be established.
-- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n>` — a file whose
-  read came back empty, or a name the audit will not put in a URL, was not
-  scanned. An unscanned file is never a clean one.
+- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n> [unparsed=<files>]`
+  — a file whose read came back empty, or a name the audit will not put in a
+  URL, was not scanned; an `unparsed` file did not load in the YAML parser and
+  was judged on its literal text only. An unscanned file is never a clean one.
+- `warn:workflow-pin-scan-incomplete yaml-parser-unavailable decoded-layer-skipped`
+  — no PyYAML was found, so no file was decoded.
 
 ### The two-file lane
 

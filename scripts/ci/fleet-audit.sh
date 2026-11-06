@@ -173,6 +173,83 @@ obfuscated_in() {
     END { if (found) print 1 }'
 }
 
+# --- the decoded layer (#1716, security review round 3) -----------------------
+# Every check above reads the file AS TEXT, and YAML is not text: `"uses"`
+# is the key `uses`, `ci-runner-infra` is `ci-runner-infra`, `\x2f` is `/`,
+# a `uses:` value can sit under a comment on the next line, and `? uses` /
+# `: "…"` is an explicit key. Each of those spelled a fleet call no grep saw.
+# So every workflow is also DECODED with a real YAML parser and every string the
+# document yields — keys and values, anchors resolved, every document in the
+# stream — that names `ci-runner-infra/.github/workflows/` is fed to the same
+# extractors as the raw text. The literal scan stays as the first layer, so a
+# commented pin (which a parser drops) is still judged.
+#
+# The parser is PyYAML, the reader check-runner-policy.sh already depends on;
+# py_usable/ensure_yaml are that script's (copied, not sourced: sourcing it
+# runs the gate). The audit job installs python3-yaml when the runner lacks it.
+# A missing parser, or a file it cannot load, is an unscanned file — a warning,
+# never a pass.
+export PY_BIN="${PY_BIN:-}"
+py_usable() {
+  command -v "$1" >/dev/null 2>&1 &&
+    "$1" -I -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1
+}
+
+ensure_yaml() {
+  local c
+  if [ -n "$PY_BIN" ]; then
+    py_usable "$PY_BIN" && return 0
+    PY_BIN=""
+  fi
+  for c in python3 /usr/bin/python3 /usr/bin/python /usr/local/bin/python3 python; do
+    if py_usable "$c"; then
+      PY_BIN="$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The decoder. The workflow arrives on stdin (no argv size limit), every fleet-
+# naming string leaves on its own line with its whitespace collapsed, and a
+# document that does not load prints `#ERR` alone. The walk is breadth-first in
+# document order and tracks containers by id, because a YAML alias can make the
+# structure recursive.
+DECODE_PY='
+import re, sys
+from collections import deque
+import yaml
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(newline="\n", encoding="utf-8")
+FLEET = re.compile(r"ci-runner-infra/\.github/workflows/", re.I)
+try:
+    docs = list(yaml.safe_load_all(sys.stdin.buffer.read().decode("utf-8")))
+except Exception:
+    print("#ERR")
+    sys.exit(0)
+seen, queue = set(), deque(docs)
+while queue:
+    node = queue.popleft()
+    if isinstance(node, (dict, list)):
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            for key, value in node.items():
+                queue.append(key)
+                queue.append(value)
+        else:
+            queue.extend(node)
+    elif isinstance(node, str) and FLEET.search(node):
+        print(" ".join(node.split()))
+'
+
+# decoded_fleet_refs <file-contents> — the decoded strings, one per line, or
+# `#ERR` when the document does not load. Needs ensure_yaml to have succeeded.
+decoded_fleet_refs() {
+  printf '%s' "$1" | "${PY_BIN:-python3}" -I -c "$DECODE_PY" 2>/dev/null || echo "#ERR"
+}
+
 # pin_in <file-contents> <callee> — the first pin. Both the stale rule and
 # provenance judge EVERY pin, through `<caller>_pins` and pins_history.
 pin_in() {
@@ -274,7 +351,7 @@ caller_pin_facts() {
 #
 # The named callers above are four files. Any other workflow can call a fleet
 # reusable workflow at an imposter SHA, so every `.github/workflows/*.y(a)ml`
-# is read and every non-comment `ci-runner-infra/.github/workflows/<x>@<sha>`
+# is read and every `ci-runner-infra/.github/workflows/<x>@<sha>`
 # in it is judged for provenance. Cost: one read per workflow file not already
 # read for the named callers (WORKFLOW_TEXT), plus one compare per DISTINCT SHA
 # in the run (pin_in_history's cache) — the listing is the one facts_for has.
@@ -287,11 +364,16 @@ declare -A WORKFLOW_TEXT=()
 #   came back empty — an unread file is unscanned, never clean), wf_refused
 #   (names not safe to put in a URL or a fact, also unscanned), wf_not_sha
 #   (files holding a fleet reference whose ref is not a 40-hex SHA),
-#   wf_obfuscated (files where an escape could spell one — obfuscated_in).
+#   wf_obfuscated (files where an escape could spell one — obfuscated_in),
+#   wf_unparsed (files the YAML parser could not load: judged on their
+#   literal text only), wf_no_parser (1 when no PyYAML was found, so no file
+#   was decoded). Both mean a partial scan.
 #   facts_for adds wf_listing_unreadable=1 instead when the listing failed.
 workflow_pin_facts() {
   local repo="$1" names="$2" name text pins sha v count=0 refused=0
   local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
+  local unparsed="" no_parser=0 decoded
+  ensure_yaml || no_parser=1
   while IFS= read -r name; do
     name="${name%$'\r'}"
     # Any case: `CI.YML` runs exactly like `ci.yml`, so it is scanned too.
@@ -308,6 +390,17 @@ workflow_pin_facts() {
     if [ -z "$text" ]; then
       unread="${unread:+$unread,}$name"
       continue
+    fi
+    # The literal text first (comments count), then what the parser decodes.
+    # A file the parser cannot load is still judged on its literal text, and
+    # is named as unparsed — a partial scan, never a clean one.
+    if [ "$no_parser" = "0" ]; then
+      decoded=$(decoded_fleet_refs "$text")
+      if printf '%s\n' "$decoded" | grep -cx '#ERR' >/dev/null; then
+        unparsed="${unparsed:+$unparsed,}$name"
+      else
+        text="$text"$'\n'"$decoded"
+      fi
     fi
     [ -n "$(refs_not_sha_in "$text")" ] && not_sha="${not_sha:+$not_sha,}$name"
     [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$name"
@@ -329,8 +422,8 @@ workflow_pin_facts() {
   if [ -n "$bad" ]; then verdict=0; named="$bad"; files="$bad_files"
   elif [ -n "$unk" ]; then verdict=""; named="$unk"; files="$unk_files"
   fi
-  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s;wf_not_sha=%s;wf_obfuscated=%s' \
-    "$count" "$verdict" "$named" "$files" "$unread" "$refused" "$not_sha" "$obf"
+  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s;wf_not_sha=%s;wf_obfuscated=%s;wf_unparsed=%s;wf_no_parser=%s' \
+    "$count" "$verdict" "$named" "$files" "$unread" "$refused" "$not_sha" "$obf" "$unparsed" "$no_parser"
 }
 
 # --- the two-file lane (#1380, #1382) ------------------------------------------
