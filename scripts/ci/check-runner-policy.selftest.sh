@@ -459,6 +459,14 @@ mutate "the bracket spellings of an input are missed" \
   's@r"(?i)inputs(?:\\.|@r"(?i)inputs(?:\\.|NEVER@'
 mutate "a callee's matrix-built runs-on inputs are never read" \
   's@                    out("#RUNSONMATRIXINPUT", vid, in_name)@                    pass@'
+# #1718: the anchor's host passed whole is the pin, not a lane risk. Matched by
+# substring, `|| vars.POOL` beside it rides the exemption; without the owner
+# check, a non-owner's `runs-on` output does.
+mutate "the anchor-host exemption matches a substring" \
+  's@WITH_ANCHOR_HOST_ONLY.fullmatch(w_value)@NEEDS_RUNS_ON.search(w_value)@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "the anchor-host exemption skips the owner check" \
+  's@if \[ -n "$a_job" \] && owner_job "$file" "$records" "$a_job" </dev/null; then@if [ -n "$a_job" ]; then@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -703,8 +711,9 @@ CASES="$(case_list | wc -l)"
 # this line used to say. 83 with the computed-pool cases for a non-lane callee
 # (#1718, +3), 88 when the security review added five more (#1718: the
 # unreadable callee, the whole-value matrix exception, the escaped leg, the
-# bracket input spelling, the callee's matrix-built input).
-FLOOR=88
+# bracket input spelling, the callee's matrix-built input). 90 with the
+# anchor-host exemption's two guards (#1718: whole match, owner check).
+FLOOR=90
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

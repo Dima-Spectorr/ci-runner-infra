@@ -419,6 +419,11 @@ ensure_yaml() {
 #                                    `${{ matrix.<key> }}` over a literal matrix
 #                                    the reader resolved; a non-lane
 #                                    callee's pool input is both hosts (#1718)
+#   #WITHANCHORHOST	<id>	<name>	<job>  beside `#WITHCOMPUTED`: every computed
+#                                    value of the input is, WHOLE, one
+#                                    `${{ needs.<job>.outputs.runs-on }}`; the
+#                                    shell exempts it when <job> is the caller's
+#                                    shared-infra owner (#1718)
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -552,6 +557,12 @@ MATRIX_REF = re.compile(r"(?i)(?<![A-Za-z0-9_.-])matrix(?![A-Za-z0-9_-])")
 # (`${{ matrix.pool }}`, `${{ Matrix['pool'] }}`): its value is a leg of the
 # matrix, which the reader resolves itself (#1718).
 MATRIX_ONLY_EXPR = re.compile(r"(?i)\$\{\{\s*matrix(?:\.[A-Za-z0-9_-]+|\[\s*'[^'\\]*'\s*\])+\s*\}\}")
+# A `with:` value that is ONE reference to a job's published host and nothing
+# else (`${{ needs.anchor.outputs.runs-on }}`), matched WHOLE (#1718). When the
+# shell finds that job is the caller's shared-infra owner, the value is the
+# run's anchor host — RUNNER9's pin — not a computed pool. No fallback, no
+# second reference, no text either side: each of those can build `-lane`.
+WITH_ANCHOR_HOST_ONLY = re.compile(r"\$\{\{\s*needs\.([A-Za-z0-9_-]+)\.outputs\.runs-on\s*\}\}")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -1106,7 +1117,14 @@ for job_id, job in jobs.items():
             # (fail-closed): literal text beside the reference (`${{ matrix.a
             # }}ne` over `a: [X-la]` builds `X-lane`), two references, a list
             # item, a fallback, `toJSON(matrix)`, a computed matrix.
+            #
+            # The anchor's host passed whole is recorded beside it as
+            # `#WITHANCHORHOST` with the job it names, for the shell to judge
+            # against the caller's owner. Only when EVERY computed value of the
+            # name is that form, naming one job: `RUNS-ON:` set to the anchor
+            # must not cover a `runs-on:` beside it set to `${{ vars.POOL }}`.
             w_names = []
+            w_anchor = {}
             for w_key, w_value in with_block.items():
                 if w_value is None:
                     continue
@@ -1117,8 +1135,15 @@ for job_id, job in jobs.items():
                     w_name = str(w_key).lower()
                     if w_name not in w_names:
                         w_names.append(w_name)
+                    a_m = WITH_ANCHOR_HOST_ONLY.fullmatch(w_value) if isinstance(w_value, str) else None
+                    a_job = a_m.group(1) if a_m else None
+                    if w_anchor.get(w_name, a_job) != a_job:
+                        a_job = None
+                    w_anchor[w_name] = a_job
             for w_name in w_names:
                 out("#WITHCOMPUTED", vid, w_name)
+                if w_anchor.get(w_name):
+                    out("#WITHANCHORHOST", vid, w_name, w_anchor[w_name])
 
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
@@ -1742,6 +1767,27 @@ EOF
     if [ "$merge_lane_any" -eq 0 ] && [ -n "$call_target" ]; then
       local computed_inputs callee_path callee_records callee_inputs computed_pool=0 c_name
       computed_inputs="$(printf '%s\n' "$records" | sed -n "s/^#WITHCOMPUTED\t${job_re}\t//p")"
+      # One computed value is not a pool: the anchor's own published host,
+      # passed WHOLE (`${{ needs.<anchor>.outputs.runs-on }}`), to a callee
+      # that routes on it. That is RUNNER9's pin — the shape every consumer of
+      # the shared-infra anchor takes — and the anchor is the job
+      # `caller_passes_anchor` accepts: an owner of the caller's stack. With
+      # --shared-infra off there is no anchor, and no exemption. A fallback,
+      # another output, or a job that only publishes a pool stays computed.
+      if [ "$SHARED_INFRA" -eq 1 ] && [ -n "$computed_inputs" ]; then
+        local a_job kept=""
+        while IFS= read -r c_name; do
+          [ -n "$c_name" ] || continue
+          a_job="$(printf '%s\n' "$records" | sed -n "s/^#WITHANCHORHOST\t${job_re}\t$(re_quote "$c_name")\t//p")"
+          if [ -n "$a_job" ] && owner_job "$file" "$records" "$a_job" </dev/null; then
+            continue
+          fi
+          kept="${kept}${c_name}"$'\n'
+        done <<EOF
+$computed_inputs
+EOF
+        computed_inputs="$kept"
+      fi
       if [ -n "$computed_inputs" ]; then
         if [ "$(printf '%s\n' "$computed_inputs" | grep -cxF -- "runs-on")" -gt 0 ]; then
           computed_pool=1
@@ -3659,7 +3705,8 @@ jobs:
 
   # The slot's NAME inside an expression is read too, not only its suffix:
   # another repository's slot there is RUNNER2.
-  expect "a foreign slot inside a with: expression is RUNNER2" "RUNNER2" "ExampleRepo" blocked \
+  # #1718: the computed `runs-on` may also resolve to the lane host, so RUNNER18/20 too.
+  expect "a foreign slot inside a with: expression is RUNNER2" "RUNNER18 RUNNER2 RUNNER20" "ExampleRepo" blocked \
 'on: [push]
 jobs:
   gate:
@@ -5314,8 +5361,25 @@ jobs:
   expect_si_callee "a required input passed a hard-coded pool is not a pin" "RUNNER9" \
     "$required_callee" "'[\"self-hosted\",\"linux\",\"gcp\",\"ExampleRepo\"]'"
 
-  expect_si_callee "a required input passed a non-owner's output is not a pin" "RUNNER9" \
+  # #1718: `setup` only publishes a pool, so its output is a computed value the
+  # callee routes on — it may be `-lane` (RUNNER18/20) — and not the anchor pin.
+  expect_si_callee "a required input passed a non-owner's output is not a pin" "RUNNER18 RUNNER20 RUNNER9" \
     "$required_callee" '${{ needs.setup.outputs.pool }}'
+
+  # #1718: only the owner's `runs-on` output, passed WHOLE, is the anchor pin.
+  # A fallback beside it, another output of the owner, or the `runs-on` output
+  # of a job that is not the owner (`setup` publishes, holds no stack) is a
+  # computed pool the callee routes on, so it may be the lane host. A literal
+  # fallback or a non-owner also loses the caller's pin (RUNNER9); a reference
+  # to the owner alone keeps it, so the two middle cases are RUNNER18/20 only.
+  expect_si_callee "the anchor host with a lane fallback is still a lane risk" "RUNNER18 RUNNER20 RUNNER9" \
+    "$required_callee" "\${{ needs.anchor.outputs.runs-on || 'X-lane' }}"
+  expect_si_callee "the anchor host with a computed fallback is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee" '${{ needs.anchor.outputs.runs-on || vars.POOL }}'
+  expect_si_callee "another output of the anchor is still a lane risk" "RUNNER18 RUNNER20" \
+    "$required_callee" '${{ needs.anchor.outputs.other }}'
+  expect_si_callee "a non-owner's runs-on output is still a lane risk" "RUNNER18 RUNNER20 RUNNER9" \
+    "$required_callee" '${{ needs.setup.outputs.runs-on }}'
 
   rm -rf "$tmp"
   return "$status"
