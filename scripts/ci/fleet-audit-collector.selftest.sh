@@ -746,7 +746,7 @@ b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 OTHER="jobs:
   deploy:
     uses: ACCT/Ci-Runner-Infra/.github/workflows/pr-guard.yml@$BAD"
-WORKFLOW_TEXT=([merge-lane.yml]="$(job lane "$GOOD")")
+WORKFLOW_TEXT=(["merge-lane.yml"]="$(job lane "$GOOD")")
 FILE_BY_PATH=([.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "$OTHER")\"}"
               [.github/workflows/ci.yml]="{\"content\":\"$(b64 "name: CI")\"}")
 : > "$PROV_CALLS"
@@ -833,7 +833,7 @@ FILE_BY_PATH=([.github/workflows/bad.yml]="{\"content\":\"$(b64 'jobs: [unclosed
 eq "$(workflow_pin_facts svc-a bad.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=bad.yml;wf_no_parser=0" \
    "a workflow the parser cannot load is reported as unparsed"
 FILE_BY_PATH=([.github/workflows/p4.yml]="{\"content\":\"$(b64 "$P4")\"}")
-# shellcheck disable=SC2317  # the override is called by workflow_pin_facts
+# shellcheck disable=SC2317,SC2329  # the override is called by workflow_pin_facts
 eq "$(ensure_yaml() { return 1; }; workflow_pin_facts svc-a p4.yml | grep -o 'wf_unparsed=[^;]*;wf_no_parser=[01]')" "wf_unparsed=;wf_no_parser=1" \
    "no YAML parser is reported, never a clean scan"
 eq "$(decoded_fleet_refs "$(printf 'a: &x [*x, "ci-runner-infra/.github/workflows/y.yml@v1"]')")" "ci-runner-infra/.github/workflows/y.yml@v1" \
