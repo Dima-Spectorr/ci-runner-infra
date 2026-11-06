@@ -79,6 +79,19 @@ if ! _fleet_is_number "$BACKLOG_SCAN_MAX"; then
        "using $BACKLOG_SCAN_MAX_DEFAULT" >&2
   BACKLOG_SCAN_MAX="$BACKLOG_SCAN_MAX_DEFAULT"
 fi
+# The most workflow files (.yml/.yaml, any case) one repository's pin scan reads
+# (#1716). Each costs a contents read, so a repository with thousands of them
+# would buy that many calls. Over the ceiling the scan does not run and the
+# repository is UNSCANNED — wf_listing_unreadable, like a truncated listing —
+# which fails. A non-numeric value falls back to the default, for the reason
+# above: an override must never remove the bound.
+FLEET_MAX_WORKFLOWS_DEFAULT=500
+FLEET_MAX_WORKFLOWS="${FLEET_MAX_WORKFLOWS:-$FLEET_MAX_WORKFLOWS_DEFAULT}"
+if ! _fleet_is_number "$FLEET_MAX_WORKFLOWS"; then
+  echo "fleet-audit: FLEET_MAX_WORKFLOWS=\"$FLEET_MAX_WORKFLOWS\" is not a whole number;" \
+       "using $FLEET_MAX_WORKFLOWS_DEFAULT" >&2
+  FLEET_MAX_WORKFLOWS="$FLEET_MAX_WORKFLOWS_DEFAULT"
+fi
 # The tag the backlog is measured from. Empty — the normal case — derives it
 # from VERSION's major, which is the ref consumers pin. An override exists so
 # the collector can be exercised by hand against a tag that is known to be
@@ -107,10 +120,30 @@ UTILITY_HOST_REPOS="${UTILITY_HOST_REPOS:-}"
 # for every repository in the fleet.
 api() { gh api "$1" </dev/null 2>/dev/null; }
 
-# file_at <repo> <path> — the decoded contents of one file, or empty.
+# uri_seg <text> — <text> percent-encoded as ONE path segment (everything but
+# A-Z a-z 0-9 - _ . ~, UTF-8 bytes for non-ASCII). A workflow name is consumer
+# input: GitHub runs `ci build.yml`, `café.yml`, `ci+x.yml` and `ci@x.yml`, so
+# such a name is encoded, never refused (#1716 round 6). The same encoding is
+# how a name is written into a fact, so `;` `,` `=` in a file name can never
+# forge or split a fact.
+uri_seg() { printf '%s' "$1" | jq -sRr @uri 2>/dev/null | tr -d '\r'; }
+
+# file_at <repo> <path> — the decoded contents of one file, or empty. Every
+# segment of <path> is URL-encoded, so a name holding a space, `+`, `@`, `#`,
+# `?`, `%` or non-ASCII reaches the API as the file it is.
+#
+# Split in bash, not with jq's `split("/")`: Git Bash rewrites a `/` in an
+# argument to a native path, which turned every `/` into `%2F` there.
 file_at() {
-  local body
-  body=$(api "repos/$OWNER/$1/contents/$2" | jq -r '.content // empty' 2>/dev/null) || return 0
+  local body path="" rest="$2" seg
+  while :; do
+    seg="${rest%%/*}"
+    path="${path:+$path/}$(uri_seg "$seg")"
+    [ "$rest" = "$seg" ] && break
+    rest="${rest#*/}"
+  done
+  [ -z "$path" ] && return 0
+  body=$(api "repos/$OWNER/$1/contents/$path" | jq -r '.content // empty' 2>/dev/null) || return 0
   [ -z "$body" ] && return 0
   # `tr -d` first: the API wraps base64 at 60 columns, and on this platform the
   # newlines arrive as CRLF, which `base64 -d` rejects 45 bytes in.
@@ -454,16 +487,18 @@ declare -A WORKFLOW_TEXT=()
 #   verdict: 0 / "" / 1), wf_history_pin (the pin it names), wf_history_files
 #   (the files holding a pin with that verdict), wf_unread (files whose read
 #   came back empty — an unread file is unscanned, never clean), wf_refused
-#   (names not safe to put in a URL or a fact, also unscanned), wf_not_sha
+#   (count of names holding a control character — the only names not read;
+#   unscanned, so the rule FAILS them), wf_not_sha
 #   (files holding a candidate fleet reference not in canonical form —
 #   FLEET_CANON_ERE), wf_obfuscated (files where an escape could spell one —
 #   obfuscated_in), wf_unparsed (files the YAML parser could not load: their
 #   literal text is still judged, and the file FAILS), wf_no_parser (1 when no
 #   PyYAML was found, so no file was decoded: FAILS).
-#   facts_for adds wf_listing_unreadable=1 instead when the listing failed or
-#   came back truncated.
+#   facts_for adds wf_listing_unreadable=1 instead when the listing failed,
+#   came back truncated, or held more than FLEET_MAX_WORKFLOWS workflows.
+#   Every file name in a fact is uri_seg-encoded.
 workflow_pin_facts() {
-  local repo="$1" names="$2" name text tokens pins sha v count=0 refused=0
+  local repo="$1" names="$2" name label text tokens pins sha v count=0 refused=0
   local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
   local unparsed="" no_parser=0 decoded
   ensure_yaml || no_parser=1
@@ -471,17 +506,22 @@ workflow_pin_facts() {
     name="${name%$'\r'}"
     # Any case: `CI.YML` runs exactly like `ci.yml`, so it is scanned too.
     case "${name,,}" in *.yml|*.yaml) ;; *) continue ;; esac
-    if ! printf '%s' "$name" | grep -cE '^[A-Za-z0-9._-]+$' >/dev/null; then
-      refused=$((refused + 1))
-      continue
-    fi
+    # ONLY a control character is refused (facts_for marks one `#CTRL `,
+    # because a newline would otherwise split the name in two). Every other
+    # name — a space, `+`, `@`, non-ASCII — is read: GitHub runs such files
+    # (#1716 round 6). A refused name is unscanned, which the rule FAILS.
+    case "$name" in
+      '#CTRL '*|*[[:cntrl:]]*) refused=$((refused + 1)); continue ;;
+    esac
+    label=$(uri_seg "$name")
+    [ -z "$label" ] && { refused=$((refused + 1)); continue; }
     if [ -n "${WORKFLOW_TEXT[$name]+set}" ]; then
       text="${WORKFLOW_TEXT[$name]}"
     else
       text=$(file_at "$repo" ".github/workflows/$name")
     fi
     if [ -z "$text" ]; then
-      unread="${unread:+$unread,}$name"
+      unread="${unread:+$unread,}$label"
       continue
     fi
     # The literal text's candidates first (comments count), then the parser's.
@@ -497,14 +537,14 @@ workflow_pin_facts() {
         # GitHub would read, so half of them is neither a verdict nor safe to
         # pass. The file is FAILED as unparsed instead, and its literal text is
         # still judged above, so a visible bad pin in it is reported as well.
-        unparsed="${unparsed:+$unparsed,}$name"
+        unparsed="${unparsed:+$unparsed,}$label"
       else
         tokens="$tokens"$'\n'"$decoded"
       fi
     fi
     tokens=$(printf '%s\n' "$tokens" | grep -v '^$' | awk '!seen[$0]++')
-    [ -n "$(printf '%s\n' "$tokens" | fleet_noncanonical)" ] && not_sha="${not_sha:+$not_sha,}$name"
-    [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$name"
+    [ -n "$(printf '%s\n' "$tokens" | fleet_noncanonical)" ] && not_sha="${not_sha:+$not_sha,}$label"
+    [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$label"
     pins=$(canonical_shas "$tokens")
     while IFS= read -r sha; do
       [ -z "$sha" ] && continue
@@ -513,9 +553,9 @@ workflow_pin_facts() {
       case "$v" in
         1) : ;;
         0) [ -z "$bad" ] && bad="$sha"
-           case ",$bad_files," in *",$name,"*) ;; *) bad_files="${bad_files:+$bad_files,}$name" ;; esac ;;
+           case ",$bad_files," in *",$label,"*) ;; *) bad_files="${bad_files:+$bad_files,}$label" ;; esac ;;
         *) [ -z "$unk" ] && unk="$sha"
-           case ",$unk_files," in *",$name,"*) ;; *) unk_files="${unk_files:+$unk_files,}$name" ;; esac ;;
+           case ",$unk_files," in *",$label,"*) ;; *) unk_files="${unk_files:+$unk_files,}$label" ;; esac ;;
       esac
     done <<< "$pins"
   done <<< "$names"
@@ -987,23 +1027,43 @@ facts_for() {
   # 404s an unencoded `:` or `/` there), i.e. the tree file_at reads from.
   # Only `blob` entries are workflows: GitHub runs top-level files of
   # .github/workflows and nothing in a subdirectory, so a `tree` entry (or a
-  # submodule `commit`) is not a workflow and is skipped. A control character
-  # in a name becomes `?`, which workflow_pin_facts then refuses (unscanned);
-  # by code point, not `gsub`: Oniguruma reads `\u0000-…` in a class as a
-  # range over ordinary letters and mangled every name.
-  local branch tree listing listing_truncated=0
+  # submodule `commit`) is not a workflow and is skipped. A name holding a
+  # control character is emitted as `#CTRL ` + the name with each one turned
+  # to `?` (a newline would otherwise split it in two), and workflow_pin_facts
+  # refuses it — unscanned, which fails. Every other name is read as it is
+  # (#1716 round 6). By code point, not `gsub`: Oniguruma reads `\u0000-…` in
+  # a class as a range over ordinary letters and mangled every name.
+  #
+  # More than FLEET_MAX_WORKFLOWS workflow files is treated like truncation:
+  # the scan does not run, and the repository is unscanned (wf_over_ceiling).
+  #
+  # Only a whole tree with no files, or GitHub's own `Not Found` for the
+  # directory, means "no workflows". Any other unreadable answer (an empty
+  # body, a 5xx, a malformed one) leaves has_ci unknown, so the scan below
+  # reports the listing unreadable instead of reading it as no CI.
+  local branch tree listing listing_truncated=0 listing_absent=0 wf_count=0 over_ceiling=""
   branch=$(api "repos/$OWNER/$repo" | jq -r '.default_branch // empty' 2>/dev/null | tr -d '\r')
   if [ -n "$branch" ]; then
     tree=$(api "repos/$OWNER/$repo/git/trees/$(printf '%s' "$branch:.github/workflows" | jq -sRr @uri | tr -d '\r')")
     listing=$(printf '%s' "$tree" | jq -r 'if type=="object" and (.tree|type)=="array"
         then (if .truncated == false then "#OK" else "#TRUNCATED" end),
              (.tree[] | select(.type=="blob") | .path | strings
-              | explode | map(if . < 32 or . == 127 then 63 else . end) | implode)
+              | if (explode | any(. < 32 or . == 127))
+                then "#CTRL " + (explode | map(if . < 32 or . == 127 then 63 else . end) | implode)
+                else . end)
         else empty end' 2>/dev/null | tr -d '\r')
     case "$listing" in
       '#TRUNCATED'*) listing_truncated=1 ;;
+      '#OK'*) ;;
+      *) printf '%s' "$tree" | jq -e 'type=="object" and .message=="Not Found"' >/dev/null 2>&1 \
+           && listing_absent=1 ;;
     esac
     workflows=$(printf '%s\n' "$listing" | sed '1d')
+    wf_count=$(printf '%s\n' "$workflows" | grep -ciE '\.ya?ml$') || wf_count=0
+    if [ "$wf_count" -gt "$FLEET_MAX_WORKFLOWS" ]; then
+      listing_truncated=1
+      over_ceiling="$wf_count"
+    fi
   fi
   if [ "$listing_truncated" = "1" ]; then
     # Some of the directory is missing, so the scan below never runs on it.
@@ -1030,7 +1090,13 @@ facts_for() {
     # two must not render alike. The repository itself answers: a repository
     # that exists with a default branch and no `.github` directory is the
     # former, and a 404 on the repository is the latter.
-    [ -n "$branch" ] && has_ci=0
+    # Only a whole tree with no files, or `Not Found` for the directory, is
+    # "no workflows"; an empty or malformed tree response leaves has_ci
+    # unknown, so the scan reports the listing unreadable (#1716 round 6).
+    if [ -n "$branch" ]; then
+      case "$listing" in '#OK'*) has_ci=0 ;; esac
+      [ "$listing_absent" = "1" ] && has_ci=0
+    fi
   fi
 
   local facts="tier=$tier;has_lane=$has_lane;has_guard=$has_guard;has_reaper=$has_reaper"
@@ -1106,8 +1172,10 @@ facts_for() {
       elif [ "$has_ci" != "0" ]; then
         # The listing failed or was truncated (has_ci=0 is a readable
         # repository with no workflows, which has nothing to scan). Unscanned
-        # is never clean.
+        # is never clean: the rule FAILS it. Over the workflow ceiling the
+        # count and the ceiling ride along so the finding can say which.
         facts="$facts;wf_scanned=1;wf_listing_unreadable=1"
+        [ -n "$over_ceiling" ] && facts="$facts;wf_over_ceiling=$over_ceiling;wf_max_workflows=$FLEET_MAX_WORKFLOWS"
       fi
       ;;
   esac

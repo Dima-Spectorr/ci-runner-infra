@@ -218,12 +218,18 @@ has "fail:workflow-pin-unread files=gone.yml,big.yml" "an unread workflow file (
   "$(wf "$HEALTHY_POOL" wf_unread gone.yml,big.yml)"
 hasnt "ok:compliant" "an unread workflow file is never compliant" \
   "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
-hasnt "workflow-pin-scan-incomplete" "an unread file is its own failure, not a scan-incomplete warning" \
+hasnt "workflow-pin-unscanned" "an unread file is its own failure, not an unscanned-listing one" \
   "$(wf "$HEALTHY_POOL" wf_unread big.yml)"
 has "fail:workflow-pin-unread files=big.yml" "an unread file fails in the checks tier too" \
   "$(wf "tier=checks;has_ci=1" wf_unread big.yml)"
-has "warn:workflow-pin-scan-incomplete refused=1" "a refused workflow name is unscanned, never clean" \
+has "fail:workflow-pin-unscanned refused=1" "a refused workflow name is unscanned, and FAILS (round 6)" \
   "$(wf "$HEALTHY_POOL" wf_refused 1)"
+hasnt "ok:compliant" "a refused workflow name is never compliant" \
+  "$(wf "$HEALTHY_POOL" wf_refused 1)"
+hasnt "warn:workflow-pin" "no unscanned outcome is a warning any more" \
+  "$(wf "$HEALTHY_POOL" wf_refused 2);wf_listing_unreadable=1"
+has "fail:workflow-pin-unscanned refused=yes" "a malformed refused count is unscanned, never quiet" \
+  "$(wf "$HEALTHY_POOL" wf_refused yes)"
 hasnt "workflow-pin-unread" "an empty unread fact is quiet" "$HEALTHY_POOL;$WF_OK"
 has "fail:workflow-pin-not-in-fleet-history" "a checks repository's imposter pin fails too" \
   "$(wf "tier=checks;has_ci=1" wf_pin_in_history 0)"
@@ -244,10 +250,22 @@ for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;
     "$BASE;$WF_OK;wf_not_sha=tag.yml,CI.YML"
   has "warn:workflow-pin-obfuscated files=esc.yml" "an escape on a uses line warns ($T)" \
     "$BASE;$WF_OK;wf_obfuscated=esc.yml"
-  has "warn:workflow-pin-scan-incomplete workflows-listing-unreadable" "an unreadable listing is unscanned ($T)" \
+  has "fail:workflow-pin-unscanned workflows-listing-unreadable" "an unreadable listing is unscanned and fails ($T)" \
     "$BASE;wf_scanned=1;wf_listing_unreadable=1"
   hasnt "ok:compliant" "an unreadable listing is never compliant ($T)" \
     "$BASE;wf_scanned=1;wf_listing_unreadable=1"
+  # Round 6: a refused name and a repository over the workflow ceiling are
+  # unscanned too, and every unscanned outcome is a `fail:`, never a `warn:`.
+  has "fail:workflow-pin-unscanned refused=3" "a refused name fails ($T)" \
+    "$BASE;$WF_OK;wf_refused=3"
+  hasnt "ok:compliant" "a refused name is never compliant ($T)" "$BASE;$WF_OK;wf_refused=3"
+  has "fail:workflow-pin-unscanned workflows-over-ceiling count=501 max=500" "a repository over the workflow ceiling fails ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=501;wf_max_workflows=500"
+  hasnt "ok:compliant" "a repository over the workflow ceiling is never compliant ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=501;wf_max_workflows=500"
+  hasnt "warn:workflow-pin-scan-incomplete" "no unscanned outcome is a warning ($T)" \
+    "$BASE;wf_scanned=1;wf_refused=1;wf_listing_unreadable=1"
+  hasnt "workflow-pin-unscanned" "a whole listing with no refused name is quiet ($T)" "$BASE;$WF_OK"
   hasnt "workflow-pin-not-a-sha" "an empty not-a-sha fact is quiet ($T)" "$BASE;$WF_OK;wf_not_sha="
   hasnt "workflow-pin-obfuscated" "an empty obfuscated fact is quiet ($T)" "$BASE;$WF_OK;wf_obfuscated="
   # Round 3/4: a file the parser cannot load, or a run with no parser, FAILS —
@@ -256,13 +274,13 @@ for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;
     "$BASE;$WF_OK;wf_unparsed=bad.yml,x.yaml;wf_no_parser=0"
   hasnt "ok:compliant" "a file the parser cannot load is never compliant ($T)" \
     "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
-  hasnt "workflow-pin-scan-incomplete" "an unparsed file is its own failure, not a scan-incomplete warning ($T)" \
+  hasnt "workflow-pin-unscanned" "an unparsed file is its own failure, not an unscanned one ($T)" \
     "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
   has "fail:workflow-pin-yaml-parser-unavailable" "a missing YAML parser fails ($T)" \
     "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
   hasnt "ok:compliant" "a run with no YAML parser is never compliant ($T)" \
     "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
-  hasnt "workflow-pin-scan-incomplete" "a parsed scan with every file loaded is quiet ($T)" \
+  hasnt "workflow-pin-unscanned" "a parsed scan with every file loaded is quiet ($T)" \
     "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=0"
 done
 hasnt "workflow-pin" "the source repository ignores the new facts too" \

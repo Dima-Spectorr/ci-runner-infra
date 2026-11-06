@@ -43,18 +43,25 @@ _fleet_say() {
 
 # _fleet_workflow_pins <scanned> <verdict> <pin> <files> <unread> <refused> —
 # the every-workflow provenance scan (#1716). Says nothing when the scan did not
-# run; an imposter anywhere fails, an unknown warns, a refused name is a
-# warning of its own, and a file it could not READ, a file it read but could
-# not DECODE, or a run with no decoder, fails — never a clean one.
+# run; an imposter anywhere fails, an unknown warns, and EVERY file GitHub may
+# run that was not judged FAILS — a name it refused, a listing it could not
+# read whole (or that was over the workflow ceiling), a file it could not READ,
+# a file it read but could not DECODE, or a run with no decoder. The audit
+# exits non-zero only on `fail:`, so an unscanned file as a `warn:` was a green
+# run with an imposter pin inside it (#1716 round 6).
 #   …then <not-sha-files> <obfuscated-files> <listing-unreadable>
-#   <unparsed-files> <no-parser>.
+#   <unparsed-files> <no-parser> <over-ceiling-count> <ceiling>.
 _fleet_workflow_pins() {
   local scanned="$1" hist="$2" pin="$3" files="$4" unread="$5" refused="$6"
   local not_sha="${7:-}" obf="${8:-}" no_listing="${9:-}"
-  local unparsed="${10:-}" no_parser="${11:-}"
+  local unparsed="${10:-}" no_parser="${11:-}" over="${12:-}" max="${13:-}"
   [ "$scanned" = "1" ] || return 0
-  if [ "$no_listing" = "1" ]; then
-    _fleet_say "warn:workflow-pin-scan-incomplete workflows-listing-unreadable"
+  if [ -n "$over" ]; then
+    _fleet_say "fail:workflow-pin-unscanned workflows-over-ceiling count=$over max=${max:-?}"
+    return 0
+  fi
+  if [ -n "$no_listing" ] && [ "$no_listing" != "0" ]; then
+    _fleet_say "fail:workflow-pin-unscanned workflows-listing-unreadable"
     return 0
   fi
   # A fleet call by tag, branch or short SHA is not pinned at all: whatever the
@@ -71,8 +78,10 @@ _fleet_workflow_pins() {
   # Like an unparsed file it FAILS, so padding a workflow past 1 MB cannot
   # turn an imposter pin into a warning (#1716).
   [ -n "$unread" ] && _fleet_say "fail:workflow-pin-unread files=$unread"
+  # A name holding a control character is the only one not read; the file is
+  # one GitHub may run, unjudged, so it FAILS.
   if [ -n "$refused" ] && [ "$refused" != "0" ]; then
-    _fleet_say "warn:workflow-pin-scan-incomplete refused=$refused"
+    _fleet_say "fail:workflow-pin-unscanned refused=$refused"
   fi
   # A file the parser could not load is one GitHub may still run: its escaped
   # or explicit-key `uses` is invisible to the text scan, so it FAILS (#1716).
@@ -132,15 +141,19 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #                 workflows/<x>@<sha>` in every workflow: 1 / 0 / "" (unknown)
 #   wf_history_pin, wf_history_files  the pin and the files that verdict names
 #   wf_unread     workflow files whose read came back empty (unscanned)
-#   wf_refused    count of workflow names the collector would not read
+#   wf_refused    count of workflow names the collector would not read (a
+#                 control character in the name) -> fail unscanned
 #   wf_not_sha    files holding a candidate fleet reference that is not in
 #                 the canonical `<owner>/ci-runner-infra/.github/workflows/
 #                 <file>@<40 hex>` form (tag, branch, short SHA, <40hex>x,
 #                 doubled slash, a space in the name, ...) -> fail
 #   wf_obfuscated files where a backslash escape on a uses-line could spell a
 #                 fleet reference -> warn
-#   wf_listing_unreadable  1 when the workflows listing itself failed -> warn
-#                 scan-incomplete; nothing else in the scan is judged
+#   wf_listing_unreadable  1 when the workflows listing itself failed, was
+#                 truncated or was over the ceiling -> fail unscanned; nothing
+#                 else in the scan is judged
+#   wf_over_ceiling, wf_max_workflows  the workflow count and the
+#                 FLEET_MAX_WORKFLOWS ceiling it exceeded (with the above)
 #   wf_unparsed   files the YAML parser could not load (literal scan only) -> fail
 #   wf_no_parser  1 when no YAML parser was found, so nothing was decoded -> fail
 #   relay_match   1 if the review relay's `name:` is what the events file's
@@ -233,7 +246,7 @@ fleet_verdict() {
   local lane_history_pin="" events_history_pin="" guard_history_pin="" reaper_history_pin=""
   local wf_scanned="" wf_pin_in_history="" wf_history_pin="" wf_history_files=""
   local wf_unread="" wf_refused="" wf_not_sha="" wf_obfuscated="" wf_listing_unreadable=""
-  local wf_unparsed="" wf_no_parser=""
+  local wf_unparsed="" wf_no_parser="" wf_over_ceiling="" wf_max_workflows=""
   local enabled="" armed="" app_id="" app_key=""
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
@@ -286,6 +299,8 @@ fleet_verdict() {
       wf_listing_unreadable) wf_listing_unreadable="$value" ;;
       wf_unparsed) wf_unparsed="$value" ;;
       wf_no_parser) wf_no_parser="$value" ;;
+      wf_over_ceiling) wf_over_ceiling="$value" ;;
+      wf_max_workflows) wf_max_workflows="$value" ;;
       relay_match) relay_match="$value" ;;
       with_match) with_match="$value" ;;
       enabled) enabled="$value" ;;
@@ -348,7 +363,7 @@ fleet_verdict() {
       _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
         "$wf_history_files" "$wf_unread" "$wf_refused" \
         "$wf_not_sha" "$wf_obfuscated" "$wf_listing_unreadable" \
-        "$wf_unparsed" "$wf_no_parser"
+        "$wf_unparsed" "$wf_no_parser" "$wf_over_ceiling" "$wf_max_workflows"
       [ "$found" = "0" ] && echo "ok:compliant tier=checks"
       return 0
       ;;
@@ -467,7 +482,7 @@ fleet_verdict() {
     _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
       "$wf_history_files" "$wf_unread" "$wf_refused" \
       "$wf_not_sha" "$wf_obfuscated" "$wf_listing_unreadable" \
-        "$wf_unparsed" "$wf_no_parser"
+        "$wf_unparsed" "$wf_no_parser" "$wf_over_ceiling" "$wf_max_workflows"
   else
     [ "$has_guard" != "1" ] && _fleet_say "warn:no-pr-guard"
     [ "$has_reaper" != "1" ] && _fleet_say "warn:no-branch-reaper"
@@ -549,7 +564,7 @@ fleet_verdict() {
     _fleet_workflow_pins "$wf_scanned" "$wf_pin_in_history" "$wf_history_pin" \
       "$wf_history_files" "$wf_unread" "$wf_refused" \
       "$wf_not_sha" "$wf_obfuscated" "$wf_listing_unreadable" \
-        "$wf_unparsed" "$wf_no_parser"
+        "$wf_unparsed" "$wf_no_parser" "$wf_over_ceiling" "$wf_max_workflows"
 
     # --- the two-file lane (#1380, #1382) ------------------------------------
     #

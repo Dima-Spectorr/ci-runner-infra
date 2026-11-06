@@ -772,9 +772,17 @@ eq "$(workflow_pin_facts svc-a "$LIST")" \
 
 # shellcheck disable=SC2034  # read by workflow_pin_facts
 WORKFLOW_TEXT=()
-eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na;b.yml\r\n')")" \
+eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na\tb.yml\r\n')")" \
    "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
-   "an unreadable file and an unsafe name are reported as unscanned, never clean"
+   "an unreadable file and a name with a control character are reported as unscanned, never clean"
+# Round 6: `;` `,` `=` in a name are READ, and written into the facts encoded,
+# so a file name can neither be refused into a warning nor forge a fact.
+: > "$PROV_CALLS"
+eq "$(workflow_pin_facts svc-a "$(printf 'a;wf_pin_in_history=1,b.yml')")" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=a%3Bwf_pin_in_history%3D1%2Cb.yml;wf_refused=0;wf_not_sha=;wf_obfuscated=;wf_unparsed=;wf_no_parser=0" \
+   "a name holding ; = , is read and named encoded, never refused and never a forged fact"
+eq "$(grep -cx 'repos/acct/svc-a/contents/.github/workflows/a%3Bwf_pin_in_history%3D1%2Cb.yml' "$PROV_CALLS")" "1" \
+   "the read puts the name in the URL percent-encoded"
 
 # Upper-case extensions run exactly like lower-case ones, so they are scanned;
 # a tag-pinned and an escaped fleet call are named in their own facts.
@@ -984,6 +992,60 @@ eq "$(grep -c 'nested.yml' "$PROV_CALLS")" "0" "a subdirectory is never read as 
 F_TREE=$(tree_body false '{"path":"a\nzz-imposter.yml","mode":"100644","type":"blob","sha":"z"}')
 eq "$(facts_for svc-a checks "$GOOD" | grep -o 'wf_unread=[^;]*;wf_refused=[^;]*')" "wf_unread=;wf_refused=1" \
    "a name holding a newline is refused, not split"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$(facts_for svc-a checks "$GOOD")") | grep -c '^fail:workflow-pin-unscanned refused=1$')" "1" \
+   "a refused name FAILS the repository, never a warning on a green run"
+
+# Security review round 6: a name with a space, `+`, `@` or non-ASCII was
+# refused (a warning, and the run went green with an imposter inside). GitHub
+# runs such files — orbisgis/h2gis has `.github/workflows/CI build.yml` — so
+# each is read through its percent-encoded path and judged like any other.
+IMPOSTER_WF="{\"content\":\"$(b64 "jobs:
+  z:
+    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD")\"}"
+declare -A R6=([SPACE]='ci build.yml|ci%20build.yml' [UNI]='café.yml|caf%C3%A9.yml'
+               [PLUS]='ci+x.yml|ci%2Bx.yml' [AT]='ci@x.yml|ci%40x.yml')
+for R in SPACE UNI PLUS AT; do
+  R6_NAME="${R6[$R]%%|*}" R6_ENC="${R6[$R]#*|}"
+  F_TREE=$(tree_body false "$(blob "$R6_NAME")")
+  FILE_BY_PATH=([.github/workflows/$R6_ENC]="$IMPOSTER_WF")
+  : > "$PROV_CALLS"
+  R6_FACTS=$(facts_for svc-a checks "$GOOD")
+  eq "$(printf '%s' "$R6_FACTS" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*;wf_unread=[^;]*;wf_refused=[^;]*')" \
+     "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=$R6_ENC;wf_unread=;wf_refused=0" \
+     "round 6 ${R,,}: \`$R6_NAME\` is read and its imposter pin reaches the provenance check"
+  eq "$(grep -cx "repos/acct/svc-a/contents/.github/workflows/$R6_ENC" "$PROV_CALLS")" "1" \
+     "round 6 ${R,,}: the read URL carries the name percent-encoded"
+  # shellcheck source=/dev/null
+  eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$R6_FACTS") | grep -c '^fail:workflow-pin-not-in-fleet-history')" "1" \
+     "round 6 ${R,,}: the repository FAILS"
+done
+
+# Round 6: more workflow files than FLEET_MAX_WORKFLOWS is unscanned — no file
+# is read, the listing reads as unreadable with the count, and the rule fails.
+F_TREE=$(tree_body false "$(blob a.yml)" "$(blob b.YAML)" "$(blob c.yml)" "$(blob notes.txt)")
+FILE_BY_PATH=()
+: > "$PROV_CALLS"
+OVER_FACTS=$(FLEET_MAX_WORKFLOWS=2; facts_for svc-a checks "$GOOD")
+eq "$(printf '%s' "$OVER_FACTS" | grep -o 'wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=3;wf_max_workflows=2')" \
+   "wf_scanned=1;wf_listing_unreadable=1;wf_over_ceiling=3;wf_max_workflows=2" \
+   "three workflow files over a ceiling of two is unscanned, with the count"
+eq "$(grep -c '/contents/' "$PROV_CALLS")" "0" "over the ceiling, no workflow file is read"
+# shellcheck source=/dev/null
+eq "$( (source "$HERE/fleet-audit-decision.sh"; fleet_verdict "$OVER_FACTS") | grep -c '^fail:workflow-pin-unscanned workflows-over-ceiling count=3 max=2$')" "1" \
+   "a repository over the workflow ceiling FAILS"
+# shellcheck disable=SC2034  # read by facts_for
+eq "$( (FLEET_MAX_WORKFLOWS=3; facts_for svc-a checks "$GOOD") | grep -c 'wf_over_ceiling')" "0" \
+   "exactly at the ceiling, the scan runs"
+
+# Round 6: an empty tree response on a repository that answered is an
+# unreadable listing (and fails), never "no workflows".
+F_TREE=""
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*;.*wf_scanned=1;wf_listing_unreadable=1')" \
+   "has_ci=;want_pin=$GOOD;wf_scanned=1;wf_listing_unreadable=1" \
+   "an empty trees response on a readable repository is unreadable, not no-CI"
+F_TREE=$(tree_body false)
+eq "$(facts_for svc-a checks "$GOOD" | grep -o 'has_ci=[^;]*')" "has_ci=0" "a whole tree with no files is no CI"
 F_TREE=""
 F_META=""
 FILE_BY_PATH=()
@@ -1007,6 +1069,11 @@ eq "$(load abc)" "40" "a scan cap that is not a number falls back to the default
 eq "$(load '')"  "40" "an empty scan cap falls back to the default"
 eq "$(load 7)"   "7"  "a numeric scan cap is honoured"
 eq "$(load 0)"   "0"  "zero is a whole number, and still caps the walk at zero"
+load_max() { FLEET_AUDIT_LIB=1 FLEET_OWNER=acct FLOATING_TAG=v9 FLEET_MAX_WORKFLOWS="$1" \
+  bash -c 'source "$0" && printf "%s" "$FLEET_MAX_WORKFLOWS"' "$HERE/fleet-audit.sh" 2>/dev/null; }
+eq "$(load_max abc)" "500" "a workflow ceiling that is not a number falls back to 500"
+eq "$(load_max '')"  "500" "an unset workflow ceiling is 500"
+eq "$(load_max 20)"  "20"  "a numeric workflow ceiling is honoured"
 
 # The library guard has to mean the same thing however the file was entered.
 # EXECUTED with the variable set, a bare top-level `return` is an error that

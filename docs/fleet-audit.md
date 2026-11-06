@@ -166,15 +166,35 @@ if it still cannot import it.
   on real workflows: a backslash on a line holding a `uses:` key, the text
   `runner-infra` or `.github/workflows` (any case), or on the value line after
   a bare `uses:`. A `uses:` value never needs a backslash.
-- `warn:workflow-pin-scan-incomplete workflows-listing-unreadable` — the
-  workflows listing itself could not be read (and the repository did not answer
-  as one with no workflows), or came back `truncated`. Nothing was scanned, so
-  nothing else in the scan is judged, and the repository is never reported
-  compliant. The listing is the git tree of `<default branch>:.github/workflows`
+**Any name, read as it is.** GitHub runs a workflow file whatever its name —
+`ci build.yml`, `café.yml`, `ci+x.yml`, `ci@x.yml` (orbisgis/h2gis has an
+active `.github/workflows/CI build.yml`). Each path segment is percent-encoded
+(`jq @uri`) when it goes into an API URL, and every file name the audit writes
+into a fact or a finding is written the same way (`ci%20build.yml`), so `;`,
+`,` or `=` in a name can never forge or split a fact. Only a name holding a
+**control character** is not read, and it fails as unscanned (below).
+
+**Unscanned is red.** The audit exits non-zero only on a `fail:`, so every
+outcome where a file GitHub may run was not judged is a `fail:` — never a
+`warn:` on a green run.
+
+- `fail:workflow-pin-unscanned workflows-listing-unreadable` — the
+  workflows listing itself could not be read, or came back `truncated`. Only a
+  whole tree with no files, or GitHub's `Not Found` for the directory on a
+  repository that answered, means "no workflows"; an empty or malformed tree
+  response is unreadable. Nothing was scanned, so nothing else in the scan is
+  judged, and the repository fails. The listing is the git tree of `<default branch>:.github/workflows`
   (`git/trees`), never the contents API: that one returns at most 1000 entries,
   alphabetically and without paging, so 1000 decoy files would hide a `zz.yml`
   behind them. Only top-level files (`blob` entries) are workflows — GitHub
   runs nothing from a subdirectory of `.github/workflows`, so those are skipped.
+- `fail:workflow-pin-unscanned workflows-over-ceiling count=<n> max=<m>` — the
+  repository holds more than `FLEET_MAX_WORKFLOWS` (default **500**; a
+  non-numeric value falls back to it) `.yml`/`.yaml` files. Each costs one
+  contents read, so the ceiling bounds the run's API spend; over it no file is
+  read, and the repository is unscanned exactly like a truncated listing.
+- `fail:workflow-pin-unscanned refused=<n>` — `<n>` names held a control
+  character and were not read. An unscanned file is never a clean one.
 
 - `fail:workflow-pin-not-in-fleet-history pin=<sha8> files=<a.yml,b.yml>` — some
   pin is not reachable from the default branch; `files` names every file that
@@ -186,8 +206,6 @@ if it still cannot import it.
   empty (deleted mid-run, or over 1 MB, where the contents API returns no
   `content`). GitHub still runs it unseen, so — like an unparsed file — it
   fails; padding a workflow past 1 MB cannot demote an imposter to a warning.
-- `warn:workflow-pin-scan-incomplete refused=<n>` — a name the audit will not
-  put in a URL was not scanned. An unscanned file is never a clean one.
 - `fail:workflow-pin-unparsed files=<a.yml,…>` — a file the YAML parser could
   not load (or that exceeded the decoder's bounds). GitHub may still run it, and
   an escaped or explicit-key `uses` in it is invisible to the text scan, so it
@@ -314,7 +332,8 @@ bash scripts/ci/fleet-audit.sh IntegrateIT
 Exit status is `0` when nothing failed, `1` on any `fail:` finding, `2` when the
 audit could not run at all. `FLEET_OWNER`, `FLEET_MANIFEST`, `DEMAND_MAX_AGE`
 and `QUEUED_PAGE` are all overridable; the defaults match what the controller
-actually uses. So are `BACKLOG_MAX_HOURS`, `RELEASED_SURFACE`, `BACKLOG_SCAN_MAX`
+actually uses. So are `BACKLOG_MAX_HOURS`, `RELEASED_SURFACE`, `BACKLOG_SCAN_MAX`,
+`FLEET_MAX_WORKFLOWS` (the per-repository workflow-file ceiling, default 500)
 and `FLOATING_TAG` — the last of these exists so the backlog code can be
 exercised by hand against a tag known to be behind main:
 
