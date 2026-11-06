@@ -3937,6 +3937,32 @@ jobs:
     with:
       runs-on: '"'"'["self-hosted", "ExampleRepo\u002dlane"]'"'"''
 
+  # The escape is ALSO undecidable text (the backslash, RUNNER19), so the two
+  # cases above pass even if nothing decodes it. With forks allowed only the
+  # DECODED `-util` adds RUNNER17: the proof the decoding itself still runs.
+  expect "a JSON-escaped -util slot is decoded to the util host" "RUNNER17 RUNNER19" "ExampleRepo" allowed \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: '"'"'["self-hosted", "ExampleRepo\u002dutil"]'"'"''
+
+  # A computed matrix behind the LANE's runs-on: the computed-pool rule skips
+  # the lane call (RUNNER19 refuses it instead), so only the matrix rule counts
+  # the util host, which RUNNER17 shows with forks allowed.
+  expect "a computed matrix behind the lane runs-on is the util host" "RUNNER17 RUNNER19" "ExampleRepo" allowed \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    strategy:
+      matrix: ${{ fromJSON(vars.POOLS) }}
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1635): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ matrix.pool }}'
+
   expect "a backslash in the lane runs-on is undecidable" "RUNNER19" "ExampleRepo" blocked \
 'on: [workflow_dispatch]
 jobs:
@@ -5634,6 +5660,19 @@ jobs:
     "$required_callee"
   SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.label }}')" \
     expect_si_callee "a literal output of a job not in needs is computed" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  # …and with a `needs:` that lists some OTHER job: the case above has none at
+  # all, so it never reaches the membership test.
+  SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' '    needs: [prep]' "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.label }}')" \
+    expect_si_callee "a literal output of a job missing from a needs list is computed" "RUNNER18 RUNNER20" \
+    "$required_callee"
+  # A local job is never the fleet anchor, even one handed the anchor's own
+  # inputs. Without `with:` the case above stops at the missing repo-label and
+  # never reaches the `uses:` test.
+  SI_SCAN_LANE=1 SI_ANCHOR="$(printf '%s\n' '    runs-on: [self-hosted, linux, gcp, ExampleRepo]' '    timeout-minutes: 30' \
+      '    outputs:' '      runs-on: ${{ steps.pin.outputs.runs-on }}' '    with:' '      repo-label: ExampleRepo-shared' \
+      '    services:' '      db: {image: "postgres:16"}' '    steps: [{id: pin, run: "true"}]')" \
+    expect_si_callee "a local services job handed anchor inputs is still a lane risk" "RUNNER18 RUNNER20" \
     "$required_callee"
   SI_ANCHOR_LANE=1 SI_ANCHOR="$(printf '%s\n' "$fleet_anchor_needs" "$fleet_anchor_uses" '    with:' '      repo-label: ${{ needs.setup.outputs.LABEL }}')" \
     expect_si_callee "an output matched only by case is computed" "RUNNER18 RUNNER20" \
