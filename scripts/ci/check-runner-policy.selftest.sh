@@ -456,7 +456,7 @@ mutate "a matrix reference with literal text beside it is a bare leg" \
 mutate "an escaped matrix leg is trusted" \
   's@^                        if "\\\\" in w_text:$@                        if False:@'
 mutate "the bracket spellings of an input are missed" \
-  's@r"(?i)inputs(?:\\.|@r"(?i)inputs(?:\\.|NEVER@'
+  's@(?:[\\][.][\\]s[*]|@&NEVER@'
 mutate "a callee's matrix-built runs-on inputs are never read" \
   's@                    out("#RUNSONMATRIXINPUT", vid, in_name)@                    pass@'
 # #1718: the anchor's host passed whole is the pin, not a lane risk. Matched by
@@ -499,6 +499,7 @@ mutate "the anchor's literal-output repo-label proves nothing" \
 # #1718 re-review: a callee reading `inputs` by no fixed name routes on any.
 mutate "a callee reading inputs by no fixed name routes on none" \
   's@    return any(not FIXED_INPUT.match(text, m.end()) for m in ANY_INPUTS.finditer(text))@    return False@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
 mutate "the caller ignores a callee that reads inputs by no fixed name" \
   's@if \[ -n "$computed_inputs" \] \&\&@if false \&\&@'
 mutate "whitespace before an input reference hides its name" \
