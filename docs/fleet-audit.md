@@ -81,8 +81,14 @@ trailing ` #…` is cut before matching, so a commented decoy that *is* in the
 history cannot stand in for the real `uses:` line. Every remaining pin is
 de-duplicated and judged, and the **worst verdict wins**: any pin not in the
 history fails, else any unknown warns, else the caller is quiet. The finding
-names the pin that made the verdict. `<caller>-pin-stale` still compares the
-first non-comment pin with the expected release.
+names the pin that made the verdict. `<caller>-pin-stale` judges every pin the
+same way: any pin that is not the expected release is stale, and the finding
+names it.
+
+**Case does not hide a pin.** GitHub resolves the owner and repository in any
+case (measured 2026-11-06: `compare` against `CI-Runner-Infra` and against an
+upper-case SHA both answer), so the match is case-insensitive on the path and
+the SHA is lowercased before it is checked and compared.
 
 The named callers — `merge-lane.yml`, `merge-lane-events.yml`, the guard and
 the reaper — report per caller:

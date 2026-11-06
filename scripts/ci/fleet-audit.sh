@@ -125,12 +125,19 @@ file_at() {
 # (in history) above the real `uses:` line (an imposter) read as the pin when
 # only the first match was taken. Every pin is returned, not the first, because
 # a second job calling the same callee is a second pin to judge.
+#
+# CASE-INSENSITIVE on the path, and the SHA is lowercased. GitHub resolves an
+# owner/repository in any case (measured 2026-11-06: `compare` on
+# `CI-Runner-Infra` and on an upper-case SHA both answer `identical`), so a
+# `CI-Runner-Infra/...@<sha>` pin is the same fleet call and must not slip past
+# a lower-case match. Lowercasing is what lets the SHA pass is_sha and be
+# compared; it is correct whether or not Actions itself accepts upper-case hex.
 pins_in() {
   printf '%s\n' "$1" | tr -d '\r' \
     | grep -vE '^[[:space:]]*#' \
     | sed -E 's/[[:space:]]#.*$//' \
-    | grep -oE "ci-runner-infra/\.github/workflows/$2@[0-9a-fA-F]{40}" \
-    | grep -oE '[0-9a-fA-F]{40}$' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+    | grep -oiE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}" \
+    | grep -oiE '[0-9a-f]{40}$' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
 }
 
 # pin_in <file-contents> <callee> — the first non-comment pin, which is what the
@@ -218,14 +225,17 @@ pins_history() {
 }
 
 # caller_pin_facts <prefix> <file-contents> <callee-regex> — the named caller's
-# facts: `<prefix>_pin` (the first pin, for the stale rule), its provenance over
-# EVERY pin (worst wins), and `<prefix>_history_pin`, the pin that verdict names.
+# facts: `<prefix>_pin` (the first pin), `<prefix>_pins` (EVERY pin,
+# comma-separated, which the stale rule judges — worst wins), its provenance
+# over every pin, and `<prefix>_history_pin`, the pin that verdict names.
 caller_pin_facts() {
   local pins r
   pins=$(pins_in "$2" "$3")
   r=$(pins_history "$pins")
-  printf '%s_pin=%s;%s_pin_in_history=%s;%s_history_pin=%s' \
-    "$1" "$(printf '%s\n' "$pins" | sed -n 1p)" "$1" "${r%% *}" "$1" "${r#* }"
+  printf '%s_pin=%s;%s_pins=%s;%s_pin_in_history=%s;%s_history_pin=%s' \
+    "$1" "$(printf '%s\n' "$pins" | sed -n 1p)" \
+    "$1" "$(printf '%s\n' "$pins" | paste -sd, -)" \
+    "$1" "${r%% *}" "$1" "${r#* }"
 }
 
 # --- every workflow's fleet pins (#1716) -----------------------------------------

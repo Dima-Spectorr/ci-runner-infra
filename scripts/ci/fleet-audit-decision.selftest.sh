@@ -192,7 +192,14 @@ has "fail:lane-pin-not-in-fleet-history pin=eeeeeeee" "a caller's verdict names 
 has "warn:guard-pin-history-unknown pin=eeeeeeee" "an unknown verdict names the pin it is about" \
   "$(swap guard_pin_in_history '');guard_history_pin=$IMPOSTER"
 hasnt "fail:lane-pin-stale" "the first pin is still the expected release, so it is not stale" \
-  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER"
+  "$(swap lane_pin_in_history 0);lane_history_pin=$IMPOSTER;lane_pins=$WANT"
+# Two pins in one caller, the second an older release: stale, naming it.
+has "fail:lane-pin-stale pin=bbbbbbbb" "two pins, one stale, is stale and names the stale pin" \
+  "$HEALTHY_POOL;lane_pins=$WANT,$OLD"
+has "fail:guard-pin-stale pin=bbbbbbbb" "the stale pin need not be the first" \
+  "$HEALTHY_POOL;guard_pins=$WANT,$OLD"
+hasnt "pin-stale" "every pin at the expected release is not stale" \
+  "$HEALTHY_POOL;lane_pins=$WANT;guard_pins=$WANT;reaper_pins=$WANT"
 
 # The scan over every workflow file.
 WF_OK="wf_scanned=1;wf_pins=5;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0"

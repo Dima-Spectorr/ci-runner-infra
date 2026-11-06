@@ -644,7 +644,7 @@ DECOY="jobs:
 $(job lane "$BAD")"
 eq "$(pins_in "$DECOY" 'merge-lane\.yml')" "$BAD" "a commented decoy pin is not a pin"
 eq "$(pin_in "$DECOY" 'merge-lane\.yml')" "$BAD" "and pin_in no longer reads the decoy"
-eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$BAD;lane_pins=$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
    "a decoy comment above an imposter pin fails provenance"
 
 # A pin that appears only in a trailing comment is not a pin either.
@@ -657,29 +657,40 @@ TWO_JOBS="jobs:
 $(job a "$GOOD")
 $(job b "$BAD")"
 eq "$(pins_in "$TWO_JOBS" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "both jobs' pins are read, in order"
-eq "$(caller_pin_facts lane "$TWO_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+eq "$(caller_pin_facts lane "$TWO_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
    "one imposter among two jobs fails, naming the imposter"
 UNK_JOBS="jobs:
 $(job a "$GOOD")
 $(job b "$UNK")"
-eq "$(caller_pin_facts lane "$UNK_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=;lane_history_pin=$UNK" \
+eq "$(caller_pin_facts lane "$UNK_JOBS" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$UNK;lane_pin_in_history=;lane_history_pin=$UNK" \
    "an unknown among good pins is unknown, never a pass"
 ALL_GOOD="jobs:
 $(job a "$GOOD")
 $(job b "$GOOD")
 $(job c "$(printf '%s' "$GOOD" | tr 'a-f' 'A-F')")"
 eq "$(pins_in "$ALL_GOOD" 'merge-lane\.yml')" "$GOOD" "repeated pins, any case, de-duplicate to one"
-eq "$(caller_pin_facts lane "$ALL_GOOD" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pin_in_history=1;lane_history_pin=$GOOD" \
+eq "$(caller_pin_facts lane "$ALL_GOOD" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD;lane_pin_in_history=1;lane_history_pin=$GOOD" \
    "every pin in history is quiet"
-eq "$(caller_pin_facts lane "name: x" 'merge-lane\.yml')" "lane_pin=;lane_pin_in_history=;lane_history_pin=" \
+eq "$(caller_pin_facts lane "name: x" 'merge-lane\.yml')" "lane_pin=;lane_pins=;lane_pin_in_history=;lane_history_pin=" \
    "a caller with no pin has no provenance"
+
+# GitHub resolves the owner/repository in any case, so a mixed-case path is the
+# same fleet call: an imposter behind it must fail, not slip past the match.
+MIXED="jobs:
+$(job a "$GOOD")
+  b:
+    uses: Acct/CI-Runner-Infra/.GitHub/Workflows/merge-lane.yml@$(printf '%s' "$BAD" | tr 'a-f' 'A-F')"
+eq "$(pins_in "$MIXED" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a mixed-case path is matched, and its SHA lowercased"
+eq "$(caller_pin_facts lane "$MIXED" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "a mixed-case path with an imposter SHA fails"
+eq "$(pins_in "$MIXED" 'merge-lane\.yml' | grep -cvE '^[0-9a-f]{40}$')" "0" "every extracted pin passes the is_sha shape"
 
 # The scan over every workflow file. merge-lane.yml was already read for the
 # named caller, so it must come from WORKFLOW_TEXT, not a second read.
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 OTHER="jobs:
   deploy:
-    uses: acct/ci-runner-infra/.github/workflows/pr-guard.yml@$BAD"
+    uses: ACCT/Ci-Runner-Infra/.github/workflows/pr-guard.yml@$BAD"
 WORKFLOW_TEXT=([merge-lane.yml]="$(job lane "$GOOD")")
 FILE_BY_PATH=([.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "$OTHER")\"}"
               [.github/workflows/ci.yml]="{\"content\":\"$(b64 "name: CI")\"}")

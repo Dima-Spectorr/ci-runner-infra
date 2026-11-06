@@ -89,6 +89,10 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #   guard_pin     ditto for the guard
 #   reaper_pin    ditto for the reaper
 #   events_pin    ditto for merge-lane-events.yml, when it exists
+#   lane_pins     EVERY non-comment pin the lane caller holds, comma-separated
+#                 (#1716); the stale rule fails on any one that is not
+#                 want_pin. Likewise events_pins, guard_pins, reaper_pins.
+#                 Absent, the single `<caller>_pin` stands in.
 #   lane_pin_in_history  1 if lane_pin is reachable from the fleet repository's
 #                 default branch, 0 if it is not (an imposter commit from a fork,
 #                 #1715), "" if that could not be established. Likewise
@@ -190,6 +194,7 @@ fleet_verdict() {
   local has_events="" events_pin="" relay_match="" with_match=""
   local lane_pin_in_history="" events_pin_in_history=""
   local guard_pin_in_history="" reaper_pin_in_history=""
+  local lane_pins="" events_pins="" guard_pins="" reaper_pins=""
   local lane_history_pin="" events_history_pin="" guard_history_pin="" reaper_history_pin=""
   local wf_scanned="" wf_pin_in_history="" wf_history_pin="" wf_history_files=""
   local wf_unread="" wf_refused=""
@@ -226,6 +231,10 @@ fleet_verdict() {
       events_pin_in_history) events_pin_in_history="$value" ;;
       guard_pin_in_history) guard_pin_in_history="$value" ;;
       reaper_pin_in_history) reaper_pin_in_history="$value" ;;
+      lane_pins) lane_pins="$value" ;;
+      events_pins) events_pins="$value" ;;
+      guard_pins) guard_pins="$value" ;;
+      reaper_pins) reaper_pins="$value" ;;
       lane_history_pin) lane_history_pin="$value" ;;
       events_history_pin) events_history_pin="$value" ;;
       guard_history_pin) guard_history_pin="$value" ;;
@@ -427,14 +436,22 @@ fleet_verdict() {
     if [ -z "$want_pin" ]; then
       _fleet_say "warn:expected-pin-unknown"
     else
-      local name pin present
+      # Every pin in the caller is judged (#1716), worst wins: a second job
+      # pinning an older release is as stale as the first. `<caller>_pins` is
+      # the comma-separated list; absent, the single `<caller>_pin` stands in.
+      local name pin present all p
       for name in lane events guard reaper; do
         case "$name" in
-          lane) pin="$lane_pin"; present="$has_lane" ;;
-          events) pin="$events_pin"; present="$has_events" ;;
-          guard) pin="$guard_pin"; present="$has_guard" ;;
-          reaper) pin="$reaper_pin"; present="$has_reaper" ;;
+          lane) pin="$lane_pin"; present="$has_lane"; all="$lane_pins" ;;
+          events) pin="$events_pin"; present="$has_events"; all="$events_pins" ;;
+          guard) pin="$guard_pin"; present="$has_guard"; all="$guard_pins" ;;
+          reaper) pin="$reaper_pin"; present="$has_reaper"; all="$reaper_pins" ;;
         esac
+        if [ -n "$pin" ]; then
+          for p in ${all//,/ }; do
+            [ "$p" != "$want_pin" ] && { pin="$p"; break; }
+          done
+        fi
         # An absent caller is already reported above, and has no pin to judge.
         [ "$present" != "1" ] && continue
         if [ -z "$pin" ]; then
