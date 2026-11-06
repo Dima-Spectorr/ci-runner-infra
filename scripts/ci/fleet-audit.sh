@@ -117,8 +117,55 @@ file_at() {
   printf '%s' "$body" | tr -d '\r\n' | base64 -d 2>/dev/null
 }
 
+# --- fleet references: find every candidate, then demand the canonical form ---
+#
+# THE MATCHING IS INVERTED (#1716, security review round 4). Listing the shapes
+# that count as a fleet call — `[A-Za-z0-9._-]+\.ya?ml@`, single slashes — let
+# every shape outside the list read clean: `merge+lane.yml`, `m~l.yml`,
+# `mergé.yml`, `merge lane.yml`, `ci-runner-infra//.github/…` (GitHub drops the
+# empty segment) and `…/workflows/merge-lane@<sha>` (no extension), each pinned
+# to an imposter, were COMPLIANT. So the scan now finds every CANDIDATE — any
+# token that names `ci-runner-infra` (any case) and runs to an `@` — keeps the
+# ones that also name `.github` and `workflows`, and requires each to FULLY
+# match FLEET_CANON_ERE. A candidate that does not is `workflow-pin-not-a-sha`;
+# one that does goes on to provenance. A new shape can only fail, never pass.
+#
+# THE TOKEN. It starts at the first character after whitespace, a quote, a
+# bracket, a brace or a comma before `ci-runner-infra`, runs through anything
+# but `@` and quotes (so a space, `+`, `~`, a doubled slash or a non-ASCII byte
+# stays INSIDE it and fails the canonical match), then takes the ref after the
+# `@` up to whitespace, a quote, a comma, a bracket or a brace. Bytes, not
+# characters (LC_ALL=C), so a non-UTF-8 file cannot make grep skip a line.
+#
+# PROSE IS NOT A CALL. A line that names `ci-runner-infra/.github/workflows/<x>`
+# with no `@` after it on the same line — a comment saying which callee a job
+# uses, a docs URL (`…/ci-runner-infra/blob/main/.github/workflows/x.yml`) — is
+# not a reference GitHub could resolve (a reusable-workflow call must carry
+# `@<ref>`), so it yields no token and is not judged. A line that does carry an
+# `@` after the name is judged even in a comment (see pins_in), so prose that
+# writes `…/x.yml@v5`, or mentions an e-mail address after the name, fails:
+# visible noise in the consumer's own file, never a silent pass.
+FLEET_TOKEN_ERE="[^][[:space:]\"'{},]*ci-runner-infra[^@\"']*@[^][[:space:]\"',{}]*"
+# Matched case-insensitively (grep -i): GitHub resolves the owner and the
+# repository in any case, and the SHA is lowercased before it is compared.
+FLEET_CANON_ERE='^[A-Za-z0-9-]+/ci-runner-infra/\.github/workflows/[^/@[:space:]]+@[0-9a-f]{40}$'
+
+# fleet_tokens_in <text> — every candidate fleet reference in free text, one per
+# line, in order (duplicates kept; callers de-duplicate).
+fleet_tokens_in() {
+  printf '%s\n' "$1" | tr -d '\r' | LC_ALL=C grep -oiE "$FLEET_TOKEN_ERE" \
+    | LC_ALL=C grep -iF '.github' | LC_ALL=C grep -iF 'workflows'
+}
+
+# fleet_canonical / fleet_noncanonical — filter a token list (stdin) to the
+# tokens that do / do not fully match FLEET_CANON_ERE.
+fleet_canonical() { LC_ALL=C grep -iE "$FLEET_CANON_ERE"; }
+fleet_noncanonical() { LC_ALL=C grep -viE "$FLEET_CANON_ERE"; }
+
 # pins_in <file-contents> <callee-regex> — EVERY sha a file pins for the callee,
 # one per line, lowercased, de-duplicated in first-appearance order (#1716).
+# Only canonical tokens are pins; the callee regex is matched against the file
+# name segment of one.
 #
 # EVERY MATCH, COMMENTS INCLUDED. A commented decoy pin (in history) above the
 # real `uses:` line (an imposter) read as the pin when only the first match was
@@ -140,19 +187,23 @@ file_at() {
 # a lower-case match. Lowercasing is what lets the SHA pass is_sha and be
 # compared; it is correct whether or not Actions itself accepts upper-case hex.
 pins_in() {
-  printf '%s\n' "$1" | tr -d '\r' \
-    | grep -oiE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}([^0-9a-z._/-]|$)" \
-    | sed -E 's/.*@([0-9a-fA-F]{40}).*/\1/' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+  fleet_tokens_in "$1" | fleet_canonical \
+    | LC_ALL=C grep -iE "/\.github/workflows/$2@[0-9a-f]{40}$" \
+    | sed -E 's/.*@//' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
 }
 
-# refs_not_sha_in <file-contents> — every fleet reference whose ref is NOT
-# exactly a 40-hex SHA (a tag, a branch, `refs/pull/N/head`, a short SHA,
-# `<40 hex>x`, or nothing at all), one per line. Case-insensitive like pins_in.
-# The ref runs to the first whitespace, quote, comma, bracket or brace.
+# canonical_shas <token-list> — the lowercased SHA of every canonical token,
+# de-duplicated in first-appearance order.
+canonical_shas() {
+  printf '%s\n' "$1" | fleet_canonical | sed -E 's/.*@//' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+}
+
+# refs_not_sha_in <file-contents> — every candidate fleet reference that is NOT
+# in canonical form, whole, one per line, de-duplicated: a tag, a branch,
+# `refs/pull/N/head`, a short SHA, `<40 hex>x`, an empty ref, a doubled slash,
+# a callee name with a character outside the canonical set's reach.
 refs_not_sha_in() {
-  printf '%s\n' "$1" | tr -d '\r' \
-    | grep -oiE "ci-runner-infra/\.github/workflows/[A-Za-z0-9._-]+@[^][[:space:]\"',{}]*" \
-    | sed -E 's/^[^@]*@//; s/^$/<empty>/' | grep -vE '^[0-9a-fA-F]{40}$' | awk '!seen[$0]++'
+  fleet_tokens_in "$1" | fleet_noncanonical | awk '!seen[$0]++'
 }
 
 # obfuscated_in <file-contents> — 1 when a line could spell a fleet reference
@@ -178,17 +229,26 @@ obfuscated_in() {
 # is the key `uses`, `ci-runner-infra` is `ci-runner-infra`, `\x2f` is `/`,
 # a `uses:` value can sit under a comment on the next line, and `? uses` /
 # `: "…"` is an explicit key. Each of those spelled a fleet call no grep saw.
-# So every workflow is also DECODED with a real YAML parser and every string the
-# document yields — keys and values, anchors resolved, every document in the
-# stream — that names `ci-runner-infra/.github/workflows/` is fed to the same
-# extractors as the raw text. The literal scan stays as the first layer, so a
-# commented pin (which a parser drops) is still judged.
+# So every workflow is also DECODED with a real YAML parser. Two kinds of string
+# leave it (decoded_fleet_refs):
+#   - the VALUE of any `uses` key (any case, surrounding whitespace ignored)
+#     that names `ci-runner-infra`, `.github` and `workflows`: that string IS
+#     what GitHub reads, so it is a candidate WHOLE — a space, a quote or an
+#     `@`-less value inside it fails the canonical match rather than splitting
+#     the token. (Only a str value: a `!!binary` or other tagged node is not a
+#     call GitHub accepts.)
+#   - every other string (keys and values, anchors resolved, every document in
+#     the stream) that names `ci-runner-infra`: free text, tokenized exactly
+#     like a raw line (fleet_tokens_in).
+# The literal scan stays as the first layer, so a commented pin (which a parser
+# drops) is still judged.
 #
 # The parser is PyYAML, the reader check-runner-policy.sh already depends on;
 # py_usable/ensure_yaml are that script's (copied, not sourced: sourcing it
-# runs the gate). The audit job installs python3-yaml when the runner lacks it.
-# A missing parser, or a file it cannot load, is an unscanned file — a warning,
-# never a pass.
+# runs the gate). The audit job makes PyYAML a precondition and stops if it
+# cannot install it. A missing parser, or a file it cannot load, FAILS the
+# repository (`workflow-pin-yaml-parser-unavailable`, `workflow-pin-unparsed`):
+# GitHub runs a file the audit could not decode, so it can never read clean.
 export PY_BIN="${PY_BIN:-}"
 py_usable() {
   command -v "$1" >/dev/null 2>&1 &&
@@ -210,18 +270,23 @@ ensure_yaml() {
   return 1
 }
 
-# The decoder. The workflow arrives on stdin (no argv size limit), every fleet-
-# naming string leaves on its own line with its whitespace collapsed, and a
-# document that does not load prints `#ERR` alone. The walk is breadth-first in
-# document order and tracks containers by id, because a YAML alias can make the
-# structure recursive.
+# The decoder. The workflow arrives on stdin (no argv size limit). Each string
+# leaves on its own line with its whitespace collapsed (so a newline inside a
+# value cannot split it), prefixed `U ` for a whole `uses` value and `S ` for
+# free text; a document that does not load prints `#ERR` alone. The walk is
+# breadth-first in document order and tracks containers by id, because a YAML
+# alias can make the structure recursive.
 DECODE_PY='
-import re, sys
+import sys
 from collections import deque
 import yaml
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(newline="\n", encoding="utf-8")
-FLEET = re.compile(r"ci-runner-infra/\.github/workflows/", re.I)
+def names_fleet(s):
+    return "ci-runner-infra" in s.lower()
+def names_call(s):
+    low = s.lower()
+    return "ci-runner-infra" in low and ".github" in low and "workflows" in low
 try:
     docs = list(yaml.safe_load_all(sys.stdin.buffer.read().decode("utf-8")))
 except Exception:
@@ -236,18 +301,45 @@ while queue:
         seen.add(id(node))
         if isinstance(node, dict):
             for key, value in node.items():
+                if (isinstance(key, str) and key.strip().lower() == "uses"
+                        and isinstance(value, str) and names_call(value)):
+                    print("U " + " ".join(value.split()))
                 queue.append(key)
                 queue.append(value)
         else:
             queue.extend(node)
-    elif isinstance(node, str) and FLEET.search(node):
-        print(" ".join(node.split()))
+    elif isinstance(node, str) and names_fleet(node):
+        print("S " + " ".join(node.split()))
 '
 
-# decoded_fleet_refs <file-contents> — the decoded strings, one per line, or
-# `#ERR` when the document does not load. Needs ensure_yaml to have succeeded.
+# The decoder's bounds. A workflow larger than this is not decoded (it is
+# reported unparsed), and a decode that runs longer than DECODE_TIMEOUT seconds is killed and
+# reported the same way. Neither bound can make a file read clean.
+DECODE_MAX_BYTES=1048576
+DECODE_TIMEOUT=30
+
+# decoded_fleet_refs <file-contents> — the candidate fleet references the
+# parser sees, one per line, de-duplicated, or `#ERR` when the document does not
+# load (or is too large, or the decode timed out). Needs ensure_yaml.
 decoded_fleet_refs() {
-  printf '%s' "$1" | "${PY_BIN:-python3}" -I -c "$DECODE_PY" 2>/dev/null || echo "#ERR"
+  local bytes out
+  bytes=$(printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' ')
+  if [ "${bytes:-0}" -gt "$DECODE_MAX_BYTES" ]; then
+    echo "#ERR"
+    return 0
+  fi
+  # `head -c` as well as the size check: the check guards the verdict (a cut
+  # document could load and silently drop its tail), the cap guards the parser.
+  out=$(printf '%s' "$1" | head -c "$DECODE_MAX_BYTES" \
+          | timeout "$DECODE_TIMEOUT" "${PY_BIN:-python3}" -I -c "$DECODE_PY" 2>/dev/null) || out="#ERR"
+  if printf '%s\n' "$out" | grep -cx '#ERR' >/dev/null; then
+    echo "#ERR"
+    return 0
+  fi
+  {
+    printf '%s\n' "$out" | sed -n 's/^U //p'
+    fleet_tokens_in "$(printf '%s\n' "$out" | sed -n 's/^S //p')"
+  } | grep -v '^$' | awk '!seen[$0]++'
 }
 
 # pin_in <file-contents> <callee> — the first pin. Both the stale rule and
@@ -351,8 +443,8 @@ caller_pin_facts() {
 #
 # The named callers above are four files. Any other workflow can call a fleet
 # reusable workflow at an imposter SHA, so every `.github/workflows/*.y(a)ml`
-# is read and every `ci-runner-infra/.github/workflows/<x>@<sha>`
-# in it is judged for provenance. Cost: one read per workflow file not already
+# is read, every candidate fleet reference in it must be canonical, and every
+# canonical one is judged for provenance. Cost: one read per workflow file not already
 # read for the named callers (WORKFLOW_TEXT), plus one compare per DISTINCT SHA
 # in the run (pin_in_history's cache) — the listing is the one facts_for has.
 declare -A WORKFLOW_TEXT=()
@@ -363,14 +455,14 @@ declare -A WORKFLOW_TEXT=()
 #   (the files holding a pin with that verdict), wf_unread (files whose read
 #   came back empty — an unread file is unscanned, never clean), wf_refused
 #   (names not safe to put in a URL or a fact, also unscanned), wf_not_sha
-#   (files holding a fleet reference whose ref is not a 40-hex SHA),
-#   wf_obfuscated (files where an escape could spell one — obfuscated_in),
-#   wf_unparsed (files the YAML parser could not load: judged on their
-#   literal text only), wf_no_parser (1 when no PyYAML was found, so no file
-#   was decoded). Both mean a partial scan.
+#   (files holding a candidate fleet reference not in canonical form —
+#   FLEET_CANON_ERE), wf_obfuscated (files where an escape could spell one —
+#   obfuscated_in), wf_unparsed (files the YAML parser could not load: their
+#   literal text is still judged, and the file FAILS), wf_no_parser (1 when no
+#   PyYAML was found, so no file was decoded: FAILS).
 #   facts_for adds wf_listing_unreadable=1 instead when the listing failed.
 workflow_pin_facts() {
-  local repo="$1" names="$2" name text pins sha v count=0 refused=0
+  local repo="$1" names="$2" name text tokens pins sha v count=0 refused=0
   local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
   local unparsed="" no_parser=0 decoded
   ensure_yaml || no_parser=1
@@ -391,20 +483,28 @@ workflow_pin_facts() {
       unread="${unread:+$unread,}$name"
       continue
     fi
-    # The literal text first (comments count), then what the parser decodes.
-    # A file the parser cannot load is still judged on its literal text, and
-    # is named as unparsed — a partial scan, never a clean one.
+    # The literal text's candidates first (comments count), then the parser's.
+    # The decoded candidates are ALREADY tokens and are not re-tokenized: a
+    # whole `uses` value may hold a quote or a space that would split it.
+    tokens=$(fleet_tokens_in "$text")
     if [ "$no_parser" = "0" ]; then
       decoded=$(decoded_fleet_refs "$text")
       if printf '%s\n' "$decoded" | grep -cx '#ERR' >/dev/null; then
+        # A file that does not load yields NO decoded candidates, even when
+        # the decoder printed some before it failed (a decode killed by the
+        # timeout): strings from a document the parser rejected are not what
+        # GitHub would read, so half of them is neither a verdict nor safe to
+        # pass. The file is FAILED as unparsed instead, and its literal text is
+        # still judged above, so a visible bad pin in it is reported as well.
         unparsed="${unparsed:+$unparsed,}$name"
       else
-        text="$text"$'\n'"$decoded"
+        tokens="$tokens"$'\n'"$decoded"
       fi
     fi
-    [ -n "$(refs_not_sha_in "$text")" ] && not_sha="${not_sha:+$not_sha,}$name"
+    tokens=$(printf '%s\n' "$tokens" | grep -v '^$' | awk '!seen[$0]++')
+    [ -n "$(printf '%s\n' "$tokens" | fleet_noncanonical)" ] && not_sha="${not_sha:+$not_sha,}$name"
     [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$name"
-    pins=$(pins_in "$text" '[A-Za-z0-9._-]+\.ya?ml')
+    pins=$(canonical_shas "$tokens")
     while IFS= read -r sha; do
       [ -z "$sha" ] && continue
       count=$((count + 1))

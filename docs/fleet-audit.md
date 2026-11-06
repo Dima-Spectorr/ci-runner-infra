@@ -111,24 +111,55 @@ so in the `pool`, `lane` and `checks` tiers every `.github/workflows/*.yml` /
 `*.yaml` in the repository — the extension in **any case**, since `CI.YML` runs
 exactly like `ci.yml` — is read, from the listing the audit already takes,
 reusing the named callers' texts, so the extra cost is one read per other
-workflow file. Every `ci-runner-infra/.github/workflows/<x>@<sha>` in it is
-judged the same way. A pin is a SHA only when the 40 hex characters end the
-ref: `@<40 hex>x` is a branch or tag that starts like one.
+workflow file.
+
+**Find every candidate, then demand the canonical form.** The scan does not
+list the shapes that count as a fleet call — a list let every shape outside it
+read clean (`merge+lane.yml`, `m~l.yml`, `mergé.yml`, `merge lane.yml`,
+`ci-runner-infra//.github/…`, which GitHub resolves by dropping the empty
+segment, and `…/workflows/merge-lane@<sha>` with no extension, each pinned to an
+imposter). Instead every **candidate** is found — a token that names
+`ci-runner-infra` (any case), also names `.github` and `workflows`, and runs to
+an `@` — and each must **fully** match
+
+    ^[A-Za-z0-9-]+/ci-runner-infra/\.github/workflows/[^/@\s]+@[0-9a-f]{40}$
+
+(case-insensitive; the SHA is lowercased before it is compared). A candidate
+that does not match fails as `workflow-pin-not-a-sha`; one that does is a pin,
+and is judged for provenance as above. A new shape can only fail.
+
+In the file's text a token starts after whitespace, a quote, a bracket, a brace
+or a comma, runs through anything but `@` and quotes — so a space, `+`, `~`, a
+doubled slash or a non-ASCII byte stays inside it — and its ref ends at
+whitespace, a quote, a comma, a bracket or a brace. **Prose is not a call:** a
+line that names `ci-runner-infra/.github/workflows/<x>` with no `@` after it (a
+comment saying which callee a job uses, a docs URL such as
+`…/ci-runner-infra/blob/main/.github/workflows/x.yml`) yields no candidate,
+because a reusable-workflow call must carry `@<ref>`. A line that does carry an
+`@` after the name is judged even in a comment, so a comment writing `…@v5`, or
+an e-mail address after the name on the same line, fails — visible noise in the
+consumer's own file, never a silent pass.
 
 **Decoded, not only read.** YAML is not text: `"\x75ses"` is the key `uses`,
-`/` is `/`, a `uses:` value can sit on the line after a comment, and
+`\x2f` is `/`, a `uses:` value can sit on the line after a comment, and
 `? uses` / `: "…"` is an explicit key — each spelled a fleet call no text match
 saw. So every workflow is also loaded with PyYAML (the parser
-`check-runner-policy.sh` already uses; the audit job installs `python3-yaml`
-when the runner lacks it), and every string the documents yield — keys and
-values, aliases resolved — that names `ci-runner-infra/.github/workflows/` is
-judged by the same rules. The literal scan stays as the first layer, so a
-commented pin (which a parser drops) still counts.
+`check-runner-policy.sh` already uses). The **value of any `uses` key** that
+names the fleet's workflows is a candidate **whole** — it is exactly what
+GitHub reads, so a space or quote inside it fails the match instead of
+splitting it; every other string the documents yield (keys and values, aliases
+resolved) is tokenized like a text line. The literal scan stays as the first
+layer, so a commented pin (which a parser drops) still counts. The decoder is
+bounded: a workflow over 1 MiB is not decoded, and a decode that runs past 30
+seconds is killed — both are reported unparsed. The audit job makes PyYAML a
+**precondition**: it installs `python3-yaml` when the runner lacks it and stops
+if it still cannot import it.
 
-- `fail:workflow-pin-not-a-sha files=<a.yml,…>` — a fleet reference whose ref is
-  not exactly a 40-hex SHA: a tag (`@v5`), a branch (`@main`), a short SHA,
-  `refs/pull/<n>/head`, `<40 hex>x`, or nothing at all. Whatever the ref points
-  at today runs, so its provenance cannot be judged.
+- `fail:workflow-pin-not-a-sha files=<a.yml,…>` — a candidate fleet reference
+  not in the canonical form: a tag (`@v5`), a branch (`@main`), a short SHA,
+  `refs/pull/<n>/head`, `<40 hex>x`, an empty ref, a doubled slash, whitespace
+  in the callee name. Whatever such a ref points at today runs, so its
+  provenance cannot be judged.
 - `warn:workflow-pin-obfuscated files=<a.yml,…>` — a YAML double-quoted escape
   can spell a fleet reference no extractor sees (`c\x69-runner-infra`, or a
   backslash-newline joining two halves of a SHA). The rule, chosen to stay quiet
@@ -146,12 +177,17 @@ commented pin (which a parser drops) still counts.
   own line.
 - `warn:workflow-pin-history-unknown pin=<sha8> files=…` — no imposter, but some
   pin's provenance could not be established.
-- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n> [unparsed=<files>]`
-  — a file whose read came back empty, or a name the audit will not put in a
-  URL, was not scanned; an `unparsed` file did not load in the YAML parser and
-  was judged on its literal text only. An unscanned file is never a clean one.
-- `warn:workflow-pin-scan-incomplete yaml-parser-unavailable decoded-layer-skipped`
-  — no PyYAML was found, so no file was decoded.
+- `warn:workflow-pin-scan-incomplete unread=<files> refused=<n>` — a file whose
+  read came back empty, or a name the audit will not put in a URL, was not
+  scanned. An unscanned file is never a clean one.
+- `fail:workflow-pin-unparsed files=<a.yml,…>` — a file the YAML parser could
+  not load (or that exceeded the decoder's bounds). GitHub may still run it, and
+  an escaped or explicit-key `uses` in it is invisible to the text scan, so it
+  fails. Its literal text is still judged, so a visible bad pin is reported too;
+  strings decoded before the failure are discarded, not half-trusted.
+- `fail:workflow-pin-yaml-parser-unavailable decoded-layer-skipped` — no PyYAML
+  was found, so no file was decoded. A run without the parser can never report a
+  repository compliant.
 
 ### The two-file lane
 

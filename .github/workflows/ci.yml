@@ -940,11 +940,14 @@ jobs:
       # without anything outside this file having to change.
       - name: fleet-audit collector self-test
         run: |
-          # The pin scan's decoded layer needs PyYAML (#1716); same guard as
-          # the other PyYAML readers in this pipeline.
-          python3 -c 'import yaml' 2>/dev/null || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq python3-yaml
+          # The pin scan's decoded layer needs PyYAML (#1716). A precondition:
+          # without it the decoder cases cannot run, so the step stops here.
+          python3 -I -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml &&
+              python3 -I -c 'import yaml'
+          } || {
+            echo 'fleet-audit collector self-test: PyYAML is not importable and python3-yaml did not install' >&2
+            exit 1
           }
           bash scripts/ci/fleet-audit-collector.selftest.sh
 

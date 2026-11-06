@@ -43,8 +43,9 @@ _fleet_say() {
 
 # _fleet_workflow_pins <scanned> <verdict> <pin> <files> <unread> <refused> —
 # the every-workflow provenance scan (#1716). Says nothing when the scan did not
-# run; an imposter anywhere fails, an unknown warns, and an unscanned file is a
-# warning of its own — a file the audit could not read is never a clean one.
+# run; an imposter anywhere fails, an unknown warns, an unread file is a
+# warning of its own — a file the audit could not read is never a clean one —
+# and a file it read but could not DECODE, or a run with no decoder, fails.
 #   …then <not-sha-files> <obfuscated-files> <listing-unreadable>
 #   <unparsed-files> <no-parser>.
 _fleet_workflow_pins() {
@@ -65,12 +66,15 @@ _fleet_workflow_pins() {
     0) _fleet_say "fail:workflow-pin-not-in-fleet-history pin=${pin:0:8} files=${files:-?} not-reachable-from-the-fleet-default-branch" ;;
     *) _fleet_say "warn:workflow-pin-history-unknown pin=${pin:0:8} files=${files:-?}" ;;
   esac
-  if [ -n "$unread" ] || [ -n "$unparsed" ] || { [ -n "$refused" ] && [ "$refused" != "0" ]; }; then
-    _fleet_say "warn:workflow-pin-scan-incomplete unread=${unread:-none} refused=${refused:-0}${unparsed:+ unparsed=$unparsed}"
+  if [ -n "$unread" ] || { [ -n "$refused" ] && [ "$refused" != "0" ]; }; then
+    _fleet_say "warn:workflow-pin-scan-incomplete unread=${unread:-none} refused=${refused:-0}"
   fi
+  # A file the parser could not load is one GitHub may still run: its escaped
+  # or explicit-key `uses` is invisible to the text scan, so it FAILS (#1716).
+  [ -n "$unparsed" ] && _fleet_say "fail:workflow-pin-unparsed files=$unparsed"
   # No YAML parser: every file was read only as text, which an escaped or
-  # explicit-key `uses` defeats. A partial scan, never a clean one.
-  [ "$no_parser" = "1" ] && _fleet_say "warn:workflow-pin-scan-incomplete yaml-parser-unavailable decoded-layer-skipped"
+  # explicit-key `uses` defeats. Such a run can never report a repo compliant.
+  [ "$no_parser" = "1" ] && _fleet_say "fail:workflow-pin-yaml-parser-unavailable decoded-layer-skipped"
   return 0
 }
 
@@ -124,14 +128,16 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #   wf_history_pin, wf_history_files  the pin and the files that verdict names
 #   wf_unread     workflow files whose read came back empty (unscanned)
 #   wf_refused    count of workflow names the collector would not read
-#   wf_not_sha    files holding a fleet reference whose ref is not a 40-hex
-#                 SHA (tag, branch, short SHA, refs/pull/..., <40hex>x) -> fail
+#   wf_not_sha    files holding a candidate fleet reference that is not in
+#                 the canonical `<owner>/ci-runner-infra/.github/workflows/
+#                 <file>@<40 hex>` form (tag, branch, short SHA, <40hex>x,
+#                 doubled slash, a space in the name, ...) -> fail
 #   wf_obfuscated files where a backslash escape on a uses-line could spell a
 #                 fleet reference -> warn
 #   wf_listing_unreadable  1 when the workflows listing itself failed -> warn
 #                 scan-incomplete; nothing else in the scan is judged
-#   wf_unparsed   files the YAML parser could not load (literal scan only) -> warn
-#   wf_no_parser  1 when no YAML parser was found, so nothing was decoded -> warn
+#   wf_unparsed   files the YAML parser could not load (literal scan only) -> fail
+#   wf_no_parser  1 when no YAML parser was found, so nothing was decoded -> fail
 #   relay_match   1 if the review relay's `name:` is what the events file's
 #                 `workflow_run: workflows:` hears, 0 if not (or no relay), ""
 #                 if unread

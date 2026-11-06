@@ -667,9 +667,9 @@ eq "$(pins_in "$PROBE2" 'merge-lane\.yml')" "$BAD" "a '#'-led line inside a quot
 eq "$(pins_in "    uses: $CALLEE@${GOOD}x" 'merge-lane\.yml')" "" "<40 hex>x is not a SHA pin"
 eq "$(pins_in "    uses: \"$CALLEE@$BAD\"" 'merge-lane\.yml')" "$BAD" "a quoted SHA pin is still a pin"
 for REF in v5 main 1234567 "${GOOD}x" refs/pull/1/head "refs/pull/1/${GOOD}x" ""; do
-  eq "$(refs_not_sha_in "    uses: $CALLEE@$REF")" "${REF:-<empty>}" "a fleet ref '@${REF:-<empty>}' is reported as not a SHA"
+  eq "$(refs_not_sha_in "    uses: $CALLEE@$REF")" "$CALLEE@$REF" "a fleet ref '@${REF:-<empty>}' is reported as not canonical"
 done
-eq "$(refs_not_sha_in "    uses: '$CALLEE@v5' # tag")" "v5" "a quoted tag ref stops at the quote"
+eq "$(refs_not_sha_in "    uses: '$CALLEE@v5' # tag")" "$CALLEE@v5" "a quoted tag ref stops at the quote"
 eq "$(refs_not_sha_in "    uses: $CALLEE@$GOOD")" "" "a 40-hex SHA ref is not reported"
 eq "$(refs_not_sha_in "    uses: actions/checkout@v4")" "" "a non-fleet ref by tag is not this rule's business"
 
@@ -822,6 +822,97 @@ eq "$(ensure_yaml() { return 1; }; workflow_pin_facts svc-a p4.yml | grep -o 'wf
    "no YAML parser is reported, never a clean scan"
 eq "$(decoded_fleet_refs "$(printf 'a: &x [*x, "ci-runner-infra/.github/workflows/y.yml@v1"]')")" "ci-runner-infra/.github/workflows/y.yml@v1" \
    "a recursive alias does not hang the decoder"
+
+# Security review round 4: the matching is INVERTED. Every candidate fleet
+# reference must fully match the canonical form, so a shape the old allow-list
+# did not know — each pinned to the imposter — can no longer read clean. The
+# YAML is the reviewer's probe files byte for byte, the SHA swapped for BAD.
+# Each shape either fails as not-a-sha or is a canonical pin that provenance
+# then fails; nothing in between.
+declare -A R4=()
+R4[PLUS]='    uses: acme/ci-runner-infra/.github/workflows/merge+lane.yml@'"$BAD"
+R4[TILDE]='    uses: acme/ci-runner-infra/.github/workflows/m~l.yml@'"$BAD"
+R4[UNI]='    uses: acme/ci-runner-infra/.github/workflows/mergé.yml@'"$BAD"
+R4[SPACE]='    uses: acme/ci-runner-infra/.github/workflows/merge lane.yml@'"$BAD"
+R4[NOEXT]='    uses: acme/ci-runner-infra/.github/workflows/merge-lane@'"$BAD"
+R4[DSL1]='    uses: acme/ci-runner-infra//.github/workflows/merge-lane.yml@'"$BAD"
+R4[DSL2]='    uses: acme/ci-runner-infra/.github//workflows/merge-lane.yml@'"$BAD"
+R4[DSL3]='    uses: acme/ci-runner-infra/.github/workflows//merge-lane.yml@'"$BAD"
+# shellcheck disable=SC2016
+R4[ESPLUS]='    "\x75ses": "acme/ci-runner-\x69nfra\x2f.github\x2fworkflows\x2fm\x2bl.yml@'"$BAD"'"'
+r4() { printf 'on: push\njobs:\n  a:\n%s\n' "$1"; }
+r4_facts() { FILE_BY_PATH=([.github/workflows/p.yml]="{\"content\":\"$(b64 "$(r4 "$1")")\"}"); workflow_pin_facts svc-a p.yml; }
+for R in PLUS TILDE UNI NOEXT ESPLUS; do
+  eq "$(r4_facts "${R4[$R]}" | grep -o 'wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*')" \
+     "wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=p.yml" "round 4 ${R,,}: a canonical-form pin to an imposter fails provenance"
+done
+for R in SPACE DSL1 DSL2 DSL3; do
+  eq "$(r4_facts "${R4[$R]}" | grep -o 'wf_not_sha=[^;]*')" "wf_not_sha=p.yml" "round 4 ${R,,}: a non-canonical fleet reference fails as not-a-sha"
+done
+# The same shapes with NO parser: the text layer alone still refuses them.
+for R in PLUS TILDE UNI NOEXT; do
+  eq "$(pins_in "${R4[$R]}" '[^/@[:space:]]+')" "$BAD" "round 4 ${R,,}: the text layer reads the pin without the parser"
+done
+for R in SPACE DSL1 DSL2 DSL3; do
+  eq "$(refs_not_sha_in "${R4[$R]}" | grep -c .)" "1" "round 4 ${R,,}: the text layer reports it as not canonical without the parser"
+done
+eq "$(decoded_fleet_refs "$(r4 "${R4[SPACE]}")")" "acme/ci-runner-infra/.github/workflows/merge lane.yml@$BAD" \
+   "a uses value is decoded WHOLE, so a space stays inside the candidate"
+# shellcheck disable=SC2016
+R4_SQ="    uses: 'acme/ci-runner-infra/.github/workflows/m''l.yml@x'"
+eq "$(r4_facts "$R4_SQ" | grep -o 'wf_not_sha=[^;]*')" "wf_not_sha=p.yml" "a quote inside a single-quoted uses value cannot split the decoded candidate"
+
+# The round-4 probes that already failed keep their verdicts (each pins @main).
+# shellcheck disable=SC2016
+R4[BOM]=$'\xef\xbb\xbf''on: push
+jobs:
+  a:
+    uses: "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main"'
+# shellcheck disable=SC2016
+R4[MERGE]='on: push
+jobs:
+  a:
+    <<: {uses: "acme/ci-runner-\x69nfra/.github/workflows/merge-lane.yml@main"}
+    runs-on: x'
+# shellcheck disable=SC2016
+R4[SLASHESC]='on: push
+jobs:
+  a:
+    uses: "acme/ci-runner-infra\/.github\/workflows\/merge-lane.yml@main"'
+# shellcheck disable=SC2016
+R4[SURR]='on: push
+jobs:
+  a:
+    name: "\ud800"
+    uses: "acme/ci-runner-\x69nfra/.github/workflows/merge-lane.yml@main"'
+# The NUL probe: bash drops the byte (as file_at's `$(…)` does in production).
+R4[NUL]="$(printf 'on: push\njobs:\n  a:\n    uses: "acme/ci-runner-infra/.github/workflows/merge-lane.yml@main"\n\0\n' 2>/dev/null)"
+for R in BOM MERGE SLASHESC SURR NUL; do
+  FILE_BY_PATH=([.github/workflows/p.yml]="{\"content\":\"$(b64 "${R4[$R]}")\"}")
+  eq "$(workflow_pin_facts svc-a p.yml | grep -o 'wf_not_sha=[^;]*;wf_obfuscated=[^;]*;wf_unparsed=[^;]*')" \
+     "wf_not_sha=p.yml;wf_obfuscated=$(case $R in MERGE|SLASHESC|SURR) echo p.yml ;; esac);wf_unparsed=" \
+     "round 4 ${R,,}: still fails as not-a-sha"
+done
+eq "$(r4_facts "    uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@$GOOD" | grep -o 'wf_pins=[^;]*;wf_pin_in_history=[^;]*;wf_history_pin=[^;]*;wf_history_files=[^;]*;wf_unread=[^;]*;wf_refused=[^;]*;wf_not_sha=[^;]*')" \
+   "wf_pins=1;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=" "round 4 base: a canonical pin in history is quiet"
+
+# Prose that names a fleet workflow with no `@` is not a call; a comment that
+# pins one still counts, and a docs URL is not a candidate.
+PROSE='# This job calls acme/ci-runner-infra/.github/workflows/merge-lane.yml (see
+# https://github.com/acme/ci-runner-infra/blob/main/.github/workflows/merge-lane.yml)
+jobs:
+  a:
+    uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@'"$GOOD"'
+    with: {note: "acme/ci-runner-infra/.github/workflows/merge-lane.yml is the lane"}'
+eq "$(r4_facts "$PROSE" | grep -o 'wf_pins=[^;]*;wf_pin_in_history=[^;]*;.*wf_not_sha=[^;]*')" \
+   "wf_pins=1;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=" "prose and a docs URL with no @ are not calls"
+eq "$(refs_not_sha_in "    # uses: acme/ci-runner-infra/.github/workflows/merge-lane.yml@v5")" "acme/ci-runner-infra/.github/workflows/merge-lane.yml@v5" \
+   "a commented fleet reference by tag still fails"
+
+# The decoder's bounds: an oversize workflow and a decoder that fails are unparsed.
+eq "$(DECODE_MAX_BYTES=10 decoded_fleet_refs "jobs: {a: {uses: x}}")" "#ERR" "a workflow over the size cap is not decoded"
+# shellcheck disable=SC2030,SC2031
+eq "$(PY_BIN=false decoded_fleet_refs "jobs: {}")" "#ERR" "a decoder that fails reports #ERR"
 
 # A workflows listing that could not be read is unscanned in every tier that
 # scans, never a clean scan with nothing in it.

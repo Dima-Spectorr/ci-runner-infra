@@ -243,10 +243,17 @@ for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;
     "$BASE;wf_scanned=1;wf_listing_unreadable=1"
   hasnt "workflow-pin-not-a-sha" "an empty not-a-sha fact is quiet ($T)" "$BASE;$WF_OK;wf_not_sha="
   hasnt "workflow-pin-obfuscated" "an empty obfuscated fact is quiet ($T)" "$BASE;$WF_OK;wf_obfuscated="
-  # Round 3: the decoded layer's own partial scans.
-  has "warn:workflow-pin-scan-incomplete unread=none refused=0 unparsed=bad.yml" "a file the parser cannot load is unscanned ($T)" \
+  # Round 3/4: a file the parser cannot load, or a run with no parser, FAILS —
+  # GitHub runs a file the audit could not decode, so it never reads clean.
+  has "fail:workflow-pin-unparsed files=bad.yml,x.yaml" "a file the parser cannot load fails ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml,x.yaml;wf_no_parser=0"
+  hasnt "ok:compliant" "a file the parser cannot load is never compliant ($T)" \
     "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
-  has "warn:workflow-pin-scan-incomplete yaml-parser-unavailable" "a missing YAML parser is a partial scan ($T)" \
+  hasnt "workflow-pin-scan-incomplete" "an unparsed file is its own failure, not a scan-incomplete warning ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=bad.yml;wf_no_parser=0"
+  has "fail:workflow-pin-yaml-parser-unavailable" "a missing YAML parser fails ($T)" \
+    "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
+  hasnt "ok:compliant" "a run with no YAML parser is never compliant ($T)" \
     "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=1"
   hasnt "workflow-pin-scan-incomplete" "a parsed scan with every file loaded is quiet ($T)" \
     "$BASE;$WF_OK;wf_unparsed=;wf_no_parser=0"
