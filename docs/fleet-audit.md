@@ -75,11 +75,14 @@ repository's default branch (`compare/<default-branch>...<sha>`, one call per
 distinct SHA per run, cached across repositories).
 
 **Every pin, not the first.** A caller can hold several pins — a second job
-calling the same callee, or a commented-out line above the real one. Comments
-are not pins: a line whose first non-space character is `#` is skipped, and a
-trailing ` #…` is cut before matching, so a commented decoy that *is* in the
-history cannot stand in for the real `uses:` line. Every remaining pin is
-de-duplicated and judged, and the **worst verdict wins**: any pin not in the
+calling the same callee, or a commented-out line above the real one. **Comments
+are not stripped**: a line-based comment strip cannot see YAML quoting, and both
+`{name: "a #", uses: …@<imposter>}` and a `#`-led line inside a multi-line
+double-quoted scalar hid the real pin from it. So every match in the file —
+commented or not — is a pin; a commented decoy can only *add* a pin to judge,
+never hide one (a stale or foreign SHA in a comment is reported: visible noise,
+never a silent pass). Every pin is de-duplicated and judged, and the **worst
+verdict wins**: any pin not in the
 history fails, else any unknown warns, else the caller is quiet. The finding
 names the pin that made the verdict. `<caller>-pin-stale` judges every pin the
 same way: any pin that is not the expected release is stale, and the finding
@@ -105,10 +108,27 @@ the reaper — report per caller:
 
 **Every workflow, not four.** Any workflow can call a fleet reusable workflow,
 so in the `pool`, `lane` and `checks` tiers every `.github/workflows/*.yml` /
-`*.yaml` in the repository is read — from the listing the audit already takes,
+`*.yaml` in the repository — the extension in **any case**, since `CI.YML` runs
+exactly like `ci.yml` — is read, from the listing the audit already takes,
 reusing the named callers' texts, so the extra cost is one read per other
-workflow file — and every non-comment `ci-runner-infra/.github/workflows/<x>@<sha>`
-in it is judged the same way:
+workflow file. Every `ci-runner-infra/.github/workflows/<x>@<sha>` in it is
+judged the same way. A pin is a SHA only when the 40 hex characters end the
+ref: `@<40 hex>x` is a branch or tag that starts like one.
+
+- `fail:workflow-pin-not-a-sha files=<a.yml,…>` — a fleet reference whose ref is
+  not exactly a 40-hex SHA: a tag (`@v5`), a branch (`@main`), a short SHA,
+  `refs/pull/<n>/head`, `<40 hex>x`, or nothing at all. Whatever the ref points
+  at today runs, so its provenance cannot be judged.
+- `warn:workflow-pin-obfuscated files=<a.yml,…>` — a YAML double-quoted escape
+  can spell a fleet reference no extractor sees (`c\x69-runner-infra`, or a
+  backslash-newline joining two halves of a SHA). The rule, chosen to stay quiet
+  on real workflows: a backslash on a line holding a `uses:` key, the text
+  `runner-infra` or `.github/workflows` (any case), or on the value line after
+  a bare `uses:`. A `uses:` value never needs a backslash.
+- `warn:workflow-pin-scan-incomplete workflows-listing-unreadable` — the
+  workflows listing itself could not be read (and the repository did not answer
+  as one with no workflows). Nothing was scanned, so nothing else in the scan is
+  judged, and the repository is never reported compliant.
 
 - `fail:workflow-pin-not-in-fleet-history pin=<sha8> files=<a.yml,b.yml>` — some
   pin is not reachable from the default branch; `files` names every file that

@@ -639,17 +639,64 @@ CALLEE="acct/ci-runner-infra/.github/workflows/merge-lane.yml"
 job() { printf '  %s:\n    uses: %s@%s\n' "$1" "$CALLEE" "$2"; }
 
 # The reviewer's reproduction: a commented decoy, in history, above the real pin.
+# Comments are NOT stripped (a line-based strip cannot see quoting, below), so
+# the decoy is judged as a pin too — it can only add a pin, never hide one, and
+# the worst verdict, the imposter, wins.
 DECOY="jobs:
   # uses: $CALLEE@$GOOD
 $(job lane "$BAD")"
-eq "$(pins_in "$DECOY" 'merge-lane\.yml')" "$BAD" "a commented decoy pin is not a pin"
-eq "$(pin_in "$DECOY" 'merge-lane\.yml')" "$BAD" "and pin_in no longer reads the decoy"
-eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$BAD;lane_pins=$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
-   "a decoy comment above an imposter pin fails provenance"
+eq "$(pins_in "$DECOY" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a commented decoy is read as well as the real pin"
+eq "$(pin_in "$DECOY" 'merge-lane\.yml')" "$GOOD" "pin_in is the first pin, decoy or not"
+eq "$(caller_pin_facts lane "$DECOY" 'merge-lane\.yml')" "lane_pin=$GOOD;lane_pins=$GOOD,$BAD;lane_pin_in_history=0;lane_history_pin=$BAD" \
+   "a decoy comment above an imposter pin still fails provenance, naming the imposter"
 
-# A pin that appears only in a trailing comment is not a pin either.
+# A pin in a trailing comment is judged too: noise, never a silent pass.
 TRAIL="    uses: $CALLEE@$GOOD # was $CALLEE@$BAD"
-eq "$(pins_in "$TRAIL" 'merge-lane\.yml')" "$GOOD" "a pin in a trailing comment is not a pin"
+eq "$(pins_in "$TRAIL" 'merge-lane\.yml' | tr '\n' ' ')" "$GOOD $BAD " "a pin in a trailing comment is judged too"
+
+# The security review's two probes (round 2): a ` #` inside a quoted string, and
+# a `#`-led line inside a multi-line double-quoted flow scalar. Comment
+# stripping hid the imposter in both.
+PROBE1="jobs: {x: {name: \"a #\", uses: $CALLEE@$BAD}}"
+eq "$(pins_in "$PROBE1" 'merge-lane\.yml')" "$BAD" "a ' #' inside a quoted flow-mapping value does not hide the pin"
+PROBE2="jobs: {x: {name: \"a
+  # b\", uses: $CALLEE@$BAD}}"
+eq "$(pins_in "$PROBE2" 'merge-lane\.yml')" "$BAD" "a '#'-led line inside a quoted multi-line scalar does not hide the pin"
+
+# A ref that only STARTS like a SHA is a branch or tag: not a pin, but a not-a-sha.
+eq "$(pins_in "    uses: $CALLEE@${GOOD}x" 'merge-lane\.yml')" "" "<40 hex>x is not a SHA pin"
+eq "$(pins_in "    uses: \"$CALLEE@$BAD\"" 'merge-lane\.yml')" "$BAD" "a quoted SHA pin is still a pin"
+for REF in v5 main 1234567 "${GOOD}x" refs/pull/1/head "refs/pull/1/${GOOD}x" ""; do
+  eq "$(refs_not_sha_in "    uses: $CALLEE@$REF")" "${REF:-<empty>}" "a fleet ref '@${REF:-<empty>}' is reported as not a SHA"
+done
+eq "$(refs_not_sha_in "    uses: '$CALLEE@v5' # tag")" "v5" "a quoted tag ref stops at the quote"
+eq "$(refs_not_sha_in "    uses: $CALLEE@$GOOD")" "" "a 40-hex SHA ref is not reported"
+eq "$(refs_not_sha_in "    uses: actions/checkout@v4")" "" "a non-fleet ref by tag is not this rule's business"
+
+# An escape in a double-quoted scalar can spell a fleet reference neither
+# extractor sees: `\x69` for `i`, and a backslash-newline joining two halves.
+eq "$(obfuscated_in "    uses: \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\"")" "1" "a \\x69 escape on a uses line is obfuscated"
+CONT="    uses: \"$CALLEE@bbbbbbbbbbbbbbbbbbbb\\
+      bbbbbbbbbbbbbbbbbbbb\""
+eq "$(obfuscated_in "$CONT")" "1" "a backslash continuation on a uses line is obfuscated"
+eq "$(pins_in "$CONT" 'merge-lane\.yml')" "" "and the split pin is invisible to the extractor, which is why it warns"
+NEXT="    uses: >-
+      \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\""
+eq "$(obfuscated_in "$NEXT")" "1" "an escape on the value line after a bare uses: is obfuscated"
+ORDINARY="name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: printf 'a\\tb\\n' | grep -E '\\s'
+      - run: |
+          echo \"done\" \\
+            && true
+  lane:
+    uses: $CALLEE@$GOOD"
+eq "$(obfuscated_in "$ORDINARY")" "" "an ordinary workflow with backslashes in run: text does not warn"
 
 # Two jobs call the same callee; the second is the imposter. Worst wins, the
 # stale rule still reads the first, and the finding names the imposter.
@@ -700,26 +747,44 @@ ci.yml
 deploy.yaml
 README.md"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
    "an imposter pin in an extra workflow file fails, naming the file"
 eq "$(grep -c '/contents/' "$PROV_CALLS")" "2" "only the files not already read are fetched, and non-YAML is skipped"
 eq "$(grep -c 'contents/.github/workflows/merge-lane.yml' "$PROV_CALLS")" "0" "the named caller's text is reused"
 
 FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$GOOD}")\"}"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
    "every pin in every workflow in history is quiet"
 
 FILE_BY_PATH[.github/workflows/deploy.yaml]="{\"content\":\"$(b64 "${OTHER/$BAD/$UNK}")\"}"
 eq "$(workflow_pin_facts svc-a "$LIST")" \
-   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0" \
+   "wf_scanned=1;wf_pins=2;wf_pin_in_history=;wf_history_pin=$UNK;wf_history_files=deploy.yaml;wf_unread=;wf_refused=0;wf_not_sha=;wf_obfuscated=" \
    "an unknown provenance in an extra file is unknown, naming the file"
 
 # shellcheck disable=SC2034  # read by workflow_pin_facts
 WORKFLOW_TEXT=()
 eq "$(workflow_pin_facts svc-a "$(printf 'gone.yml\r\na;b.yml\r\n')")" \
-   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1" \
+   "wf_scanned=1;wf_pins=0;wf_pin_in_history=1;wf_history_pin=;wf_history_files=;wf_unread=gone.yml;wf_refused=1;wf_not_sha=;wf_obfuscated=" \
    "an unreadable file and an unsafe name are reported as unscanned, never clean"
+
+# Upper-case extensions run exactly like lower-case ones, so they are scanned;
+# a tag-pinned and an escaped fleet call are named in their own facts.
+FILE_BY_PATH=([.github/workflows/CI.YML]="{\"content\":\"$(b64 "$OTHER")\"}"
+              [.github/workflows/tag.Yaml]="{\"content\":\"$(b64 "    uses: $CALLEE@v5")\"}"
+              [.github/workflows/esc.yml]="{\"content\":\"$(b64 "    uses: \"o/c\\x69-runner-infra/.github/workflows/merge-lane.yml@$BAD\"")\"}")
+eq "$(workflow_pin_facts svc-a "$(printf 'CI.YML\ntag.Yaml\nesc.yml\nnotes.TXT')")" \
+   "wf_scanned=1;wf_pins=1;wf_pin_in_history=0;wf_history_pin=$BAD;wf_history_files=CI.YML;wf_unread=;wf_refused=0;wf_not_sha=tag.Yaml;wf_obfuscated=esc.yml" \
+   "an upper-case .YML is scanned, a tag ref is not-a-sha, an escape is obfuscated"
+
+# A workflows listing that could not be read is unscanned in every tier that
+# scans, never a clean scan with nothing in it.
+FILE_BY_PATH=()
+for TIER in checks pool lane; do
+  eq "$(facts_for svc-a "$TIER" "$GOOD" | grep -o 'wf_scanned=1;wf_listing_unreadable=1')" "wf_scanned=1;wf_listing_unreadable=1" \
+     "an unreadable workflows listing is reported in the $TIER tier"
+done
+eq "$(facts_for svc-a dormant "$GOOD" | grep -c 'wf_')" "0" "a dormant repository is not scanned"
 FILE_BY_PATH=()
 COMPARE_BY_SHA=()
 # shellcheck disable=SC2034  # read by pin_in_history

@@ -120,11 +120,18 @@ file_at() {
 # pins_in <file-contents> <callee-regex> — EVERY sha a file pins for the callee,
 # one per line, lowercased, de-duplicated in first-appearance order (#1716).
 #
-# COMMENTS ARE NOT PINS. A line whose first non-space character is `#` is
-# dropped, and a trailing ` #…` is cut before matching: a commented decoy pin
-# (in history) above the real `uses:` line (an imposter) read as the pin when
-# only the first match was taken. Every pin is returned, not the first, because
-# a second job calling the same callee is a second pin to judge.
+# EVERY MATCH, COMMENTS INCLUDED. A commented decoy pin (in history) above the
+# real `uses:` line (an imposter) read as the pin when only the first match was
+# taken. Stripping comments was tried and is WRONG: line-based YAML comment
+# detection cannot see quoting, so `{name: "a #", uses: …@<imposter>}` and a
+# `#`-led line inside a multi-line double-quoted scalar hid the real pin. With
+# every match judged and the worst verdict winning, a decoy can only ADD a pin
+# to judge, never hide one. A commented pin is therefore judged too (stale or
+# foreign, it is reported) — visible noise, never a silent pass.
+#
+# THE SHA MUST END THERE. `@<40 hex>` followed by another ref character (`x`,
+# `/`, `.`, `-`, `_`) is not a SHA pin — it is a branch or tag that starts like
+# one — so it is not returned here; refs_not_sha_in reports it.
 #
 # CASE-INSENSITIVE on the path, and the SHA is lowercased. GitHub resolves an
 # owner/repository in any case (measured 2026-11-06: `compare` on
@@ -134,15 +141,40 @@ file_at() {
 # compared; it is correct whether or not Actions itself accepts upper-case hex.
 pins_in() {
   printf '%s\n' "$1" | tr -d '\r' \
-    | grep -vE '^[[:space:]]*#' \
-    | sed -E 's/[[:space:]]#.*$//' \
-    | grep -oiE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}" \
-    | grep -oiE '[0-9a-f]{40}$' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
+    | grep -oiE "ci-runner-infra/\.github/workflows/$2@[0-9a-f]{40}([^0-9a-z._/-]|$)" \
+    | sed -E 's/.*@([0-9a-fA-F]{40}).*/\1/' | tr 'A-F' 'a-f' | awk '!seen[$0]++'
 }
 
-# pin_in <file-contents> <callee> — the first non-comment pin, which is what the
-# pin-stale rule compares against the expected release. Provenance does not use
-# it: it judges every pin through pins_in.
+# refs_not_sha_in <file-contents> — every fleet reference whose ref is NOT
+# exactly a 40-hex SHA (a tag, a branch, `refs/pull/N/head`, a short SHA,
+# `<40 hex>x`, or nothing at all), one per line. Case-insensitive like pins_in.
+# The ref runs to the first whitespace, quote, comma, bracket or brace.
+refs_not_sha_in() {
+  printf '%s\n' "$1" | tr -d '\r' \
+    | grep -oiE "ci-runner-infra/\.github/workflows/[A-Za-z0-9._-]+@[^][[:space:]\"',{}]*" \
+    | sed -E 's/^[^@]*@//; s/^$/<empty>/' | grep -vE '^[0-9a-fA-F]{40}$' | awk '!seen[$0]++'
+}
+
+# obfuscated_in <file-contents> — 1 when a line could spell a fleet reference
+# through a YAML double-quoted escape, nothing otherwise. A backslash in such a
+# scalar can write any character (`c\x69-runner-infra`) or join two lines
+# (`@bbbb\` + newline + `bbbb`), and neither pins_in nor refs_not_sha_in can see
+# through it. The rule, chosen to be quiet on real workflows: a backslash on a
+# line that (case-insensitively) holds a `uses:` key, the text `runner-infra`
+# or `.github/workflows`, or that follows a `uses:` whose value starts on the
+# next line. A `uses:` value never needs a backslash, and the other two strings
+# appear in shell `run:` text far less often than escapes do in general.
+obfuscated_in() {
+  printf '%s\n' "$1" | tr -d '\r' | awk '
+    { l = tolower($0); bs = index($0, "\\") > 0
+      if (bs && (l ~ /uses[ \t"'\'']*:/ || l ~ /runner-infra/ || l ~ /\.github\/workflows/ || next_is_value)) found = 1
+      if (l ~ /uses[ \t"'\'']*:[ \t]*([>|][-+0-9]*)?[ \t]*$/) next_is_value = 1
+      else if (l !~ /^[ \t]*$/) next_is_value = 0 }
+    END { if (found) print 1 }'
+}
+
+# pin_in <file-contents> <callee> — the first pin. Both the stale rule and
+# provenance judge EVERY pin, through `<caller>_pins` and pins_history.
 pin_in() {
   pins_in "$1" "$2" | sed -n 1p
 }
@@ -253,13 +285,17 @@ declare -A WORKFLOW_TEXT=()
 #   verdict: 0 / "" / 1), wf_history_pin (the pin it names), wf_history_files
 #   (the files holding a pin with that verdict), wf_unread (files whose read
 #   came back empty — an unread file is unscanned, never clean), wf_refused
-#   (names not safe to put in a URL or a fact, also unscanned).
+#   (names not safe to put in a URL or a fact, also unscanned), wf_not_sha
+#   (files holding a fleet reference whose ref is not a 40-hex SHA),
+#   wf_obfuscated (files where an escape could spell one — obfuscated_in).
+#   facts_for adds wf_listing_unreadable=1 instead when the listing failed.
 workflow_pin_facts() {
   local repo="$1" names="$2" name text pins sha v count=0 refused=0
-  local unread="" bad="" bad_files="" unk="" unk_files=""
+  local unread="" bad="" bad_files="" unk="" unk_files="" not_sha="" obf=""
   while IFS= read -r name; do
     name="${name%$'\r'}"
-    case "$name" in *.yml|*.yaml) ;; *) continue ;; esac
+    # Any case: `CI.YML` runs exactly like `ci.yml`, so it is scanned too.
+    case "${name,,}" in *.yml|*.yaml) ;; *) continue ;; esac
     if ! printf '%s' "$name" | grep -cE '^[A-Za-z0-9._-]+$' >/dev/null; then
       refused=$((refused + 1))
       continue
@@ -273,6 +309,8 @@ workflow_pin_facts() {
       unread="${unread:+$unread,}$name"
       continue
     fi
+    [ -n "$(refs_not_sha_in "$text")" ] && not_sha="${not_sha:+$not_sha,}$name"
+    [ -n "$(obfuscated_in "$text")" ] && obf="${obf:+$obf,}$name"
     pins=$(pins_in "$text" '[A-Za-z0-9._-]+\.ya?ml')
     while IFS= read -r sha; do
       [ -z "$sha" ] && continue
@@ -291,8 +329,8 @@ workflow_pin_facts() {
   if [ -n "$bad" ]; then verdict=0; named="$bad"; files="$bad_files"
   elif [ -n "$unk" ]; then verdict=""; named="$unk"; files="$unk_files"
   fi
-  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s' \
-    "$count" "$verdict" "$named" "$files" "$unread" "$refused"
+  printf 'wf_scanned=1;wf_pins=%s;wf_pin_in_history=%s;wf_history_pin=%s;wf_history_files=%s;wf_unread=%s;wf_refused=%s;wf_not_sha=%s;wf_obfuscated=%s' \
+    "$count" "$verdict" "$named" "$files" "$unread" "$refused" "$not_sha" "$obf"
 }
 
 # --- the two-file lane (#1380, #1382) ------------------------------------------
@@ -833,7 +871,13 @@ facts_for() {
   # only for having CI at all. The named callers' texts are reused, not re-read.
   case "$tier" in
     pool|lane|checks)
-      [ -n "$workflows" ] && facts="$facts;$(workflow_pin_facts "$repo" "$workflows")"
+      if [ -n "$workflows" ]; then
+        facts="$facts;$(workflow_pin_facts "$repo" "$workflows")"
+      elif [ "$has_ci" != "0" ]; then
+        # The listing failed (has_ci=0 is a readable repository with no
+        # workflows, which has nothing to scan). Unscanned is never clean.
+        facts="$facts;wf_scanned=1;wf_listing_unreadable=1"
+      fi
       ;;
   esac
 

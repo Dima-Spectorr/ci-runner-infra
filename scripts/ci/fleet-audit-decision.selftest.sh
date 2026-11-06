@@ -183,7 +183,7 @@ hasnt "guard-pin-history" "a missing caller is not judged for provenance" \
   "$(swap has_guard 0 | sed 's/;guard_pin=[^;]*/;guard_pin=/;s/;guard_pin_in_history=[^;]*/;guard_pin_in_history=/')"
 
 # --- every pin, every workflow (#1716) ------------------------------------------
-# The collector judges EVERY non-comment pin in a caller, worst wins, and names
+# The collector judges EVERY pin in a caller, worst wins, and names
 # the pin that made the verdict — which need not be the first one the stale
 # rule reads (a second job, or the real line under a commented decoy).
 IMPOSTER=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
@@ -226,6 +226,26 @@ has "fail:workflow-pin-not-in-fleet-history" "a repository with no lane caller i
   "$(wf "tier=lane;has_lane=0" wf_pin_in_history 0)"
 hasnt "workflow-pin" "the source repository is not judged by the scan" \
   "$(wf "$HEALTHY_SOURCE" wf_pin_in_history 0)"
+
+# Round 2 of the security review: a fleet ref that is not a SHA fails, an
+# escape that could spell one warns, and a listing that could not be read is
+# unscanned — in every tier the scan runs in.
+HEALTHY_LANE="${HEALTHY_POOL/tier=pool/tier=lane}"
+for BASE in "$HEALTHY_POOL" "$HEALTHY_LANE" "tier=lane;has_lane=0" "tier=checks;has_ci=1"; do
+  T="${BASE%%;*}"; T="${T#tier=}"; case "$BASE" in *has_lane=0*) T="$T-no-lane" ;; esac
+  has "fail:workflow-pin-not-a-sha files=tag.yml,CI.YML" "a tag or branch fleet ref fails ($T)" \
+    "$BASE;$WF_OK;wf_not_sha=tag.yml,CI.YML"
+  has "warn:workflow-pin-obfuscated files=esc.yml" "an escape on a uses line warns ($T)" \
+    "$BASE;$WF_OK;wf_obfuscated=esc.yml"
+  has "warn:workflow-pin-scan-incomplete workflows-listing-unreadable" "an unreadable listing is unscanned ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1"
+  hasnt "ok:compliant" "an unreadable listing is never compliant ($T)" \
+    "$BASE;wf_scanned=1;wf_listing_unreadable=1"
+  hasnt "workflow-pin-not-a-sha" "an empty not-a-sha fact is quiet ($T)" "$BASE;$WF_OK;wf_not_sha="
+  hasnt "workflow-pin-obfuscated" "an empty obfuscated fact is quiet ($T)" "$BASE;$WF_OK;wf_obfuscated="
+done
+hasnt "workflow-pin" "the source repository ignores the new facts too" \
+  "$HEALTHY_SOURCE;$WF_OK;wf_not_sha=a.yml;wf_obfuscated=b.yml;wf_listing_unreadable=1"
 
 # --- the two-file lane (#1382) ----------------------------------------------------
 # The healthy pool with a healthy events file beside the pool caller. Each case
