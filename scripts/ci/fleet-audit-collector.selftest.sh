@@ -477,6 +477,7 @@ eq "$(with_agrees "$T_POOL" "name: x")" "" "a file with no with: block is unknow
 # public-repository 422 were read live on 2026-11-05; the 403/404 shapes are
 # gh's error-document form, which `api` passes through on stdout.
 F_FORK=""
+F_COMPARE=""
 FORK_PATH_FILE="${TMPDIR:-/tmp}/fleet-audit-collector-forkpath.$$"
 trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE"' EXIT
 api() {
@@ -484,6 +485,10 @@ api() {
     */actions/permissions/fork-pr-workflows-private-repos)
       echo "$1" > "$FORK_PATH_FILE"
       printf '%s' "$F_FORK" ;;
+    # The provenance cases (#1715) below share this stub rather than redefine it.
+    */compare/*)
+      echo "$1" >> "$PROV_CALLS"
+      printf '%s' "$F_COMPARE" ;;
     *) printf '' ;;
   esac
 }
@@ -573,6 +578,41 @@ eq "$(printf '%s\n' "$OUT" | tail -1)" "exit=0" "an unreadable setting warns wit
 OUT=$(run_audit "svc-a" "$(fork_body false)" svc-a)
 eq "$(printf '%s\n' "$OUT" | grep -cE '^svc-a +ok:fork-pr-workflows-disabled$')" 1 \
    "a compliant utility-host repository is reported, not silent"
+
+# --- pin provenance (#1715) -----------------------------------------------------
+#
+# The compare bodies' `status` words were read live on 2026-11-06: an older
+# default-branch commit compared as `<branch>...<sha>` reads `behind`; a SHA
+# the repository does not hold is gh's error document with "status":"404".
+eq "$(history_of_compare '{"status":"behind","ahead_by":0,"behind_by":4}')" "1" "an ancestor of the branch is in the history"
+eq "$(history_of_compare '{"status":"identical"}')" "1" "the branch tip is in the history"
+eq "$(history_of_compare '{"status":"diverged"}')" "0" "a diverged commit is not in the history"
+eq "$(history_of_compare '{"status":"ahead"}')" "0" "a commit carrying work the branch lacks is not in the history"
+eq "$(history_of_compare '{"message":"Not Found","status":"404"}')" "0" "a SHA the repository does not hold is not in the history"
+eq "$(history_of_compare '{"message":"Resource not accessible by integration","status":"403"}')" "" "a 403 is unknown, never a verdict"
+eq "$(history_of_compare '')" "" "an empty body is unknown"
+eq "$(history_of_compare 'not json')" "" "a non-JSON body is unknown"
+
+PROV_SHA=cccccccccccccccccccccccccccccccccccccccc
+PROV_CALLS="${TMPDIR:-/tmp}/fleet-audit-collector-provcalls.$$"
+PIN_HISTORY_CACHE="${TMPDIR:-/tmp}/fleet-audit-collector-provcache.$$"
+mkdir -p "$PIN_HISTORY_CACHE"
+trap 'rm -f "$READS_FILE" "$FORK_PATH_FILE" "$PROV_CALLS"; rm -rf "$FAKE" "$PIN_HISTORY_CACHE"' EXIT
+: > "$PROV_CALLS"
+F_COMPARE='{"status":"behind"}'
+# shellcheck disable=SC2034  # read by pin_in_history, sourced from fleet-audit.sh
+FLEET_HISTORY_BRANCH=main
+eq "$(pin_in_history "$PROV_SHA")" "1" "an in-history pin reads 1"
+eq "$(cat "$PROV_CALLS")" "repos/acct/ci-runner-infra/compare/main...$PROV_SHA" "the compare is branch...sha against the fleet repository"
+eq "$(pin_in_history "$PROV_SHA")" "1" "a second read of the same pin answers the same"
+eq "$(wc -l < "$PROV_CALLS" | tr -d ' ')" "1" "and comes from the cache, not a second compare"
+eq "$(pin_in_history "not-a-sha")" "" "a malformed pin is unknown and makes no call"
+# shellcheck disable=SC2034  # read by pin_in_history
+FLEET_HISTORY_BRANCH=""
+rm -f "$PIN_HISTORY_CACHE"/*
+eq "$(pin_in_history "$PROV_SHA")" "" "an unreadable fleet repository makes every provenance unknown"
+eq "$(wc -l < "$PROV_CALLS" | tr -d ' ')" "1" "and makes no compare whose 404 would read as an imposter"
+PIN_HISTORY_CACHE=""
 
 # --- the two guards around the collector ---------------------------------------
 #

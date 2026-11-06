@@ -124,6 +124,64 @@ pin_in() {
     | head -1 | grep -oE '[0-9a-f]{40}$'
 }
 
+# --- pin provenance (#1715) ------------------------------------------------------
+#
+# A 40-hex pin is NOT proof the code came from the fleet repository. GitHub
+# resolves `<owner>/ci-runner-infra/...@<sha>` for a commit that exists only in
+# a FORK of it (an "imposter commit"): forks share object storage, so a caller
+# can pin code nobody reviewed here and RUNNER18 — which checks the owner and
+# the SHA's shape — accepts it. What proves provenance is reachability: the
+# pinned commit is an ancestor of (or equal to) the fleet's default branch.
+#
+# `compare/<branch>...<sha>` answers in the head's terms, measured 2026-11-06
+# against this repository: an older default-branch commit reads `behind`, the
+# tip reads `identical`; a commit with work the branch lacks reads `ahead` or
+# `diverged`; a SHA the repository's network does not hold is a 404.
+
+# fleet_history_branch — the fleet repository's default branch, or empty when
+# the token cannot read the fleet repository at all. Read ONCE, before any
+# compare: under a token that cannot see the fleet repository every compare is a
+# 404, and a 404 is otherwise the imposter answer. Without this check an App
+# not installed on the fleet repository would fail every consumer in the fleet.
+fleet_history_branch() {
+  api "repos/$OWNER/ci-runner-infra" | jq -r '.default_branch // empty' 2>/dev/null | tr -d '\r'
+}
+
+# history_of_compare <compare-body> — 1 when the head is reachable from the
+# base, 0 when it is not (or does not exist there), empty when the body is
+# anything else. `.status` carries both answers: the comparison's own word on a
+# success, and gh's error document's HTTP code ("404") on a refusal.
+history_of_compare() {
+  local status
+  status=$(printf '%s' "${1:-}" | jq -r 'if type=="object" then (.status // empty | tostring) else empty end' 2>/dev/null | tr -d '\r')
+  case "$status" in
+    behind|identical) echo 1 ;;
+    ahead|diverged|404) echo 0 ;;
+    # 403, 422, 5xx, an empty body: a read that failed, never a verdict.
+    *) : ;;
+  esac
+}
+
+# pin_in_history <sha> — 1 / 0 / empty (unknown) for one pinned commit.
+#
+# CACHED PER SHA FOR THE RUN. Most of the fleet pins the same release, so one
+# compare answers every repository. The cache is a directory, not a variable:
+# facts_for runs inside `$(…)`, and a variable set in a subshell is gone when it
+# returns. Empty when FLEET_HISTORY_BRANCH is empty — the fleet repository was
+# unreadable, so no answer here could be told apart from a refusal.
+pin_in_history() {
+  local sha="${1:-}" cache="${PIN_HISTORY_CACHE:-}" branch="${FLEET_HISTORY_BRANCH:-}" verdict
+  is_sha "$sha" || return 0
+  [ -n "$branch" ] || return 0
+  if [ -n "$cache" ] && [ -f "$cache/$sha" ]; then
+    cat "$cache/$sha"
+    return 0
+  fi
+  verdict=$(history_of_compare "$(api "repos/$OWNER/ci-runner-infra/compare/$branch...$sha")")
+  [ -n "$cache" ] && [ -d "$cache" ] && printf '%s' "$verdict" > "$cache/$sha"
+  printf '%s' "$verdict"
+}
+
 # --- the two-file lane (#1380, #1382) ------------------------------------------
 #
 # A private consumer's lane is `merge-lane.yml` (CI completions, pool label) and
@@ -595,14 +653,19 @@ facts_for() {
 
   if [ "$has_lane" = "1" ]; then
     lane=$(file_at "$repo" ".github/workflows/merge-lane.yml")
-    facts="$facts;lane_pin=$(pin_in "$lane" 'merge-lane\.yml')"
+    # Every pin also carries whether it is in the fleet's history (#1715): one
+    # cached compare per distinct SHA, so the guard and reaper ride along free.
+    local pin
+    pin=$(pin_in "$lane" 'merge-lane\.yml')
+    facts="$facts;lane_pin=$pin;lane_pin_in_history=$(pin_in_history "$pin")"
     facts="$facts;has_events=$has_events"
     [ "$has_events" = "1" ] && {
       # The events file calls the same callee, so it carries the same kind of
       # pin — and drifts from merge-lane.yml's exactly the way the guard and
       # reaper pins drifted from each other.
       events=$(file_at "$repo" ".github/workflows/merge-lane-events.yml")
-      facts="$facts;events_pin=$(pin_in "$events" 'merge-lane\.yml')"
+      pin=$(pin_in "$events" 'merge-lane\.yml')
+      facts="$facts;events_pin=$pin;events_pin_in_history=$(pin_in_history "$pin")"
       facts="$facts;with_match=$(with_agrees "$lane" "$events")"
       if [ "$has_relay" = "1" ]; then
         relay=$(file_at "$repo" ".github/workflows/merge-lane-review-relay.yml")
@@ -615,11 +678,13 @@ facts_for() {
     }
     [ "$has_guard" = "1" ] && {
       guard=$(file_at "$repo" ".github/workflows/pr-guard-self.yml")
-      facts="$facts;guard_pin=$(pin_in "$guard" 'pr-guard\.yml')"
+      pin=$(pin_in "$guard" 'pr-guard\.yml')
+      facts="$facts;guard_pin=$pin;guard_pin_in_history=$(pin_in_history "$pin")"
     }
     [ "$has_reaper" = "1" ] && {
       reaper=$(file_at "$repo" ".github/workflows/branch-reaper-self.yml")
-      facts="$facts;reaper_pin=$(pin_in "$reaper" 'branch-reaper\.yml')"
+      pin=$(pin_in "$reaper" 'branch-reaper\.yml')
+      facts="$facts;reaper_pin=$pin;reaper_pin_in_history=$(pin_in_history "$pin")"
     }
 
     # A 403 AND AN EMPTY LIST ARE THE SAME BYTES HERE, so the exit status is
@@ -715,6 +780,12 @@ command -v gh >/dev/null 2>&1 || { echo "fleet-audit: gh is not on PATH" >&2; ex
 ONLY="${1:-}"
 WANT_PIN=$(resolve_want_pin)
 [ -z "$WANT_PIN" ] && echo "fleet-audit: could not resolve the expected pin; every pin will read as unknown" >&2
+# Read once, here, outside the per-repository subshells — see pin_in_history.
+FLEET_HISTORY_BRANCH=$(fleet_history_branch)
+[ -z "$FLEET_HISTORY_BRANCH" ] && echo "fleet-audit: cannot read $OWNER/ci-runner-infra; every pin's provenance will read as unknown" >&2
+PIN_HISTORY_CACHE=$(mktemp -d 2>/dev/null) || PIN_HISTORY_CACHE=""
+cleanup_pin_cache() { [ -n "$PIN_HISTORY_CACHE" ] && rm -rf "$PIN_HISTORY_CACHE"; }
+trap cleanup_pin_cache EXIT
 
 declare -i FAILS=0 WARNS=0 OKS=0
 declare -a LISTED=()

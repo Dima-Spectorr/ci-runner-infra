@@ -72,6 +72,11 @@ _fleet_is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; es
 #   guard_pin     ditto for the guard
 #   reaper_pin    ditto for the reaper
 #   events_pin    ditto for merge-lane-events.yml, when it exists
+#   lane_pin_in_history  1 if lane_pin is reachable from the fleet repository's
+#                 default branch, 0 if it is not (an imposter commit from a fork,
+#                 #1715), "" if that could not be established. Likewise
+#                 events_pin_in_history, guard_pin_in_history and
+#                 reaper_pin_in_history for their pins.
 #   relay_match   1 if the review relay's `name:` is what the events file's
 #                 `workflow_run: workflows:` hears, 0 if not (or no relay), ""
 #                 if unread
@@ -156,6 +161,8 @@ fleet_verdict() {
   local tier="" has_lane="" has_guard="" has_reaper=""
   local lane_pin="" guard_pin="" reaper_pin="" want_pin=""
   local has_events="" events_pin="" relay_match="" with_match=""
+  local lane_pin_in_history="" events_pin_in_history=""
+  local guard_pin_in_history="" reaper_pin_in_history=""
   local enabled="" armed="" app_id="" app_key=""
   local vars_readable="" secrets_readable=""
   local checks_match="" ruleset="" has_ci=""
@@ -185,6 +192,10 @@ fleet_verdict() {
       want_pin) want_pin="$value" ;;
       has_events) has_events="$value" ;;
       events_pin) events_pin="$value" ;;
+      lane_pin_in_history) lane_pin_in_history="$value" ;;
+      events_pin_in_history) events_pin_in_history="$value" ;;
+      guard_pin_in_history) guard_pin_in_history="$value" ;;
+      reaper_pin_in_history) reaper_pin_in_history="$value" ;;
       relay_match) relay_match="$value" ;;
       with_match) with_match="$value" ;;
       enabled) enabled="$value" ;;
@@ -391,6 +402,34 @@ fleet_verdict() {
         fi
       done
     fi
+
+    # --- pin provenance (#1715) ----------------------------------------------
+    #
+    # A pinned SHA is not proof the code came from the fleet repository: GitHub
+    # resolves a SHA that exists only in a FORK of it, so a caller can run code
+    # nobody reviewed here while every other rule — RUNNER18 included — reads a
+    # well-formed pin. Reachability from the fleet's default branch is the
+    # proof. Independent of `want_pin`: provenance does not need the expected
+    # release to be known. A pin that could not be read is already reported
+    # above and has no provenance to judge. An unknown is a warning — the
+    # collector says unknown both when the compare failed and when the fleet
+    # repository itself was unreadable, and neither is evidence of an imposter.
+    local name pin present hist
+    for name in lane events guard reaper; do
+      case "$name" in
+        lane) pin="$lane_pin"; present="$has_lane"; hist="$lane_pin_in_history" ;;
+        events) pin="$events_pin"; present="$has_events"; hist="$events_pin_in_history" ;;
+        guard) pin="$guard_pin"; present="$has_guard"; hist="$guard_pin_in_history" ;;
+        reaper) pin="$reaper_pin"; present="$has_reaper"; hist="$reaper_pin_in_history" ;;
+      esac
+      [ "$present" != "1" ] && continue
+      [ -z "$pin" ] && continue
+      case "$hist" in
+        1) : ;;
+        0) _fleet_say "fail:${name}-pin-not-in-fleet-history pin=${pin:0:8} not-reachable-from-the-fleet-default-branch" ;;
+        *) _fleet_say "warn:${name}-pin-history-unknown pin=${pin:0:8}" ;;
+      esac
+    done
 
     # --- the two-file lane (#1380, #1382) ------------------------------------
     #
