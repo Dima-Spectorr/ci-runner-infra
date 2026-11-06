@@ -433,6 +433,18 @@ mutate "a computed matrix behind with: runs-on is trusted" \
   's@if w_matrix_dyn and any@if False and any@'
 mutate "a matrix read in another case is missed" \
   's@r"(?i)(?<!@r"(?<!@'
+# #1718: a computed pool handed to a callee that is not the merge lane is both
+# hosts. Never counting it lets `${{ vars.POOL }}` past RUNNER18; never reading
+# the local callee lets a renamed `pool:` input past it; calling a bare matrix
+# leg computed undoes #1714 for every literal matrix.
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a computed pool to a non-lane callee is trusted" \
+  's@      if \[ "$computed_pool" -eq 1 \]; then@      if false; then@'
+# shellcheck disable=SC2016  # the gate's own source text, matched literally
+mutate "a local callee's runs-on inputs are never read" \
+  's@if \[ "$computed_pool" -eq 0 \] && \[ -f "$callee_path" \]; then@if false; then@'
+mutate "a bare matrix leg is called computed" \
+  's@                    w_text = MATRIX_ONLY_EXPR.sub("", w_text)@                    pass@'
 mutate "RUNNER20 is a denylist again: push and merge_group pass" \
   's@if _n not in ("workflow_run", @if _n not in ("push", "merge_group", "workflow_run", @'
 
@@ -673,8 +685,10 @@ CASES="$(case_list | wc -l)"
 # 76 with #1712: the lane owner/ref (7), RUNNER20 (3), and RUNNER17 split into
 # its two suffixes (+2) in place of the "asked of -lane too" case (-1). 77 when
 # RUNNER20 became an allowlist (+1, the denylist case). 79 with the matrix-fed
-# `with: runs-on:` cases (#1714, +3).
-FLOOR=80
+# `with: runs-on:` cases (#1714, +3) — the list held 80 then, one above the 79
+# this line used to say. 83 with the computed-pool cases for a non-lane callee
+# (#1718, +3).
+FLOOR=83
 if [ "$CASES" -lt "$FLOOR" ]; then
   bad "the case list yielded only $CASES case(s), fewer than the $FLOOR this file is known to contain — it did not run, whatever the exit code says"
   printf 'check-runner-policy self-test: %d passed, %d failed\n' "$PASS" "$FAIL"

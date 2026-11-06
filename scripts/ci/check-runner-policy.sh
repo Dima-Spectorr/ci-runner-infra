@@ -408,6 +408,12 @@ ensure_yaml() {
 #                                    or a `with: runs-on:` read from a computed
 #                                    matrix (both kinds: undecidable)
 #   #WITHEXPR	<id>                  the `with: runs-on:` value is computed
+#   #WITHCOMPUTED	<id>	<name>        a `with:` input (name lower-cased) whose
+#                                    value is computed — an expression or a
+#                                    backslash escape, anywhere in it — other
+#                                    than a bare `${{ matrix.<key> }}` over a
+#                                    matrix the reader resolved; a non-lane
+#                                    callee's pool input is both hosts (#1718)
 read_workflow() {
   "${PY_BIN:-python3}" - "$1" <<'PY'
 import json
@@ -534,6 +540,10 @@ DYN_SLOT = re.compile(r"-([Uu][Tt][Ii][Ll]|[Ll][Aa][Nn][Ee])(?![A-Za-z0-9_.-])")
 # `Matrix.pool` and `toJSON(matrix)` all read the matrix (expressions are
 # case-insensitive), and each must reach the scan below.
 MATRIX_REF = re.compile(r"(?i)(?<![A-Za-z0-9_.-])matrix(?![A-Za-z0-9_-])")
+# An expression that is ONE matrix reference and nothing else
+# (`${{ matrix.pool }}`, `${{ Matrix['pool'] }}`): its value is a leg of the
+# matrix, which the reader resolves itself (#1718).
+MATRIX_ONLY_EXPR = re.compile(r"(?i)\$\{\{\s*matrix(?:\.[A-Za-z0-9_-]+|\[\s*'[^'\\]*'\s*\])+\s*\}\}")
 
 # A loopback address with a port in the shared-infrastructure band, anywhere in
 # a job's steps. On a Windows host there is nothing listening there: the stack
@@ -1072,6 +1082,28 @@ for job_id, job in jobs.items():
                 if "${{" in w_runs_on_text or "\\" in w_runs_on_text:
                     out("#WITHEXPR", vid)
                     break
+            # Every input whose value is computed, for a callee that is NOT
+            # the merge lane (#1718): its `runs-on` input, or any input a local
+            # callee's `runs-on` reads, could resolve to `-lane` at run time,
+            # so the caller is read as both hosts. Judged as `#WITHEXPR` is,
+            # with one exception: a bare `${{ matrix.<key> }}` over a matrix
+            # the reader resolved above is already counted by its legs, and
+            # calling it computed would undo #1714 for every literal matrix.
+            # Anything else in the value — a fallback, `toJSON(matrix)`, a
+            # computed matrix — keeps it computed (fail-closed).
+            w_names = []
+            for w_key, w_value in with_block.items():
+                if w_value is None:
+                    continue
+                w_text = w_value if isinstance(w_value, str) else json.dumps(w_value, ensure_ascii=False)
+                if not w_matrix_dyn:
+                    w_text = MATRIX_ONLY_EXPR.sub("", w_text)
+                if "${{" in w_text or "\\" in w_text:
+                    w_name = str(w_key).lower()
+                    if w_name not in w_names:
+                        w_names.append(w_name)
+            for w_name in w_names:
+                out("#WITHCOMPUTED", vid, w_name)
 
         # --- the shared-infrastructure records (RUNNER9/10/11) -------------
         #
@@ -1670,6 +1702,49 @@ EOF
       # below as RUNNER19 rather than trusted (#1635 re-review).
       if [ "$(printf '%s\n' "$records" | grep -cE "^#WITHEXPR	${job_re}\$")" -gt 0 ]; then
         lane_runs_on_expr=1
+        co_tenant=1
+      fi
+    fi
+    # …and every OTHER callee handed a computed pool (#1718). Nothing here can
+    # read what `${{ vars.POOL }}` or `${{ needs.x.outputs.pool }}` resolves
+    # to, so it may be `-lane`, or `-util`: both hosts, fail-closed, and
+    # RUNNER18 refuses it because this is not the lane call. The pool is the
+    # `runs-on` input, and for a LOCAL callee also any input its own jobs'
+    # `runs-on` reads (`pool:` mapped to `runs-on: ${{ inputs.pool }}`). An
+    # input the callee does not route on stays clean — that is every ordinary
+    # `needs.*.outputs` value the fleet passes. The merge lane is left to
+    # RUNNER19's computed-runs-on refusal above, so nothing is reported twice.
+    if [ "$merge_lane_any" -eq 0 ] && [ -n "$call_target" ]; then
+      local computed_inputs callee_path callee_inputs computed_pool=0 c_name
+      computed_inputs="$(printf '%s\n' "$records" | sed -n "s/^#WITHCOMPUTED\t${job_re}\t//p")"
+      if [ -n "$computed_inputs" ]; then
+        if [ "$(printf '%s\n' "$computed_inputs" | grep -cxF -- "runs-on")" -gt 0 ]; then
+          computed_pool=1
+        fi
+        case "$call_target" in
+          ./*)
+            # Resolved as compute_reachable resolves a call: from the
+            # repository root two levels above the workflow directory. A
+            # callee that cannot be read leaves the `runs-on` rule alone.
+            callee_path="$(cd "$(dirname "$file")/../.." 2>/dev/null && pwd)/${call_target#./}"
+            if [ "$computed_pool" -eq 0 ] && [ -f "$callee_path" ]; then
+              callee_inputs="$(read_workflow "$callee_path" | sed -n 's/^#RUNSONINPUT\t[^\t]*\t//p' | tr '[:upper:]' '[:lower:]')"
+              while IFS= read -r c_name; do
+                [ -n "$c_name" ] || continue
+                if [ "$(printf '%s\n' "$callee_inputs" | grep -cxF -- "$c_name")" -gt 0 ]; then
+                  computed_pool=1
+                fi
+              done <<EOF
+$computed_inputs
+EOF
+            fi
+            ;;
+        esac
+      fi
+      if [ "$computed_pool" -eq 1 ]; then
+        lane_why=" (its pool input is computed, so it may resolve to the lane host at run time: write the pool label literally)"
+        util_host=1
+        lane_host=1
         co_tenant=1
       fi
     fi
@@ -3084,6 +3159,64 @@ jobs:
     with:
       runs-on: ${{ matrix.pool }}'
 
+  # …and a literal matrix with no -lane leg is resolved, not called computed:
+  # the bare `${{ matrix.pool }}` is a leg, and every leg is a pool (#1718).
+  expect "a with: runs-on read from a literal pool matrix stays clean" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  # #1718: any other computed pool handed to a callee that is not the merge
+  # lane may resolve to -lane, so it is both hosts and RUNNER18 refuses it.
+  # The callee file does not exist here, so only the `runs-on` input counts.
+  expect "a with: runs-on from vars to a non-lane callee is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ vars.LANE_POOL }}'
+
+  expect "a with: runs-on from a needs output to a non-lane callee is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pool: ${{ steps.p.outputs.pool }}
+    steps: [{id: p, run: "true"}]
+  gate:
+    needs: pick
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ needs.pick.outputs.pool }}'
+
+  # Forks allowed, so RUNNER17 proves the computed pool counted as a utility
+  # host at all; a list item carries the expression just as well.
+  expect "a computed with: runs-on list item with forks allowed is both hosts" "RUNNER17 RUNNER18" "ExampleRepo" allowed \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      RUNS-ON: ["${{ inputs.pool }}"]'
+
+  expect "a literal pool label to a non-lane callee stays clean" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ExampleRepo
+      suite: ${{ vars.SUITE }}'
+
   # Every way an expression reads the matrix, not only `matrix.<key>`:
   # index syntax, any case, and the whole matrix handed over as JSON.
   expect "a matrix read by index syntax on -lane is refused" "RUNNER18" "ExampleRepo" blocked \
@@ -3161,6 +3294,74 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       suite: ${{ matrix.suite }}'
+
+  # Any other computed pool handed to a callee that is not the merge lane
+  # (#1718): nothing here can read what it resolves to, so it is both hosts
+  # and RUNNER18 refuses it. Remote callees carry RUNNER7 besides.
+  expect "a with: runs-on from a variable to a remote callee is refused" "RUNNER18 RUNNER7" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: other/repo/.github/workflows/build.yml@0123456789012345678901234567890123456789
+    with:
+      runs-on: ${{ vars.POOL }}'
+
+  expect "a with: runs-on from a job output to a remote callee is refused" "RUNNER18 RUNNER7" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: other/repo/.github/workflows/build.yml@0123456789012345678901234567890123456789
+    with:
+      runs-on: ${{ needs.x.outputs.pool }}'
+
+  expect "a with: runs-on forwarded from an input is refused" "RUNNER18" "ExampleRepo" blocked \
+'on: [workflow_call]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      RUNS-ON: ${{ inputs.pool }}'
+
+  # Forks allowed, so RUNNER17 is the proof the -util/-lane host was counted.
+  expect "a computed with: runs-on is both hosts" "RUNNER17 RUNNER18" "ExampleRepo" allowed \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ vars.POOL }}'
+
+  # A computed input that is not the pool is an ordinary value.
+  expect "a computed non-pool input to a remote callee stays clean" "RUNNER7" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    uses: other/repo/.github/workflows/build.yml@0123456789012345678901234567890123456789
+    with:
+      version: ${{ needs.x.outputs.v }}'
+
+  # A bare matrix reference over a literal matrix is its legs (#1714), not a
+  # computed pool: util-only legs and forks blocked stay clean.
+  expect "a literal matrix of -util legs is not a computed pool" "" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  gate:
+    strategy:
+      matrix:
+        pool: [ExampleRepo-util]
+    uses: ./.github/workflows/build.yml
+    with:
+      runs-on: ${{ matrix.pool }}'
+
+  # The merge lane's computed pool is RUNNER19's refusal, reported once.
+  expect "a computed pool on the merge-lane call is RUNNER19 alone" "RUNNER19" "ExampleRepo" blocked \
+'on: [workflow_dispatch]
+jobs:
+  lane:
+    # remote-reusable-allowed(Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml, #1712): the fleet merge lane
+    uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
+    with:
+      runs-on: ${{ vars.POOL }}'
 
   # A file NAMED merge-lane.yml in some other repository is not the fleet's.
   # The fleet owner and a full SHA, so the repository name is the only thing
@@ -3925,6 +4126,91 @@ jobs:
     uses: Example-Owner/ci-runner-infra/.github/workflows/merge-lane.yml@0123456789abcdef0123456789abcdef01234567
     with:
       runs-on: ExampleRepo-lane'
+
+  # A LOCAL callee routes on whatever input its jobs' `runs-on` reads (#1718):
+  # a computed value for that input is a computed pool, both hosts, whatever
+  # the input is called and in whatever case the caller spells it. The callee's
+  # own `runs-on: ${{ inputs.pool }}` is RUNNER5 on both sides of the change;
+  # RUNNER17/18 on the caller are the proof the pool was counted.
+  expect_pair "a computed value for the input a local callee routes on is both hosts" "RUNNER17 RUNNER18 RUNNER5" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      Pool: ${{ vars.P }}' \
+'on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+      version: {type: string, required: false}
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ inputs.pool }}
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and a computed input it does NOT route on is an ordinary value.
+  expect_pair "a computed input a local callee does not route on stays clean" "RUNNER5" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      pool: ExampleRepo
+      version: ${{ needs.x.outputs.v }}' \
+'on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+      version: {type: string, required: false}
+jobs:
+  build:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ${{ inputs.pool }}
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # #1718: a LOCAL callee is read for the inputs its `runs-on` uses, so a
+  # computed value behind a renamed input (`pool:`) is both hosts. The pair
+  # runs with forks allowed and no scope, so RUNNER17 joins RUNNER18.
+  expect_pair "a computed input a local callee routes on is both hosts" "RUNNER17 RUNNER18" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      pool: ${{ vars.LANE_POOL }}' \
+'on:
+  workflow_call:
+    inputs:
+      pool: {type: string, required: true}
+jobs:
+  build:
+    # dynamic-runner-allowed(build, #1718): the caller scopes the pool
+    runs-on: ${{ inputs.POOL }}
+    timeout-minutes: 5
+    steps: [{run: "true"}]'
+
+  # …and a computed input the callee does NOT route on stays clean: that is
+  # every ordinary `needs.*.outputs` value the fleet passes.
+  expect_pair "a computed input a local callee does not route on stays clean" "" \
+'on: [workflow_dispatch]
+jobs:
+  call:
+    uses: ./.github/workflows/callee.yml
+    with:
+      suite: ${{ vars.SUITE }}' \
+'on:
+  workflow_call:
+    inputs:
+      suite: {type: string}
+jobs:
+  build:
+    runs-on: [self-hosted, linux, gcp, ExampleRepo]
+    timeout-minutes: 5
+    steps: [{run: "echo ${{ inputs.suite }}"}]'
 
   # --- the lane owner's resolution (#1712) ------------------------------------
   # The flag wins, even empty (an explicit empty refuses, never falls back);
