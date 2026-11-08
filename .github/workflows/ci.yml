@@ -107,15 +107,27 @@ jobs:
       # bump here -- version and digest together, findings fixed in the same
       # PR -- never something the image does to us. The digest is the release
       # asset's own (GitHub release API `digest`), checked before extraction.
+      #
+      # FALLBACK (#1727): on 2026-11-08 GitHub's release download URLs answered
+      # 504 on every try while the releases API served the same bytes. The
+      # asset id is pinned beside the digest, and the digest check below still
+      # decides what installs.
       - name: install shellcheck
         env:
           SHELLCHECK_VERSION: v0.11.0
           SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          SHELLCHECK_ASSET_ID: "279056942"
+          GH_DOWNLOAD_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tarball="$RUNNER_TEMP/shellcheck.tar.xz"
-          timeout 300 curl -sSfL --retry 3 -o "$tarball" \
-            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          if ! timeout 120 curl -sSfL --retry 2 --retry-all-errors -o "$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"; then
+            echo "the release download failed; fetching asset ${SHELLCHECK_ASSET_ID} from the releases API" >&2
+            timeout 180 curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors -o "$tarball" \
+              -H "Accept: application/octet-stream" -H "Authorization: Bearer ${GH_DOWNLOAD_TOKEN}" \
+              "https://api.github.com/repos/koalaman/shellcheck/releases/assets/${SHELLCHECK_ASSET_ID}"
+          fi
           echo "${SHELLCHECK_SHA256}  ${tarball}" | sha256sum -c -
           tar -xJf "$tarball" -C "$RUNNER_TEMP"
           sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
@@ -187,6 +199,12 @@ jobs:
       # Build substituted into it. This one renders the step first.
       - name: image guard self-test
         run: bash scripts/ci/image-guard.selftest.sh
+
+      # Every lane, guard, reaper and review job installs gh through this
+      # script; its download fallback is what kept them green when GitHub's
+      # release URL answered 504 (2026-11-08).
+      - name: ensure-gh self-test
+        run: bash scripts/ci/ensure-gh.selftest.sh
 
       # The shell sweeps above ask whether the interpreter will ACCEPT the
       # script. This one asks whether two options the script asked for will kill
