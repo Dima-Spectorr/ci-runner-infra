@@ -257,6 +257,9 @@ jobs:
       # and the job would go green having asked for nothing.
       - name: Ensure the GitHub CLI
         run: bash scripts/ci/ensure-gh.sh
+        # Read by its fallback, which asks the releases API for the same asset.
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Mint the review App token
         id: token

@@ -281,6 +281,9 @@ jobs:
       # lane hit across seven repositories.
       - name: Ensure the GitHub CLI
         run: bash scripts/ci/ensure-gh.sh
+        # Read by its fallback, which asks the releases API for the same asset.
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Run the guard
         env:

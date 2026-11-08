@@ -29,6 +29,13 @@ GH_VERSION="${GH_VERSION:-2.98.0}"
 GH_SHA256_amd64="3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"
 # shellcheck disable=SC2034
 GH_SHA256_arm64="cf689084f3a3618f7eae4a2420d335d74626d65f5e594b9828d125d69f800d86"
+# The same two assets' ids in the releases API, for the fallback below. An
+# asset id never changes for the life of the asset, and the digest above still
+# decides what is accepted, so a wrong id can only fail, never install.
+# shellcheck disable=SC2034
+GH_ASSET_amd64="522857901"
+# shellcheck disable=SC2034
+GH_ASSET_arm64="522857902"
 
 if command -v gh >/dev/null 2>&1; then
   echo "ensure-gh: already present — $(gh --version | head -1)"
@@ -45,6 +52,8 @@ esac
 # adding one constant, not two places that have to agree.
 sha_var="GH_SHA256_${arch}"
 want="${!sha_var}"
+asset_var="GH_ASSET_${arch}"
+asset="${!asset_var}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -56,7 +65,25 @@ echo "ensure-gh: not on PATH — installing ${GH_VERSION} (${arch})"
 # --retry-all-errors: a plain --retry skips a dropped connection (curl 56,
 # "Connection reset by peer"), which is exactly what a pool full of freshly
 # booted hosts downloading this at once produced on 2026-11-05 (#1683).
-curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 -o "$tmp/$tarball" "$url"
+#
+# FALLBACK. From 2026-11-08 the releases/download URL answered 504 from
+# GitHub's own edge (israelcentral) on every try while the releases API served
+# the same bytes, and every PR guard in the fleet went red. So the first path
+# gets fewer tries, and then the API's asset endpoint is asked for the same
+# file. The job's token is sent when there is one: anonymous API calls share 60
+# an hour per address, and a pool's hosts share one. curl does not carry the
+# Authorization header across the redirect to the storage host.
+if ! curl -sSfL --retry 2 --retry-delay 3 --retry-all-errors --connect-timeout 20 -o "$tmp/$tarball" "$url"; then
+  api="https://api.github.com/repos/cli/cli/releases/assets/${asset}"
+  echo "ensure-gh: the release download failed — fetching the same asset from ${api}" >&2
+  auth=()
+  token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [ -n "$token" ]; then
+    auth=(-H "Authorization: Bearer ${token}")
+  fi
+  curl -sSfL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 \
+    -H "Accept: application/octet-stream" "${auth[@]}" -o "$tmp/$tarball" "$api"
+fi
 
 got="$(sha256sum "$tmp/$tarball" | cut -d' ' -f1)"
 if [ "$got" != "$want" ]; then

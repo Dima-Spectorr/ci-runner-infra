@@ -728,6 +728,9 @@ jobs:
       # reporting a healthy lane that could not have merged anything.
       - name: Ensure the GitHub CLI
         run: bash scripts/ci/ensure-gh.sh
+        # Read by its fallback, which asks the releases API for the same asset.
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Mint the merge App token
         id: token
