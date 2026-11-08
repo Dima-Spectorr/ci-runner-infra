@@ -741,7 +741,22 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.skip_guard}${local.derive_step}${local.serve_step}${local.build_command} || { touch ${local.build_failed}; echo '[warm] build failed; publishing what it produced'; }\n${local.serve_summary}"
+  # THE SLOT SHARE THE RUNNER HOSTS PUBLISH, published here too. A task that
+  # sizes its own parallelism from `CI_SLOT_VCPUS` (README § slot model) and
+  # falls back when it is unset ran its fallback on every warm. Measured on
+  # IntegrateIT (warm 7d937534, 2026-11-08, and every warm sampled back to
+  # 2026-11-01): admin-api's type-aware lint spreads ~3000 files over
+  # `CI_SLOT_VCPUS` ESLint workers, each with its own heap, and passes in under
+  # 99 s on a 4-vCPU slot. Unset here, it ran as ONE thread, filled one 6 GB heap
+  # for 330 s and aborted (exit 134). That failed build is what keeps mark-warmed
+  # from ever recording the commit, so an unchanged main was rebuilt once per
+  # claim window instead of not at all. The share is the hosts' formula with
+  # turbo's concurrent tasks as the slots: this step runs turbo at its default
+  # of 10 (`build_command` passes no `--concurrency`), floored at 1.
+  slot_share                = "CI_SLOT_VCPUS=$(( $(nproc) / ${local.turbo_default_concurrency} )); [ \"$CI_SLOT_VCPUS\" -ge 1 ] || CI_SLOT_VCPUS=1; export CI_SLOT_VCPUS\n"
+  turbo_default_concurrency = 10
+
+  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.slot_share}${local.skip_guard}${local.derive_step}${local.serve_step}${local.build_command} || { touch ${local.build_failed}; echo '[warm] build failed; publishing what it produced'; }\n${local.serve_summary}"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
