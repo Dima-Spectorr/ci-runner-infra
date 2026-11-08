@@ -565,7 +565,7 @@ derives_tasks_by_default() { # <main.tf>
   matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
   # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
   # `\n` in an ERE is not that, and matched nothing.
-  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.skip_guard\}\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.slot_share\}\$\{local\.skip_guard\}\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
   matches "$code" 'WARM_TASKS=\$\(node \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs turbo\.json \$\{join\(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'\$\{g\}'"'"'"\]\)\}\) \|\| \{ .*exit 1; \}' || return 1
   matches "$code" "gzip -d > \\$\{local\.staged_dir\}/derive-turbo-tasks\.cjs"
 }
@@ -863,8 +863,33 @@ skips_an_already_warmed_commit() { # <main.tf>
   matches "$code" 'warming without one' || return 1
   matches "$code" 'run_publish = "#!/bin/sh\\nset -eu\\n\$\{local\.skip_guard\}' || return 1
   matches "$code" 'run_turbo   = "#!/bin/sh\\nset -eu\\n\$\{local\.skip_guard\}' || return 1
-  matches "$code" 'EXIT\\n\$\{local\.skip_guard\}\$\{local\.derive_step\}'
+  matches "$code" 'EXIT\\n\$\{local\.slot_share\}\$\{local\.skip_guard\}\$\{local\.derive_step\}'
 }
+
+# 9c. The build step publishes the runner hosts' slot share, so a task that
+#     sizes its parallelism from CI_SLOT_VCPUS does not run its single-threaded
+#     fallback on every warm (IntegrateIT admin-api lint: one heap, exit 134).
+#     The script is EXECUTED with a stubbed nproc, not only grepped.
+publishes_the_slot_share() { # <main.tf>
+  local code share t got
+  code=$(code_of "$1")
+  matches "$code" 'trap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.slot_share\}' || return 1
+  matches "$code" 'turbo_default_concurrency = 10$' || return 1
+  share=$(printf '%s\n' "$code" | sed -n 's/^  slot_share  *= "\(.*\)\\n"$/\1/p')
+  [ -n "$share" ] || return 1
+  share=$(printf '%s' "$share" | sed 's/\${local\.turbo_default_concurrency}/10/; s/\\"/"/g')
+  t=$(mktemp -d)
+  for n in 32:3 8:1 4:1 160:16; do
+    printf '#!/bin/sh\necho %s\n' "${n%%:*}" >"$t/nproc"; chmod +x "$t/nproc"
+    got=$(PATH="$t:$PATH" bash -c "$share"'; echo "$CI_SLOT_VCPUS"') || { rm -rf "$t"; return 1; }
+    [ "$got" = "${n##*:}" ] || { rm -rf "$t"; return 1; }
+  done
+  rm -rf "$t"
+}
+
+if publishes_the_slot_share "$MAIN"; then ok; else
+  bad "the warm's build step no longer publishes CI_SLOT_VCPUS as host vCPU / turbo concurrency (floored at 1) — a task that sizes from it runs its fallback, and IntegrateIT's admin-api lint runs out of heap on every warm"
+fi
 
 if skips_an_already_warmed_commit "$MAIN"; then ok; else
   bad "a warm of a commit already warmed in this slot rebuilds and republishes again — the 15-minute schedule spends ~90 build-hours a week rebuilding an unchanged main"
@@ -1171,7 +1196,7 @@ mutate "the derive step never reaches the build script" "$MAIN" \
   derives_tasks_by_default
 
 mutate "the build ignores the skip marker" "$MAIN" \
-  's@EXIT\\n${local\.skip_guard}@EXIT\\n@' \
+  's@${local\.slot_share}${local\.skip_guard}@${local.slot_share}@' \
   skips_an_already_warmed_commit
 
 mutate "an already-claimed commit is warmed anyway" "$MAIN" \
@@ -1356,6 +1381,18 @@ mutate "a not-yet-whole artifact refused for good while building" "$TURBO" \
 mutate "the publisher stops at the first pass" "$TURBO" \
   's@^while \[ ! -e "\$WARM_BUILD_DONE" \]; do$@while false; do@' \
   publishes_while_building
+
+mutate "the slot share dropped from the build script" "$MAIN" \
+  's@EXIT\\n\${local\.slot_share}@EXIT\\n@' \
+  publishes_the_slot_share
+
+mutate "the slot share no longer floored at 1" "$MAIN" \
+  's@ || CI_SLOT_VCPUS=1;@ || :;@' \
+  publishes_the_slot_share
+
+mutate "the slot share sized from the whole machine" "$MAIN" \
+  's@\$(( \$(nproc) / \${local\.turbo_default_concurrency} ))@$(nproc)@' \
+  publishes_the_slot_share
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
