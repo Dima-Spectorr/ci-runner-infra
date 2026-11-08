@@ -46,7 +46,7 @@ the pin hold with its `ci-pin-hold` sudoers drop-in (#1639).
 
 ```hcl
 module "utility_host" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.157.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.158.0"
 
   project_id = var.project_id
   region     = var.region
@@ -84,7 +84,7 @@ host. A second instance with `label_suffix = "lane"` serves only that job, on
 
 ```hcl
 module "lane_host" {
-  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.157.0"
+  source = "git::https://github.com/<org>/ci-runner-infra.git//modules/ci-runner-utility-host?ref=v5.158.0"
 
   # ...the same inputs as module.utility_host, plus:
   name         = "ci-lane" # differs from the gatekeeper host and every pool base name
