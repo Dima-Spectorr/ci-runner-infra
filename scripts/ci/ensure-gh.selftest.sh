@@ -65,7 +65,7 @@ run_case() {
   sandbox "$d"
   local rc=0
   env -i PATH="$d/bin:$no_gh_path" HOME="$d" RUNNER_TEMP="$d/rt" STUB_LOG="$d/log" \
-    STUB_PRIMARY="$primary" STUB_API="$api" ${token:+GH_TOKEN="$token"} \
+    STUB_PRIMARY="$primary" STUB_API="$api" ${token:+GH_DOWNLOAD_TOKEN="$token"} \
     "$bash_bin" "$script" > "$d/out" 2>&1 || rc=$?
   touch "$d/log"
   local ok=1 c

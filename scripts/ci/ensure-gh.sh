@@ -77,7 +77,7 @@ if ! curl -sSfL --retry 2 --retry-delay 3 --retry-all-errors --connect-timeout 2
   api="https://api.github.com/repos/cli/cli/releases/assets/${asset}"
   echo "ensure-gh: the release download failed — fetching the same asset from ${api}" >&2
   auth=()
-  token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  token="${GH_DOWNLOAD_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   if [ -n "$token" ]; then
     auth=(-H "Authorization: Bearer ${token}")
   fi
