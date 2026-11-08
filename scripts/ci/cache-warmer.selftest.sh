@@ -844,8 +844,21 @@ skips_an_already_warmed_commit() { # <main.tf>
   claim=$(step_block "$code" claim)
   [ -n "$claim" ] || return 1
   matches "$claim" '"WARM_SHA=\$COMMIT_SHA"' || return 1
-  matches "$code" 'ifGenerationMatch=0&name=\$name' || return 1
-  matches "$code" 'rm -f \$\{local\.skip_marker\}' || return 1
+  matches "$code" 'ifGenerationMatch=0&name=\$1' || return 1
+  matches "$code" 'rm -f \$\{local\.skip_marker\} \$\{local\.build_failed\}' || return 1
+  # Skip only on a FINISHED warm, or one still inside its timeout — a claim
+  # left by a warm that died must not hide the failure for the whole slot.
+  matches "$code" 'if get "\$name-done" \| grep -q' || return 1
+  matches "$code" '\[ "\$age" -lt \$\{local\.claim_inflight_s\} \]' || return 1
+  matches "$code" 'claim_inflight_s   = tonumber\(trimsuffix\(var\.build_timeout, "s"\)\)' || return 1
+  local mark
+  mark=$(step_block "$code" mark-warmed)
+  [ -n "$mark" ] || return 1
+  matches "$mark" 'script = local\.mark_script' || return 1
+  ! matches "$mark" 'wait_for' || return 1
+  matches "$code" 'if \[ -f \$\{local\.build_failed\} \]; then' || return 1
+  matches "$code" '\|\| \{ touch \$\{local\.build_failed\}; echo' || return 1
+  matches "$code" 'code=\$\(put "\$name-done"\)' || return 1
   matches "$code" 'touch \$\{local\.skip_marker\}' || return 1
   matches "$code" 'warming without one' || return 1
   matches "$code" 'run_publish = "#!/bin/sh\\nset -eu\\n\$\{local\.skip_guard\}' || return 1
@@ -1163,6 +1176,14 @@ mutate "the build ignores the skip marker" "$MAIN" \
 
 mutate "an already-claimed commit is warmed anyway" "$MAIN" \
   's@touch ${local\.skip_marker}@: no-op@' \
+  skips_an_already_warmed_commit
+
+mutate "a failed build is still marked warmed" "$MAIN" \
+  's@|| { touch ${local\.build_failed}; echo@|| { echo@' \
+  skips_an_already_warmed_commit
+
+mutate "a dead warm's claim hides the commit for the whole slot" "$MAIN" \
+  's@\[ "$age" -lt ${local\.claim_inflight_s} \]@true@' \
   skips_an_already_warmed_commit
 
 mutate "an empty derivation builds anyway" "$MAIN" \
