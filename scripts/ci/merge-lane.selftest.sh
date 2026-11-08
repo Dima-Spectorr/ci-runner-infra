@@ -3323,6 +3323,35 @@ behavioural_check_counts_cases() {
     "{\"check_suites\":[$(_bh_suite 20 github-actions completed 2026-09-01T06:00:00Z),$(_bh_suite 21 github-actions completed 2026-09-01T07:00:00Z)]}" \
     "{\"check_runs\":[$(_bh_run 'CI summary (rollup)' completed '"success"' '"2026-09-01T09:00:00Z"' github-actions 20),$(_bh_run 'CI summary (rollup)' completed '"failure"' '"2026-09-01T08:00:00Z"' github-actions 21)]}"
 
+  # 3b. entity-platform #15045 (#1731). Two `pull_request` runs a second apart;
+  #     the older one's `docs-sync` was cancelled by the workflow's concurrency
+  #     group in the SAME second the newer suite skipped it, and the API listed
+  #     the cancelled row last. GitHub said CLEAN; the lane said `red failed=1`
+  #     on every pass. The newer suite's skip is the answer.
+  case_ "#1731: a cancelled row from a superseded suite ties the newer suite's skip" \
+    "1 0 0 0" \
+    'docs-sync' \
+    "{\"check_suites\":[$(_bh_suite 115046029046 github-actions completed 2026-11-08T09:58:50Z),$(_bh_suite 115046031621 github-actions completed 2026-11-08T09:58:51Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'docs-sync' completed '"skipped"' '"2026-11-08T09:58:52Z"' github-actions 115046031621),$(_bh_run 'docs-sync' completed '"cancelled"' '"2026-11-08T09:58:52Z"' github-actions 115046029046)]}"
+
+  # 3c. The same, with the cancellation landing a second AFTER the newer run
+  #     answered: newest-wins picks the cancelled row outright, so only the
+  #     authority substitution, not the tiebreak, gets this one right.
+  case_ "#1731: a superseded suite's cancellation finishes after the newer suite's success" \
+    "1 0 0 0" \
+    'docs-sync' \
+    "{\"check_suites\":[$(_bh_suite 40 github-actions completed 2026-11-08T09:58:50Z),$(_bh_suite 41 github-actions completed 2026-11-08T09:58:51Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'docs-sync' completed '"success"' '"2026-11-08T09:58:55Z"' github-actions 41),$(_bh_run 'docs-sync' completed '"cancelled"' '"2026-11-08T09:58:57Z"' github-actions 40)]}"
+
+  # 3d. A cancelled row from the AUTHORITATIVE suite is still red on the merge
+  #     path: the pull request's current run never passed, whatever an older
+  #     suite said.
+  case_ "#1731: the authoritative suite's own run was cancelled, over an older success" \
+    "0 0 1 0" \
+    'docs-sync' \
+    "{\"check_suites\":[$(_bh_suite 50 github-actions completed 2026-11-08T09:00:00Z),$(_bh_suite 51 github-actions completed 2026-11-08T09:30:00Z)]}" \
+    "{\"check_runs\":[$(_bh_run 'docs-sync' completed '"success"' '"2026-11-08T09:10:00Z"' github-actions 50),$(_bh_run 'docs-sync' completed '"cancelled"' '"2026-11-08T09:31:00Z"' github-actions 51)]}"
+
   # 4. THE TWO SHAPES TOGETHER, which is where a per-app rule is not merely
   #    wrong but wrong in BOTH directions: three sibling suites, the name posted
   #    red in the middle one and stale-green in the oldest, and the NEWEST
