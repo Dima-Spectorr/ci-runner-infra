@@ -565,7 +565,7 @@ derives_tasks_by_default() { # <main.tf>
   matches "$code" '^[[:space:]]*script[[:space:]]*= local\.build_step_script$' || return 1
   # `\\n`: main.tf holds a literal backslash-n (HCL's newline escape). A bare
   # `\n` in an ERE is not that, and matched nothing.
-  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
+  matches "$code" 'build_step_script = "#!/usr/bin/env bash\\ntrap .touch \$\{local\.build_done\}. EXIT\\n\$\{local\.skip_guard\}\$\{local\.derive_step\}\$\{local\.serve_step\}\$\{local\.build_command\}' || return 1
   matches "$code" 'WARM_TASKS=\$\(node \$\{local\.staged_dir\}/derive-turbo-tasks\.cjs turbo\.json \$\{join\(" ", \[for g in var\.turbo_tasks_exclude : "'"'"'\$\{g\}'"'"'"\]\)\}\) \|\| \{ .*exit 1; \}' || return 1
   matches "$code" "gzip -d > \\$\{local\.staged_dir\}/derive-turbo-tasks\.cjs"
 }
@@ -832,6 +832,42 @@ publishes_beside_the_build() { # <main.tf>
 
 if publishes_beside_the_build "$MAIN"; then ok; else
   bad "publish-turbo no longer runs beside the build, or the build's end is never marked (a publisher that waits forever) or a stale marker survives — every artifact is published only after the last lint task again"
+fi
+
+# 9b. A warm of a commit already warmed in this slot does no work: the claim
+#     step creates <sha>-<slot> with ifGenerationMatch=0 (412 = already claimed
+#     → skip marker), clears a stale marker first, fails OPEN on every other
+#     answer, and the build + both publishers honour the marker.
+skips_an_already_warmed_commit() { # <main.tf>
+  local code claim
+  code=$(code_of "$1")
+  claim=$(step_block "$code" claim)
+  [ -n "$claim" ] || return 1
+  matches "$claim" '"WARM_SHA=\$COMMIT_SHA"' || return 1
+  matches "$code" 'ifGenerationMatch=0&name=\$1' || return 1
+  matches "$code" 'rm -f \$\{local\.skip_marker\} \$\{local\.build_failed\}' || return 1
+  # Skip only on a FINISHED warm, or one still inside its timeout — a claim
+  # left by a warm that died must not hide the failure for the whole slot.
+  matches "$code" 'if get "\$name-done" \| grep -q' || return 1
+  matches "$code" '\[ "\$age" -lt \$\{local\.claim_inflight_s\} \]' || return 1
+  matches "$code" 'claim_inflight_s   = tonumber\(trimsuffix\(var\.build_timeout, "s"\)\)' || return 1
+  local mark
+  mark=$(step_block "$code" mark-warmed)
+  [ -n "$mark" ] || return 1
+  matches "$mark" 'script = local\.mark_script' || return 1
+  ! matches "$mark" 'wait_for' || return 1
+  matches "$code" 'if \[ -f \$\{local\.build_failed\} \]; then' || return 1
+  matches "$code" '\|\| \{ touch \$\{local\.build_failed\}; echo' || return 1
+  matches "$code" 'code=\$\(put "\$name-done"\)' || return 1
+  matches "$code" 'touch \$\{local\.skip_marker\}' || return 1
+  matches "$code" 'warming without one' || return 1
+  matches "$code" 'run_publish = "#!/bin/sh\\nset -eu\\n\$\{local\.skip_guard\}' || return 1
+  matches "$code" 'run_turbo   = "#!/bin/sh\\nset -eu\\n\$\{local\.skip_guard\}' || return 1
+  matches "$code" 'EXIT\\n\$\{local\.skip_guard\}\$\{local\.derive_step\}'
+}
+
+if skips_an_already_warmed_commit "$MAIN"; then ok; else
+  bad "a warm of a commit already warmed in this slot rebuilds and republishes again — the 15-minute schedule spends ~90 build-hours a week rebuilding an unchanged main"
 fi
 
 publishes_while_building() { # <warm-turbo.sh>
@@ -1131,8 +1167,24 @@ mutate "derivation runs even when a list is given" "$MAIN" \
   derives_tasks_by_default
 
 mutate "the derive step never reaches the build script" "$MAIN" \
-  's@\\n${local\.derive_step}${local\.serve_step}@\\n${local.serve_step}@' \
+  's@${local\.skip_guard}${local\.derive_step}${local\.serve_step}@${local.skip_guard}${local.serve_step}@' \
   derives_tasks_by_default
+
+mutate "the build ignores the skip marker" "$MAIN" \
+  's@EXIT\\n${local\.skip_guard}@EXIT\\n@' \
+  skips_an_already_warmed_commit
+
+mutate "an already-claimed commit is warmed anyway" "$MAIN" \
+  's@touch ${local\.skip_marker}@: no-op@' \
+  skips_an_already_warmed_commit
+
+mutate "a failed build is still marked warmed" "$MAIN" \
+  's@|| { touch ${local\.build_failed}; echo@|| { echo@' \
+  skips_an_already_warmed_commit
+
+mutate "a dead warm's claim hides the commit for the whole slot" "$MAIN" \
+  's@\[ "$age" -lt ${local\.claim_inflight_s} \]@true@' \
+  skips_an_already_warmed_commit
 
 mutate "an empty derivation builds anyway" "$MAIN" \
   's@failing the build so the warmer alert fires. >&2; exit 1; }@failing the build so the warmer alert fires'"'"' >\&2; }@' \

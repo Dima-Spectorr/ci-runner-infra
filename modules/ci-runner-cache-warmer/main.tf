@@ -386,8 +386,119 @@ locals {
     "fi\n",
   ])
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
-  run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh\n"
+  # ONE WARM PER COMMIT PER HALF-DAY, CLAIMED BEFORE ANYTHING IS INSTALLED.
+  #
+  # The schedule fires whether or not the branch moved. Measured on the first
+  # fleet repository to warm every 15 minutes (7 days to 2026-11-08): 677 warms,
+  # 479 of them on the same commit as the warm before, and those no-op warms still
+  # took a median 628 s on a 32-core worker — 91 of 142 build-hours, and a
+  # concurrency slot the deploy builds in the same project queue behind (deploy
+  # queue p90 266 s with a warm running, 59 s without). 108 warms also started
+  # while the previous one was still building the same commit.
+  #
+  # So a warm skips its commit only when, in the current 12-hour slot, another
+  # warm already FINISHED it (a `-done` object the last step writes after every
+  # step before it succeeded and the build itself did not fail), or another warm
+  # is STILL building it (a write-once claim younger than the build timeout).
+  # A claim older than that belongs to a warm that died — timed out, crashed,
+  # failed a step — and this warm runs: a failure is never hidden behind a skip
+  # for the rest of the slot. The slot, not the commit alone, is in the names so
+  # an idle branch is still rewarmed twice a day — the snapshot store has an age
+  # bound, and a branch that sits still for a week must not age out of it. Both
+  # objects sit under the turbo prefix this identity may already create in and
+  # read, so no grant widens, and the bucket's own age bound deletes old ones.
+  #
+  # FAIL-OPEN TO WARMING. No SHA, no token, an unreadable claim, or any answer
+  # the step does not expect is logged and the warm runs exactly as it did
+  # before these steps existed.
+  skip_marker        = "${local.staged_dir}/skip"
+  skip_guard         = "if [ -f ${local.skip_marker} ]; then echo '[warm] skipped: this commit is already warmed, or being warmed, in this slot (see the claim step)'; exit 0; fi\n"
+  build_failed       = "${local.staged_dir}/build-failed"
+  claim_slot_seconds = 43200
+  claim_inflight_s   = tonumber(trimsuffix(var.build_timeout, "s"))
+  claim_prefix_enc   = replace("${local.turbo_prefix}warm-claims/", "/", "%2F")
+
+  # Shared by the claim and mark steps: validate the SHA, name the slot, fetch a
+  # token, and two curl helpers that print only the HTTP status (`put`) or the
+  # body (`get`, status on fd 3). The token reaches curl through -K, never argv.
+  claim_common = <<-EOT
+    #!/bin/bash
+    set -u
+    if ! printf '%s' "$WARM_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "[warm] this build carries no commit SHA ('$WARM_SHA'); no claim" >&2
+      exit 0
+    fi
+    slot=$(( $(date -u +%s) / ${local.claim_slot_seconds} ))
+    name="${local.claim_prefix_enc}$WARM_SHA-$slot"
+    token=$(gcloud auth print-access-token 2>/dev/null) || token=""
+    if [ -z "$token" ]; then
+      echo '[warm] no access token; no claim' >&2
+      exit 0
+    fi
+    api=https://storage.googleapis.com
+    auth() { printf 'header = "Authorization: Bearer %s"\n' "$token"; }
+    put() {
+      c=$(curl -sS --proto '=https' --connect-timeout 10 --max-time 60 -K <(auth) \
+        -X POST -H 'Content-Type: text/plain' --data-binary "$WARM_BUILD_ID" \
+        -o /dev/null -w '%%{http_code}' \
+        "$api/upload/storage/v1/b/${var.cache_bucket}/o?uploadType=media&ifGenerationMatch=0&name=$1" \
+        2>/dev/null) || true
+      [ -n "$c" ] || c=000
+      printf '%s' "$c"
+    }
+    get() {
+      curl -sS --proto '=https' --connect-timeout 10 --max-time 60 -K <(auth) \
+        "$api/storage/v1/b/${var.cache_bucket}/o/$1" 2>/dev/null || true
+    }
+  EOT
+
+  claim_script = <<-EOT
+    ${local.claim_common}
+    rm -f ${local.skip_marker} ${local.build_failed}
+    if get "$name-done" | grep -q '"timeCreated"'; then
+      touch ${local.skip_marker}
+      echo "[warm] $WARM_SHA was already warmed in slot $slot; install, build and publish are skipped"
+      exit 0
+    fi
+    code=$(put "$name")
+    case "$code" in
+      200 | 201) echo "[warm] claimed $WARM_SHA for slot $slot; warming" ;;
+      412)
+        created=$(get "$name" | grep -o '"timeCreated": *"[^"]*"' | cut -d'"' -f4)
+        born=$(date -u -d "$created" +%s 2>/dev/null) || born=0
+        age=$(( $(date -u +%s) - born ))
+        if [ "$born" -gt 0 ] && [ "$age" -lt ${local.claim_inflight_s} ]; then
+          touch ${local.skip_marker}
+          echo "[warm] another warm claimed $WARM_SHA $age s ago and is still within its timeout; install, build and publish are skipped"
+        else
+          echo "[warm] $WARM_SHA was claimed in slot $slot but never finished (claim age '$age' s); warming again"
+        fi
+        ;;
+      *) echo "[warm] the claim answered HTTP $code; warming without one" >&2 ;;
+    esac
+    exit 0
+  EOT
+
+  # Runs last, so Cloud Build reaches it only when every step before it passed.
+  # The build step swallows its own failure (it still publishes what it made),
+  # so it leaves a marker instead, and a failed build is never marked warmed.
+  mark_script = <<-EOT
+    ${local.claim_common}
+    if [ -f ${local.skip_marker} ]; then exit 0; fi
+    if [ -f ${local.build_failed} ]; then
+      echo "[warm] the build failed; $WARM_SHA is not marked warmed, so the next warm retries it" >&2
+      exit 0
+    fi
+    code=$(put "$name-done")
+    case "$code" in
+      200 | 201 | 412) echo "[warm] marked $WARM_SHA warmed for slot $slot" ;;
+      *) echo "[warm] marking $WARM_SHA warmed answered HTTP $code; the next warm will rebuild it" >&2 ;;
+    esac
+    exit 0
+  EOT
+
+  run_publish = "#!/bin/sh\nset -eu\n${local.skip_guard}echo '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  run_turbo   = "#!/bin/sh\nset -eu\n${local.skip_guard}echo '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh\n"
 
   # zstd, so warm-turbo.sh can decode every artifact before it uploads it and
   # refuse a truncated one. Best effort, like getcap above, and safe to be: with
@@ -630,13 +741,15 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
+  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.skip_guard}${local.derive_step}${local.serve_step}${local.build_command} || { touch ${local.build_failed}; echo '[warm] build failed; publishing what it produced'; }\n${local.serve_summary}"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
   # top, hence a budget well under the observed 128 KiB rather than at it.
   build_config_bytes = sum([
     length(local.stage_script),
+    length(local.claim_script),
+    length(local.mark_script),
     length(local.run_publish),
     length(local.build_step_script),
     length(local.run_turbo),
@@ -837,6 +950,21 @@ resource "google_cloudbuild_trigger" "warm" {
       script = local.stage_script
     }
 
+    # 0b. THE CLAIM: one warm per commit per 12-hour slot (see `claim_script`).
+    #     Runs before any repository code, in the gcloud image, and every later
+    #     step exits at once when it leaves the skip marker. `$COMMIT_SHA` and
+    #     `$BUILD_ID` are Cloud Build substitutions, expanded in `env` (never in
+    #     `script`).
+    step {
+      id     = "claim"
+      name   = var.gcloud_image
+      script = local.claim_script
+      env = [
+        "WARM_SHA=$COMMIT_SHA",
+        "WARM_BUILD_ID=$BUILD_ID",
+      ]
+    }
+
     # 1. DEPENDENCIES, AND THE SNAPSHOT PACKED BUT NOT PUBLISHED.
     #
     #    This is the publishing script's BUILD phase, and running it here rather
@@ -955,6 +1083,18 @@ resource "google_cloudbuild_trigger" "warm" {
         "CACHE_POOL=${var.pool_name}",
         "CACHE_BUCKET=${var.cache_bucket}",
         "CACHE_MAX_BYTES=${var.snapshot_max_bytes}",
+      ]
+    }
+
+    # 5. THE COMMIT, marked warmed — only reached when every step above passed,
+    #    and it declines when the build left its failure marker. See claim_script.
+    step {
+      id     = "mark-warmed"
+      name   = var.gcloud_image
+      script = local.mark_script
+      env = [
+        "WARM_SHA=$COMMIT_SHA",
+        "WARM_BUILD_ID=$BUILD_ID",
       ]
     }
   }
