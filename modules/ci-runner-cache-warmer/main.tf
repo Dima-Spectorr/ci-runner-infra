@@ -386,8 +386,67 @@ locals {
     "fi\n",
   ])
 
-  run_publish = "#!/bin/sh\nset -eu\necho '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
-  run_turbo   = "#!/bin/sh\nset -eu\necho '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh\n"
+  # ONE WARM PER COMMIT PER HALF-DAY, CLAIMED BEFORE ANYTHING IS INSTALLED.
+  #
+  # The schedule fires whether or not the branch moved. Measured on the first
+  # fleet repository to warm every 15 minutes (7 days to 2026-11-08): 677 warms,
+  # 479 of them on the same commit as the warm before, and those no-op warms still
+  # took a median 628 s on a 32-core worker — 91 of 142 build-hours, and a
+  # concurrency slot the deploy builds in the same project queue behind (deploy
+  # queue p90 266 s with a warm running, 59 s without). 108 warms also started
+  # while the previous one was still building the same commit.
+  #
+  # So the first step creates a write-once object named for the commit and the
+  # current 12-hour slot. Created: this warm owns the commit and runs. Already
+  # there (412): another warm built it or is building it, and every later step
+  # exits at once. The slot, not the commit alone, is in the name so an idle
+  # branch is still rewarmed twice a day — the snapshot store has an age bound,
+  # and a branch that sits still for a week must not age out of it. The object
+  # sits under the turbo prefix this identity may already create in, so no grant
+  # widens, and the bucket's own age bound deletes old claims.
+  #
+  # FAIL-OPEN TO WARMING. No SHA, no token, or any answer other than 412 is
+  # logged and the warm runs exactly as it did before this step existed.
+  skip_marker        = "${local.staged_dir}/skip"
+  skip_guard         = "if [ -f ${local.skip_marker} ]; then echo '[warm] skipped: this commit is already warmed in this slot (see the claim step)'; exit 0; fi\n"
+  claim_slot_seconds = 43200
+  claim_prefix_enc   = replace("${local.turbo_prefix}warm-claims/", "/", "%2F")
+
+  claim_script = <<-EOT
+    #!/bin/bash
+    set -u
+    rm -f ${local.skip_marker}
+    if ! printf '%s' "$WARM_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "[warm] this build carries no commit SHA ('$WARM_SHA'); warming without a claim" >&2
+      exit 0
+    fi
+    slot=$(( $(date -u +%s) / ${local.claim_slot_seconds} ))
+    name="${local.claim_prefix_enc}$WARM_SHA-$slot"
+    token=$(gcloud auth print-access-token 2>/dev/null) || token=""
+    if [ -z "$token" ]; then
+      echo '[warm] no access token; warming without a claim' >&2
+      exit 0
+    fi
+    code=$(curl -sS --proto '=https' --connect-timeout 10 --max-time 60 \
+      -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+      -X POST -H 'Content-Type: text/plain' --data-binary "$WARM_BUILD_ID" \
+      -o /dev/null -w '%%{http_code}' \
+      "https://storage.googleapis.com/upload/storage/v1/b/${var.cache_bucket}/o?uploadType=media&ifGenerationMatch=0&name=$name" \
+      2>/dev/null) || true
+    [ -n "$code" ] || code=000
+    case "$code" in
+      200 | 201) echo "[warm] claimed $WARM_SHA for slot $slot; warming" ;;
+      412)
+        touch ${local.skip_marker}
+        echo "[warm] $WARM_SHA is already claimed for slot $slot by an earlier warm; install, build and publish are skipped"
+        ;;
+      *) echo "[warm] the claim answered HTTP $code; warming without one" >&2 ;;
+    esac
+    exit 0
+  EOT
+
+  run_publish = "#!/bin/sh\nset -eu\n${local.skip_guard}echo '${local.publish_sha}  ${local.staged_dir}/publish-cache-snapshot.sh\n${local.scan_sha}  ${local.staged_dir}/scan-cache-credentials.sh' | sha256sum -c -\n${local.ensure_getcap}${local.ensure_scan_allow}exec ${local.staged_dir}/publish-cache-snapshot.sh\n"
+  run_turbo   = "#!/bin/sh\nset -eu\n${local.skip_guard}echo '${local.turbo_sha}  ${local.staged_dir}/warm-turbo.sh' | sha256sum -c -\n${local.ensure_zstd}exec ${local.staged_dir}/warm-turbo.sh\n"
 
   # zstd, so warm-turbo.sh can decode every artifact before it uploads it and
   # refuse a truncated one. Best effort, like getcap above, and safe to be: with
@@ -630,13 +689,14 @@ locals {
   # getting that wrong is a build step that dies on a syntax error at fire time.
   turbo_cache_dir_arg = "'${replace(var.turbo_cache_dir, "'", "'\\''")}'"
 
-  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
+  build_step_script = "#!/usr/bin/env bash\ntrap 'touch ${local.build_done}' EXIT\n${local.skip_guard}${local.derive_step}${local.serve_step}${local.build_command} || echo '[warm] build failed; publishing what it produced'\n${local.serve_summary}"
 
   # Every byte this module hands Cloud Build, which is what the cliff above is
   # measured against. The env entries and the trigger's own fields add a little on
   # top, hence a budget well under the observed 128 KiB rather than at it.
   build_config_bytes = sum([
     length(local.stage_script),
+    length(local.claim_script),
     length(local.run_publish),
     length(local.build_step_script),
     length(local.run_turbo),
@@ -835,6 +895,21 @@ resource "google_cloudbuild_trigger" "warm" {
       id     = "stage-scripts"
       name   = var.gcloud_image
       script = local.stage_script
+    }
+
+    # 0b. THE CLAIM: one warm per commit per 12-hour slot (see `claim_script`).
+    #     Runs before any repository code, in the gcloud image, and every later
+    #     step exits at once when it leaves the skip marker. `$COMMIT_SHA` and
+    #     `$BUILD_ID` are Cloud Build substitutions, expanded in `env` (never in
+    #     `script`).
+    step {
+      id     = "claim"
+      name   = var.gcloud_image
+      script = local.claim_script
+      env = [
+        "WARM_SHA=$COMMIT_SHA",
+        "WARM_BUILD_ID=$BUILD_ID",
+      ]
     }
 
     # 1. DEPENDENCIES, AND THE SNAPSHOT PACKED BUT NOT PUBLISHED.
