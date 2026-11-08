@@ -13,14 +13,29 @@ script="$here/ensure-gh.sh"
 bash_bin="$(command -v bash)"
 fail=0
 
-# The caller's PATH minus every directory holding a gh, so the script cannot
-# exit early on a runner image that ships the CLI, with the curl stub in front.
-# (Filtering rather than symlinking a tool list: a symlinked binary outside its
-# own directory cannot find its libraries on every platform.)
+# The caller's PATH with gh taken out, so the script cannot exit early on a
+# runner image that ships the CLI; the curl stub goes in front. A directory
+# that holds gh is not dropped — on GitHub's Ubuntu image that is /usr/bin, and
+# uname, tar and sha256sum live there too — but replaced by a mirror of its
+# entries without gh. (Directories without gh stay as they are: on Windows a
+# symlinked binary outside its own directory cannot find its libraries.)
+shadow_root="$(mktemp -d)"
+trap 'rm -rf "$shadow_root"' EXIT
 no_gh_path=""
+n=0
 IFS=: read -r -a path_dirs <<< "$PATH"
 for p in "${path_dirs[@]}"; do
-  [ -n "$p" ] && [ ! -e "$p/gh" ] && [ ! -e "$p/gh.exe" ] && no_gh_path="${no_gh_path:+$no_gh_path:}$p"
+  if [ -z "$p" ] || [ ! -d "$p" ]; then continue; fi
+  if [ -e "$p/gh" ] || [ -e "$p/gh.exe" ]; then
+    n=$((n + 1)); m="$shadow_root/$n"; mkdir -p "$m"
+    for f in "$p"/*; do
+      case "${f##*/}" in gh|gh.exe) continue ;; esac
+      # Windows without developer mode refuses symlinks; a copy serves there.
+      ln -s "$f" "$m/${f##*/}" 2>/dev/null || cp -pR "$f" "$m/" 2>/dev/null || true
+    done
+    p="$m"
+  fi
+  no_gh_path="${no_gh_path:+$no_gh_path:}$p"
 done
 
 sandbox() { # <dir>
