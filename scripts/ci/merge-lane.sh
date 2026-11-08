@@ -992,6 +992,38 @@ check_counts() {
     state="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].state // "absent"')"
     winner_origin="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].origin // ""')"
 
+    # A CANCELLED RUN FROM A SUPERSEDED SUITE IS NOT THE PULL REQUEST'S ANSWER
+    # (#1731). Two `pull_request` events a second apart start two runs of one
+    # workflow; its concurrency group cancels the first, and the second posts
+    # the real answer for the same name. Cancellation is asynchronous, so the
+    # cancelled row can finish in the same second as, or after, the newer run's
+    # row, and newest-wins above then hands the name to the CANCELLED run.
+    # Measured on entity-platform #15045, 2026-11-08: `docs-sync` cancelled at
+    # 09:58:52 in suite 115046029046 and skipped at 09:58:52 in the newer suite
+    # 115046031621. GitHub reported the pull request CLEAN, and the lane
+    # skipped it as `red failed=1` on every pass.
+    #
+    # The ruleset asks the authoritative suite for the name, so this asks the
+    # same one: when the winning row is a cancelled check-run from any OTHER
+    # suite and the authoritative suite posted its own occurrence, that
+    # occurrence is the state, whatever it is. A cancelled row from the
+    # authoritative suite itself is untouched and still fails the merge path,
+    # and a substituted `success`/`skipped` still goes through the authority
+    # check and the later-unfinished hold below.
+    if [ "$state" = "cancelled" ] && [ "$winner_origin" = "run" ]; then
+      local c_app c_suite c_auth c_state
+      c_app="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].app // ""')"
+      c_suite="$(printf '%s' "$all" | jq -r --arg n "$name" '.[$n].suite // -1')"
+      c_auth="$(printf '%s' "$name_auth" | jq -r --arg a "$c_app" --arg n "$name" '.[$a][$n].id // ""')"
+      if [ -n "$c_auth" ] && [ "$c_auth" != "$c_suite" ]; then
+        c_state="$(printf '%s' "$auth_filtered" | jq -r --arg a "$c_app" --arg n "$name" '.[$a][$n] // ""')"
+        if [ -n "$c_state" ]; then
+          why="cancelled in superseded suite $c_suite; authoritative suite $c_auth says $c_state"
+          state="$c_state"
+        fi
+      fi
+    fi
+
     # THE FIX, AND THE ONLY THING IT TOUCHES: a `success` is never trusted as
     # the answer for a name unless it came from the suite the ruleset itself
     # would ask FOR THAT NAME — everything else `all` already produced
