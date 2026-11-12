@@ -502,10 +502,12 @@ resource "google_compute_instance_template" "host" {
     # controller decided to remove it.
     on_host_maintenance = var.spot ? "TERMINATE" : "MIGRATE"
 
-    # On preemption, DELETE rather than STOP: a stopped Spot host holds its
-    # registrations and its disk while serving nothing. The controller reaps
-    # terminal-state hosts anyway (drain rule 1), but deleting is immediate.
-    instance_termination_action = var.spot ? "DELETE" : null
+    # STOP, not DELETE: GCE refuses DELETE for Spot VMs in a managed instance
+    # group ("Spot virtual machines with termination action set to DELETE
+    # cannot be used with Managed Instance Groups", first apply 2026-11-12).
+    # A stopped host serves nothing; the controller reaps terminal-state hosts
+    # (drain rule 1), so the stopped disk is short-lived.
+    instance_termination_action = var.spot ? "STOP" : null
   }
 
   metadata = merge(local.boot_script_metadata, local.windows_host_metadata, {
