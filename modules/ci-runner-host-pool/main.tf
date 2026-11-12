@@ -289,6 +289,8 @@ locals {
     file("${path.module}/scripts/host-ownership.sh"),
     file("${path.module}/scripts/orphan-decision.sh"),
     file("${path.module}/scripts/pinned-job-decision.sh"),
+    # After host-ownership.sh, whose pool_slot_host it calls.
+    file("${path.module}/scripts/preempt-decision.sh"),
     file("${path.module}/scripts/recycle-decision.sh"),
     # The Windows half of the second delete gate. Concatenated on EVERY pool,
     # Linux included, and inert on one: nothing calls beacon_decision() unless a
@@ -1003,8 +1005,12 @@ resource "google_compute_instance_template" "controller" {
     # bool: in jq the STRING "false" is truthy, and this key arms a mechanism
     # that takes runner agents down.
     "ci-recycle-cordon-stops-agents" = tostring(var.recycle_cordon_stops_agents)
-    "ci-poll-seconds"                = tostring(var.poll_interval_seconds)
-    "ci-demand-budget-seconds"       = tostring(var.demand_budget_seconds)
+    # Whether the hosts are Spot VMs, so the controller re-runs a failed job
+    # whose host was reclaimed. The literal "true"/"false", for the jq reason
+    # above.
+    "ci-spot"                  = tostring(var.spot)
+    "ci-poll-seconds"          = tostring(var.poll_interval_seconds)
+    "ci-demand-budget-seconds" = tostring(var.demand_budget_seconds)
     # How much of that budget's work fits in it. See demand_fetch_concurrency.
     "ci-demand-fetch-concurrency" = tostring(var.demand_fetch_concurrency)
     "ci-metric-prefix"            = var.metric_prefix

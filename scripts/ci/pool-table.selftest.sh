@@ -94,7 +94,7 @@ FULL='[{"name":"linux-ci","mig":"ci-linux-mig","region":"europe-west4",
   "recycle_max_unavailable":2,"host_os":"linux",
   "mints_registration_token":false,"role":"ci","beacon_interval":31,
   "pin_orphan_grace_seconds":903,"runner_labels":"self-hosted,linux-ci,Repo",
-  "recycle_cordon_stops_agents":true,"jobs_per_host":5}]'
+  "recycle_cordon_stops_agents":true,"jobs_per_host":5,"spot":true}]'
 
 # --- the column-order contract ------------------------------------------------
 # controller-startup.sh reads these rows POSITIONALLY. Appending a column is
@@ -121,6 +121,7 @@ want_field "column 15 is pin_orphan_grace_seconds" 15 903
 want_field "column 16 is runner_labels" 16 "self-hosted,linux-ci,Repo"
 want_field "column 17 is recycle_cordon_stops_agents" 17 true
 want_field "column 18 is jobs_per_host" 18 5
+want_field "column 19 is spot" 19 true
 
 # jobs_per_host defaults to slots: an older table without the column still
 # converts a recycling host into exactly one host of demand.
@@ -199,6 +200,15 @@ want_field 'the string "false" does not arm the host-side cordon' 17 false
 run '[{"name":"p","mig":"m","region":"r","runner_labels":"a",
   "recycle_cordon_stops_agents":true}]'
 want_field "a real true does arm the host-side cordon" 17 true
+
+# And again for spot, which arms the controller RE-RUNNING failed jobs: a pool
+# that says nothing, or says "false" as a string, must not re-run anything.
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a"}]'
+want_field "a pool that never heard of spot reads false" 19 false
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a","spot":"false"}]'
+want_field 'the string "false" does not arm preempted-job re-runs' 19 false
+run '[{"name":"p","mig":"m","region":"r","runner_labels":"a","spot":true}]'
+want_field "a real true does arm preempted-job re-runs" 19 true
 
 # --- rejections, one per validation branch ------------------------------------
 # Each of these is a row the controller must refuse to act on, and must SAY it

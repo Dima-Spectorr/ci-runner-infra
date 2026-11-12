@@ -52,6 +52,8 @@ variable "pools" {
     # The autoscaler's single_instance_assignment, so a recycling host can be
     # published as exactly one host's worth of demand. pool_descriptor carries it.
     jobs_per_host = optional(number)
+    # Spot hosts: a failed job whose host was reclaimed is re-run (preempt-decision.sh).
+    spot = optional(bool)
   }))
 
   # EMPTY MEANS "THE `repos` TABLE IS IN USE", and only that. "At least one pool"
@@ -245,6 +247,7 @@ variable "repos" {
         pin_orphan_grace_seconds    = optional(number)
         recycle_cordon_stops_agents = optional(bool)
         jobs_per_host               = optional(number)
+        spot                        = optional(bool)
       }))
     })
   )

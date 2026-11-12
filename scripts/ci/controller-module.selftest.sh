@@ -99,7 +99,7 @@ columns=$(
       tr -d '(. ='
   } | sort -u
 )
-check "the parser still declares eighteen columns" 18 \
+check "the parser still declares nineteen columns" 19 \
   "$(printf '%s\n' "$columns" | grep -c .)"
 
 # `value = {` inside the pool_descriptor output, keys only.
@@ -314,6 +314,12 @@ grep -q '"ci-recycle-cordon-stops-agents"' "$POOL_TF/main.tf" && r=yes || r=no
 check "the pool module renders the flag as its own metadata key too" yes "$r"
 grep -q 'ci-recycle-cordon-stops-agents' "$STARTUP" && r=yes || r=no
 check "and the controller reads that key when it has no table" yes "$r"
+# Same for spot: a single-pool Spot controller with no key would never re-run a
+# job lost to a reclaimed host.
+grep -q '"ci-spot"' "$POOL_TF/main.tf" && r=yes || r=no
+check "the pool module renders spot as its own metadata key" yes "$r"
+grep -q 'instance/attributes/ci-spot' "$STARTUP" && r=yes || r=no
+check "and the controller reads the spot key when it has no table" yes "$r"
 
 # A cordoned host is short of registered slots BY DESIGN, for as long as the
 # cordon lasts. Counted, it drives ci_slots_missing non-zero on every recycle

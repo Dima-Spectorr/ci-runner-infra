@@ -465,6 +465,11 @@ jobs:
       - name: pinned-job-decision self-test
         run: bash scripts/ci/pinned-job-decision.selftest.sh
 
+      # Re-running a job whose Spot host was reclaimed: when the evidence says
+      # the host is gone, once per attempt, under the cap.
+      - name: preempt-decision self-test
+        run: bash scripts/ci/preempt-decision.selftest.sh
+
       # The Windows half of the delete gate. Where the Linux rule reads an
       # answer the controller fetched itself, this one reads a value the HOST
       # published — so every failure of that publisher, its clock and the guest

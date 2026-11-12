@@ -29,7 +29,7 @@ Two facts shape everything below:
 |---|---|---|---|
 | **Metadata** | Read | mandatory for every App | nothing works |
 | **Administration** | Read & write | `POST /repos/{owner}/{repo}/actions/runners/registration-token`, `GET /repos/{owner}/{repo}/actions/runners` | **hosts cannot register.** The one permission here that fails loudly — a host boots, cannot get a token, and the pool serves nothing |
-| **Actions** | Read & write | read: `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`; write: `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`, `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun` | without read: the controller sees no demand, publishes none, and the pool never scales out (reads on every chart as a quiet repository). Without write: a run pinned to a deleted host is never cancelled or re-run. Signalled: WARNING `pinned-run-unservable` events with `outcome` `refused-403` or `rerun-refused-403` |
+| **Actions** | Read & write | read: `GET /repos/{owner}/{repo}/actions/runs`, `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`; write: `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel`, `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun`, `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs` | without read: the controller sees no demand, publishes none, and the pool never scales out (reads on every chart as a quiet repository). Without write: a run pinned to a deleted host is never cancelled or re-run, and a job lost to a reclaimed Spot host is not re-run. Signalled: WARNING `pinned-run-unservable` events with `outcome` `refused-403` or `rerun-refused-403`; WARNING `preempted-job-not-rerun` with `outcome` `rerun-refused-403` |
 | **Checks** | Read | `GET /repos/{owner}/{repo}/commits/{ref}/check-runs` | the merge-queue **parking detector** can never report. Signalled: `ci_parked_sweep_denied` non-zero, log `parked sweep: DENIED`, `parkeddenied` alert after 30 min |
 | **Pull requests** | Read | `GET /repos/{owner}/{repo}/pulls?state=open` | same detector, one step earlier — log `parked sweep: cannot list open pull requests` |
 
@@ -68,6 +68,17 @@ Any other 403 is a rate limit, and a secondary limit can arrive with neither
 header, so it is retried on a later tick. A
 refusal falls back to a WARNING `pinned-run-unservable` event that names the run
 and says to re-run it in full, which is exactly the behaviour before the grant.
+
+**Spot pools also use it for `rerun-failed-jobs`.** On a pool with
+`spot = true`, a job that failed with no failed step on a host the MIG no
+longer has (or recreated after the job began) is re-run with
+`POST .../runs/{id}/rerun-failed-jobs`, so the passed jobs are kept; a
+host-pinned run gets the full `rerun` above instead. GitHub's
+[permissions table for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps)
+lists this endpoint under **Actions: write**, the same as `rerun` and `cancel`
+(checked 2026-11-12), so it needs no new grant. It is posted with the same
+down-scoped token. A refusal is a WARNING `preempted-job-not-rerun`. See
+[scale-down-contract.md](scale-down-contract.md#jobs-lost-to-a-reclaimed-spot-host).
 
 **Blast radius.** `Actions: write` lets this App, in every repository its
 installation covers, cancel, re-run and delete workflow runs, dispatch
@@ -147,7 +158,7 @@ Terraform `github_repo` sets) and exactly the permissions its call path uses
 | controller general | `controller-startup.sh` `gh_token` | `[<pool repo>]` | `actions: read`, `administration: write`, `checks: read`, `pull_requests: read` | runs, run jobs, runner list + `DELETE`, registration-token, `pulls`, `check-runs` |
 | controller general, narrowed | same, after a 422 on the set above | `[<pool repo>]` | `actions: read`, `administration: write` | the same, minus the parked sweep (which reports `DENIED`) |
 | controller general, admin only | same, after a 422 on the pair above | `[<pool repo>]` | `administration: write` | runner list + `DELETE` (drain, cordon, orphan reap), registration-token; demand is blind |
-| controller actions write | #1413's `gh_actions_token` | `[<pool repo>]` | `actions: write` | `POST .../runs/{id}/cancel`, `.../rerun` |
+| controller actions write | #1413's `gh_actions_token` | `[<pool repo>]` | `actions: write` | `POST .../runs/{id}/cancel`, `.../rerun`, `.../rerun-failed-jobs` |
 
 The Windows pool mints nothing on the host: the controller writes the
 registration token into the host's metadata (`ci-registration-token`).

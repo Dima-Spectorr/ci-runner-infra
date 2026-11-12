@@ -300,9 +300,18 @@ variable "spot" {
   description = <<-EOT
     Run hosts as Spot VMs (60-70% cheaper, preemptible at any moment).
 
-    Only safe for pools whose jobs are NOT merge-blocking: a preemption kills
-    every job on the host at once, and with K slots the blast radius is K jobs,
-    not one. Leave false for the pool that gates merges.
+    A preemption kills every job on the host at once, and with K slots the
+    blast radius is K jobs, not one. Those jobs are NOT lost silently: the
+    controller re-runs a run's failed jobs (`rerun-failed-jobs`; a full re-run
+    for a host-pinned run) when a failed job ran on one of this pool's hosts
+    and that host is gone from the MIG or has cold-started since the job
+    began, at most until the run reaches its third attempt. Each re-run is an
+    INFO `preempted-job-rerun` event and a `ci_preempted_reruns` point; a lost
+    job it will not re-run is a WARNING. See docs/scale-down-contract.md.
+
+    Still a poor fit for the pool that gates merges: the re-run costs the
+    lost job's whole duration again, and the merge waits for it. Prefer false
+    there.
 
     Refused outright on `host_os = "windows"`. Windows adds two reasons to the
     fleet-wide one: a preemption takes K slots with it on a host whose boot is
