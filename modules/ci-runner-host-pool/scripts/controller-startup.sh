@@ -3295,7 +3295,7 @@ rerun_preempted_jobs() {
   [ "$POOL_SPOT" = true ] || return 0
   local f id now st att stamp acted body keep line
   local l_pool runner started completed pinned host status born verdict
-  local lost lost_host lost_why any_pinned mine decision verb how
+  local lost lost_host lost_why any_pinned on_spot_pool decision verb how
   local run_json rstatus rattempt concl
   now=$(date +%s)
   for f in "$STATE_DIR"/preempt-*; do
@@ -3307,7 +3307,7 @@ rerun_preempted_jobs() {
     [ "$st" = pending ] || continue
     body=$(tail -n +2 "$f" 2>/dev/null)
 
-    keep="" lost=0 lost_host="" lost_why="" any_pinned=0 mine=0
+    keep="" lost=0 lost_host="" lost_why="" any_pinned=0 on_spot_pool=0
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       l_pool="" runner="" started="" completed="" pinned=""
@@ -3316,7 +3316,7 @@ rerun_preempted_jobs() {
         keep="${keep:+$keep$'\n'}$line"
         continue
       fi
-      mine=1
+      on_spot_pool=1
       host="" status="" born=""
       if [ -n "$MIG_BASE" ] && host=$(pool_slot_host "$MIG_BASE" "$runner") && [ -n "$host" ]; then
         # Listed with no status yet is a host being created: present, not gone.
@@ -3343,7 +3343,7 @@ rerun_preempted_jobs() {
         *) ;; # foreign: not this pool's host, nothing to say
       esac
     done <<<"$body"
-    [ "$mine" = 1 ] || continue
+    [ "$on_spot_pool" = 1 ] || continue
 
     if [ "$lost" = 1 ]; then
       # Decided against the run as GitHub reports it NOW, never the ledger.
