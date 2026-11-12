@@ -483,6 +483,7 @@ if [ -z "${POOLS_JSON:-}" ]; then
     --arg beacon "$(md "instance/attributes/ci-beacon-interval")" \
     --arg pin "$(md "instance/attributes/ci-pin-orphan-grace-seconds")" \
     --arg labels "$(md "instance/attributes/ci-runner-labels")" \
+    --arg spot "$(md "instance/attributes/ci-spot")" \
     'def nz: if . == "" then null else . end;
      [ { name: $name, mig: $mig, region: $region,
          slots: ($slots | nz), min_hosts: ($minh | nz), max_hosts: ($maxh | nz),
@@ -501,6 +502,9 @@ if [ -z "${POOLS_JSON:-}" ]; then
          mints_registration_token: ($mint | nz),
          beacon_interval: ($beacon | nz),
          pin_orphan_grace_seconds: ($pin | nz),
+         # Absent on every controller rendered before the key existed: null,
+         # so the parser default (false) applies and nothing is re-run.
+         spot: ($spot | nz),
          runner_labels: $labels } ]')
 fi
 
@@ -508,7 +512,7 @@ POOLS=()
 declare -A P_MIG=() P_REGION=() P_SLOTS=() P_MIN=() P_MAX=() P_GRACE=()
 declare -A P_REGGRACE=() P_TICKS=() P_RECYCLE=() P_CORDON_STOP=() P_HOST_OS=() P_MINT=() P_JPH=()
 declare -A P_ROLE=() P_BEACON=() P_PIN=() P_LABELS=() P_LABELS_JSON=()
-declare -A P_MATCH_JSON=() P_MATCH_CSV=()
+declare -A P_MATCH_JSON=() P_MATCH_CSV=() P_SPOT=()
 
 # Rejected rows are counted and published (ci_pool_table_rejected), not merely
 # logged: a pool that silently stopped being served looks exactly like a pool
@@ -539,9 +543,10 @@ POOL_TABLE_REJECTED=0
 # collapse. See the note in pool-table.sh.
 while IFS=$'\t' read -r p_name p_mig p_region p_slots p_min p_max p_grace \
   p_reggrace p_ticks p_recycle p_hostos p_mint p_role p_beacon p_pin p_labels \
-  p_cordonstop p_jph; do
+  p_cordonstop p_jph p_spot; do
   [ -n "$p_name" ] || continue
   POOLS+=("$p_name")
+  P_SPOT["$p_name"]="${p_spot:-false}"
   P_MIG["$p_name"]="$p_mig"
   P_REGION["$p_name"]="$p_region"
   P_SLOTS["$p_name"]="$p_slots"
@@ -624,6 +629,19 @@ POOLS_MATCH_MAP=$(
   } | jq -s -c 'add // {}'
 )
 
+# The same map restricted to the Spot pools: the only pools whose failed jobs
+# the outcome sweep inspects for a reclaimed host (preempt-decision.sh). It is
+# `{}` on a controller with no Spot pool, and every preemption path below is
+# then skipped before it costs a jq pass or an API call.
+SPOT_MATCH_MAP=$(
+  {
+    for p in "${POOLS[@]}"; do
+      [ "${P_SPOT[$p]:-false}" = true ] || continue
+      jq -n -c --arg p "$p" --argjson l "${P_MATCH_JSON[$p]}" '{($p): $l}'
+    done
+  } | jq -s -c 'add // {}'
+)
+
 # pool_select <name> — make <name> THE pool for every function below.
 #
 # It writes the same global names the single-pool controller always used, which
@@ -653,6 +671,7 @@ pool_select() {
   RUNNER_LABELS="${P_LABELS[$POOL]}"
   RUNNER_MATCH_LABELS="${P_MATCH_CSV[$POOL]}"
   POOL_LABELS_JSON="${P_LABELS_JSON[$POOL]}"
+  POOL_SPOT="${P_SPOT[$POOL]:-false}"
 
   MIG_BASE=""
   MIG_TARGET=0
@@ -669,6 +688,7 @@ pool_select() {
 # The per-pool globals pool_select writes, declared at file scope so that a read
 # before the first select cannot kill the tick under `set -u`.
 POOL=""
+POOL_SPOT=false
 DEMAND_EXPIRED=0
 MIG=""
 REGION=""
@@ -2117,9 +2137,29 @@ collect_outcomes() {
   local workflows=0
   declare -A seen_workflow=()
 
+  # Each run's attempt and conclusion, from the list already in hand, for the
+  # reclaimed-Spot-host check (rerun_preempted_jobs). Empty, and the check
+  # skipped, on a controller with no Spot pool.
+  declare -A run_attempt_of=() run_concl_of=()
+  if [ "$SPOT_MATCH_MAP" != "{}" ]; then
+    local r_id r_att r_concl
+    while IFS=$'\t' read -r r_id r_att r_concl; do
+      case "$r_id" in "" | *[!0-9]*) continue ;; esac
+      run_attempt_of["$r_id"]="$r_att"
+      run_concl_of["$r_id"]="$r_concl"
+    done <<<"$(printf '%s' "$runs" | jq -r '.workflow_runs[]?
+      | [ (.id | tostring), ((.run_attempt // "-") | tostring), (.conclusion // "-") ] | @tsv' 2>/dev/null)"
+  fi
+
   local id
   for id in $ids; do
-    grep -q " $id\$" "$OUTCOME_STATE" && continue
+    if grep -q " $id\$" "$OUTCOME_STATE"; then
+      # Seen before. Only a run this controller re-ran after a reclaimed host
+      # is worth a second look, and only on a new failed attempt.
+      [ -n "${run_concl_of[$id]:-}" ] &&
+        preempt_recheck_seen "$id" "${run_attempt_of[$id]:-}" "${run_concl_of[$id]:-}" "$deadline"
+      continue
+    fi
 
     if ! budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME"; then
       OUTCOME_RUNS_SKIPPED=$((OUTCOME_RUNS_SKIPPED + 1))
@@ -2155,6 +2195,10 @@ collect_outcomes() {
     # re-examining it every tick for the rest of the day would spend the budget
     # that the runs we do care about need.
     printf '%s %s\n' "$sweep_start" "$id" >>"$OUTCOME_STATE"
+    # The same job list, asked one more question: did a Spot host take a job
+    # down with it? Nothing fetched for it; see rerun_preempted_jobs.
+    [ "${run_concl_of[$id]:-}" = failure ] &&
+      preempt_note_candidates "$id" "${run_attempt_of[$id]:-}" "$jobs"
     [ -n "$rows" ] || continue
 
     local o_pool wf outcome secs
@@ -3114,6 +3158,267 @@ rerun_cancelled_pinned() {
   # same run; GitHub's own queue limit is a day.
   find "$STATE_DIR" -maxdepth 1 -name 'pinrerun-*' -mmin +10080 -delete 2>/dev/null || true
   find "$STATE_DIR" -maxdepth 1 -name 'pinwarn-*' -mmin +1440 -delete 2>/dev/null || true
+  return 0
+}
+
+# --- jobs lost to a reclaimed Spot host ----------------------------------------
+#
+# preempt-decision.sh carries the rule and the reasoning; this is the I/O.
+#
+# COST. Nothing here lists anything. The candidates come out of the job lists
+# collect_outcomes ALREADY fetches for every newly completed run, and are looked
+# at only when the run concluded `failure` on a controller with a Spot pool. The
+# one extra read per candidate run is `GET runs/<id>` right before a POST, paid
+# only once a host is known to be gone. The one extra job-list read is for a run
+# THIS controller re-ran, once per new attempt, so it is bounded by the cap.
+#
+# THE LEDGER, `preempt-<run_id>`. Line 1 is "<state> <attempt> <epoch> <acted>":
+#   pending   candidates recorded for <attempt>, verdict not reached yet
+#   rerun     the controller re-ran <acted>; a later failed attempt is re-read
+#   done | declined | gaveup | refused   final for this attempt
+# Every later line is one candidate job, tab-separated:
+#   <pool> <runner_name> <started_epoch> <completed_epoch> <pinned 0|1>
+# The ledger is NOT the cap. GitHub's run_attempt is (preempt_rerun_decision);
+# the ledger only stops a second POST before GitHub moves the attempt.
+PREEMPT_RERUN_CAP=3
+# A finished job's host must still be RUNNING this long before it is called
+# alive. The reclaim notice is 30s; this leaves the MIG room to stop listing it.
+PREEMPT_SETTLE=180
+# A candidate whose host is neither gone nor provably alive by then is given up
+# on, loudly. Longer than the settle and than a MIG recreate.
+PREEMPT_MAX_WAIT=1800
+PREEMPT_RERUNS=0
+PREEMPT_DECLINED=0
+
+preempt_ledger_write() { # <run_id> <state> <attempt> <epoch> <acted> [body]
+  {
+    printf '%s %s %s %s\n' "$2" "${3:--}" "${4:-$(date +%s)}" "${5:--}"
+    if [ -n "${6:-}" ]; then printf '%s\n' "$6"; fi
+  } >"$STATE_DIR/preempt-$1" 2>/dev/null || true
+}
+
+# preempt_note_candidates <run_id> <run_attempt> <jobs_json>
+#
+# Called by collect_outcomes with a job list it already holds, for a run that
+# concluded `failure`. Records the jobs that look like a lost runner on a Spot
+# pool. Returns 1 when there are none.
+#
+# `run_attempt` on the job and not just on the run: the jobs endpoint returns
+# the LATEST execution of each job, and after a rerun-failed-jobs the passed
+# jobs are carried over with their old attempt number.
+#
+# `host-*` labels are stripped before the pool match (a pinned job carries the
+# host it was pinned to, which no pool's match set lists) and remembered,
+# because a pinned run must be re-run in full (adr-pr-host-affinity.md).
+preempt_note_candidates() {
+  local id="$1" att="$2" jobs="$3" f prev st patt acted rows
+  case "$att" in "" | *[!0-9]*) return 1 ;; esac
+  f="$STATE_DIR/preempt-$id"
+  acted=-
+  if [ -f "$f" ]; then
+    prev=$(head -n1 "$f" 2>/dev/null)
+    st="" patt="" acted=""
+    read -r st patt _ acted <<<"$prev"
+    # Already recorded for this attempt (or a later one): nothing new.
+    case "$patt" in "" | *[!0-9]*) ;; *) [ "$patt" -ge "$att" ] && return 0 ;; esac
+    acted="${acted:--}"
+  fi
+
+  rows=$(printf '%s' "$jobs" | jq -r --argjson pools "$SPOT_MATCH_MAP" --argjson att "$att" '
+    def ep: if . == null or . == "" then 0 else (try fromdateiso8601 catch 0) end;
+    [ .jobs[]?
+      | select(.status == "completed" and .conclusion == "failure")
+      | select((.run_attempt // $att) == $att)
+      | select(([.steps[]? | select(.conclusion == "failure")] | length) == 0)
+      | select((.runner_name // "") | test("^[A-Za-z0-9._-]+$"))
+    ] as $c
+    | $pools | to_entries[]
+    | .key as $pool
+    | .value as $mine
+    | $c[]
+    | ((.labels // []) | map(ascii_downcase)) as $jl
+    | select(($jl | length) > 0)
+    | select((($jl | map(select(startswith("host-") | not))) - $mine) | length == 0)
+    | [ $pool, .runner_name, (.started_at | ep), (.completed_at | ep),
+        (if any($jl[]; startswith("host-")) then 1 else 0 end) ] | @tsv' 2>/dev/null)
+
+  if [ -z "$rows" ]; then
+    # A run the controller re-ran whose new attempt failed for a reason with a
+    # failed step: a real failure, and the re-read is not repeated.
+    [ -f "$f" ] && preempt_ledger_write "$id" "done" "$att" "" "$acted"
+    return 1
+  fi
+  preempt_ledger_write "$id" pending "$att" "" "$acted" "$rows"
+  log "run $id attempt $att: $(printf '%s\n' "$rows" | grep -c .) failed job(s) with no failed step on a Spot pool; checking whether the host was reclaimed"
+  return 0
+}
+
+# preempt_recheck_seen <run_id> <run_attempt> <run_conclusion> <deadline>
+#
+# collect_outcomes reads a run id once. A run this controller re-ran comes back
+# under the same id on a new attempt, so for exactly those runs the job list is
+# read again — once per attempt, inside the outcome budget, and only when the
+# new attempt failed.
+preempt_recheck_seen() {
+  local id="$1" att="$2" concl="$3" deadline="$4" f st patt acted jobs
+  [ "$concl" = failure ] || return 0
+  f="$STATE_DIR/preempt-$id"
+  [ -f "$f" ] || return 0
+  st="" patt="" acted=""
+  read -r st patt _ acted <<<"$(head -n1 "$f" 2>/dev/null)"
+  [ "$st" = rerun ] || return 0
+  case "$att" in "" | *[!0-9]*) return 0 ;; esac
+  case "$acted" in "" | *[!0-9]*) return 0 ;; esac
+  [ "$att" -gt "$acted" ] || return 0
+  budget_allows_call "$(date +%s)" "$deadline" "$CURL_MAX_TIME" || return 0
+  jobs=$(gh_api "repos/$REPO_FULL/actions/runs/$id/jobs?per_page=100" 2>/dev/null) || return 0
+  preempt_note_candidates "$id" "$att" "$jobs" ||
+    log "run $id attempt $att (re-run by this controller after a reclaimed host): failed again, and not to a lost runner; left alone"
+  return 0
+}
+
+preempt_warning() { # <run_id> <class> <host> <msg>
+  throttled_event "$STATE_DIR/preemptwarn-$1" "$2" WARNING preempted-job-not-rerun \
+    "$3" "$4" run="$1" outcome="$2"
+}
+
+# rerun_preempted_jobs
+#
+# Per pool, after collect_hosts/collect_mig/collect_host_boots, so the verdict
+# is taken on this tick's MIG list and boot times. Only the selected pool's
+# candidate lines are judged; another pool's are kept for its own turn.
+#
+# `rerun-failed-jobs` and not `rerun`: the jobs that passed are kept and only
+# the lost ones run again. The exception is a host-pinned run, re-run in full
+# for the reason rerun_cancelled_pinned gives.
+rerun_preempted_jobs() {
+  [ "$POOL_SPOT" = true ] || return 0
+  local f id now st att stamp acted body keep line
+  local l_pool runner started completed pinned host status born verdict
+  local lost lost_host lost_why any_pinned on_spot_pool decision verb how
+  local run_json rstatus rattempt concl
+  now=$(date +%s)
+  for f in "$STATE_DIR"/preempt-*; do
+    [ -e "$f" ] || continue
+    id=${f##*/preempt-}
+    case "$id" in "" | *[!0-9]*) rm -f "$f"; continue ;; esac
+    st="" att="" stamp="" acted=""
+    read -r st att stamp acted <<<"$(head -n1 "$f" 2>/dev/null)"
+    [ "$st" = pending ] || continue
+    body=$(tail -n +2 "$f" 2>/dev/null)
+
+    keep="" lost=0 lost_host="" lost_why="" any_pinned=0 on_spot_pool=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      l_pool="" runner="" started="" completed="" pinned=""
+      IFS=$'\t' read -r l_pool runner started completed pinned <<<"$line"
+      if [ "$l_pool" != "$POOL" ]; then
+        keep="${keep:+$keep$'\n'}$line"
+        continue
+      fi
+      on_spot_pool=1
+      host="" status="" born=""
+      if [ -n "$MIG_BASE" ] && host=$(pool_slot_host "$MIG_BASE" "$runner") && [ -n "$host" ]; then
+        # Listed with no status yet is a host being created: present, not gone.
+        status=$(printf '%s\n' "$HOSTS" | awk -F, -v h="$host" '$1 == h { print ($2 == "" ? "CREATING" : $2); exit }')
+        # Guarded: an empty subscript on an associative array is a fatal error.
+        born="${HOST_BORN[$host]:-}"
+      fi
+      verdict=$(preempt_host_verdict "$MIG_BASE" "$runner" "$HOSTS_LISTED" "$status" \
+        "$born" "$started" "$completed" "$now" "$PREEMPT_SETTLE")
+      case "$verdict" in
+        lost:*)
+          lost=1
+          lost_host="$host"
+          lost_why="${verdict#lost:}"
+          [ "$pinned" = 1 ] && any_pinned=1
+          keep="${keep:+$keep$'\n'}$line"
+          ;;
+        wait:*)
+          keep="${keep:+$keep$'\n'}$line"
+          ;;
+        alive:*)
+          log "run $id attempt $att: job on $runner failed with its host still up (${verdict#alive:}); a real failure, not re-run"
+          ;;
+        *) ;; # foreign: not this pool's host, nothing to say
+      esac
+    done <<<"$body"
+    [ "$on_spot_pool" = 1 ] || continue
+
+    if [ "$lost" = 1 ]; then
+      # Decided against the run as GitHub reports it NOW, never the ledger.
+      run_json=$(gh_api "repos/$REPO_FULL/actions/runs/$id" 2>/dev/null)
+      rstatus="" rattempt="" concl=""
+      IFS=$'\t' read -r rstatus rattempt concl <<<"$(printf '%s' "$run_json" | jq -r '
+        [ (.status // "-"), ((.run_attempt // "-") | tostring), (.conclusion // "-") ] | @tsv' 2>/dev/null)"
+      [ "$rstatus" = - ] && rstatus=""
+      [ "$rattempt" = - ] && rattempt=""
+      [ "$concl" = - ] && concl=""
+      decision=$(preempt_rerun_decision "$rstatus" "$concl" "$rattempt" "$att" "$acted" \
+        "$PREEMPT_RERUN_CAP" "$any_pinned")
+      case "$decision" in
+        rerun-failed:* | rerun-full:*)
+          verb=rerun-failed-jobs how="its failed jobs"
+          [ "${decision%%:*}" = rerun-full ] && verb=rerun how="in full (host-pinned)"
+          gh_actions_post "$id" "$verb"
+          case "$ACT_CLASS" in
+            ok)
+              # Recorded BEFORE anything else can fail: this stops a second POST.
+              preempt_ledger_write "$id" rerun "$att" "" "$att"
+              PREEMPT_RERUNS=$((PREEMPT_RERUNS + 1))
+              event INFO preempted-job-rerun "$lost_host" \
+                "run $id attempt $att: $lost_why; re-ran $how (HTTP $ACT_CODE)" \
+                run="$id" attempt="$att" verb="$verb"
+              ;;
+            refused)
+              preempt_ledger_write "$id" refused "$att" "$stamp" "$acted"
+              PREEMPT_DECLINED=$((PREEMPT_DECLINED + 1))
+              preempt_warning "$id" "rerun-refused-$ACT_CODE" "$lost_host" \
+                "run $id attempt $att: $lost_why, but the re-run was REFUSED (HTTP $ACT_CODE; the App needs Actions: write). Re-run it by hand"
+              ;;
+            *)
+              # Rate limit or outage: still pending, asked again next tick
+              # until PREEMPT_MAX_WAIT runs out.
+              log "run $id attempt $att: $verb not accepted (HTTP $ACT_CODE, $ACT_CLASS); asking again next tick"
+              preempt_ledger_write "$id" pending "$att" "$stamp" "$acted" "$keep"
+              ;;
+          esac
+          ;;
+        declined:*)
+          preempt_ledger_write "$id" declined "$att" "$stamp" "$acted"
+          PREEMPT_DECLINED=$((PREEMPT_DECLINED + 1))
+          preempt_warning "$id" declined "$lost_host" \
+            "run $id attempt $att: $lost_why, and it is NOT re-run: ${decision#declined:}"
+          ;;
+        done:*)
+          preempt_ledger_write "$id" "done" "$att" "$stamp" "$acted"
+          log "run $id attempt $att: lost a job to a reclaimed host, nothing to do (${decision#done:})"
+          ;;
+        *)
+          log "run $id attempt $att: ${decision#wait:}; asking again next tick"
+          ;;
+      esac
+      continue
+    fi
+
+    if [ -z "$keep" ]; then
+      preempt_ledger_write "$id" "done" "$att" "$stamp" "$acted"
+      continue
+    fi
+    case "$stamp" in "" | *[!0-9]*) stamp=$now ;; esac
+    if [ $((now - stamp)) -gt "$PREEMPT_MAX_WAIT" ]; then
+      preempt_ledger_write "$id" gaveup "$att" "$stamp" "$acted"
+      PREEMPT_DECLINED=$((PREEMPT_DECLINED + 1))
+      preempt_warning "$id" gaveup "" \
+        "run $id attempt $att: a failed job with no failed step ran on a Spot host whose fate could not be read in ${PREEMPT_MAX_WAIT}s; not re-run. If the host was reclaimed, re-run its failed jobs by hand"
+      continue
+    fi
+    preempt_ledger_write "$id" pending "$att" "$stamp" "$acted" "$keep"
+  done
+
+  # A week, like the pinned ledger: longer than any plausible retry of a run.
+  find "$STATE_DIR" -maxdepth 1 -name 'preempt-*' -mmin +10080 -delete 2>/dev/null || true
+  find "$STATE_DIR" -maxdepth 1 -name 'preemptwarn-*' -mmin +1440 -delete 2>/dev/null || true
   return 0
 }
 
@@ -5247,6 +5552,8 @@ tick_pool() {
   WORKER_GATE_UNDETERMINED=0
   WORKER_GATE_OS_FALLBACK=0
   PIN_HELD=0
+  PREEMPT_RERUNS=0
+  PREEMPT_DECLINED=0
   # Reads refused by constraints/compute.disableGuestAttributesAccess this tick,
   # across BOTH gates. Zero on a healthy pool and equal to the number of hosts
   # the controller tried to remove on a pool where the mechanism is off, so the
@@ -5286,6 +5593,9 @@ tick_pool() {
   adopt_flagged_cordons
   classify_pinned
   rerun_cancelled_pinned
+  # AFTER collect_hosts and collect_host_boots: "is the host gone" is read off
+  # this tick's MIG list and boot times. A no-op on a non-Spot pool.
+  rerun_preempted_jobs
 
   local pool_size=0 slots_busy=0 idle_max=0 draining=0 stale_hosts=0
   # Slots that answered, summed only over hosts the runner list could speak
@@ -5802,6 +6112,11 @@ tick_pool() {
   queue_series "ci_demand_pinned" "${DEMAND_PINNED:-0}"
   queue_series "ci_pinned_runs_cancelled" "${PIN_ORPHANED:-0}"
   queue_series "ci_pinned_jobs_host_vanished" "${PIN_VANISHED:-0}"
+  # Runs re-run this tick because a Spot host was reclaimed under a job, and
+  # lost jobs that were NOT re-run (cap reached, refused, or unreadable). Zero
+  # on every tick of every pool, so absence means a dead controller.
+  queue_series "ci_preempted_reruns" "${PREEMPT_RERUNS:-0}" '"outcome":"rerun"'
+  queue_series "ci_preempted_reruns" "${PREEMPT_DECLINED:-0}" '"outcome":"declined"'
   queue_series "ci_demand_queued" "$DEMAND_QUEUED"
   # Queued jobs this pool has STOPPED answering for: older than DEMAND_MAX_AGE,
   # so they are not in ci_demand and not in ci_demand_wait_seconds either. This

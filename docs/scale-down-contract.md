@@ -280,6 +280,46 @@ things follow from that default and from where the code lives:
 * Linux only. Windows hosts have no slot sweep to carry the flag and livelock
   identically; tracked separately.
 
+## Jobs lost to a reclaimed Spot host
+
+A Spot pool (`spot = true`) can lose a host at any moment, and with it the job
+that was running there. Nothing in this contract can prevent that, so the
+controller re-runs the job instead of leaving a red pull request for a person
+to notice (`preempt-decision.sh`, `rerun_preempted_jobs`). It re-runs only when
+all of these hold:
+
+* the job concluded `failure` with **no step that concluded `failure`**. A
+  failed test has a failed step. A job whose host vanished has zero steps, or
+  its running step `cancelled` by the shutdown signal;
+* its `runner_name` is a slot of a host this Spot pool's MIG could have created;
+* that host is **gone**: not in the MIG's instance list, or listed but
+  cold-started after the job began. A MIG recreates a deleted instance under the
+  same name. A host still `RUNNING` on the same boot `PREEMPT_SETTLE` (180s)
+  after the job ended is a real failure, and is left alone;
+* GitHub, read again just before the POST, reports the run `completed`/`failure`
+  on the same attempt, and `run_attempt` is below `PREEMPT_RERUN_CAP` (3).
+
+It posts `rerun-failed-jobs`, so the passed jobs are kept. A host-pinned run
+gets a full `rerun`, as in the pinned-run rule. The candidates come from the
+job lists the outcome sweep already fetches. The only new calls are one run
+read before each POST, and one job-list read per attempt the controller itself
+re-ran. The state directory records each run (`preempt-<run_id>`). GitHub's
+attempt number is the cap, so a restart cannot double-fire.
+
+An operator sees an INFO `preempted-job-rerun` event for each re-run, and a
+WARNING `preempted-job-not-rerun` when a lost job is not re-run: cap reached,
+re-run refused, or the host's fate unreadable within `PREEMPT_MAX_WAIT`. The
+`ci_preempted_reruns` metric counts both (`outcome` = `rerun` / `declined`).
+
+Limits:
+
+* A controller replaced or freshly booted seeds its outcome sweep and does not
+  look back, so a run that failed before it booted is not re-run.
+* The outcome sweep reads only the 50 newest completed runs, every 300s.
+* A genuine failure with no failed step, whose host the pool scales in before
+  the run completes, would read as lost. The cap bounds it to two extra
+  attempts.
+
 ## Changing this contract
 
 * A new call that deletes, resizes, abandons or rolls a host is a change to the

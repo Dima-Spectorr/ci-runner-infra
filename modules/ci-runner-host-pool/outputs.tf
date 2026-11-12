@@ -85,6 +85,13 @@ output "pool_descriptor" {
     # pool that arrives labelled `ci` is sized from pull-request demand, which
     # is precisely the rationing the split removes.
     role = var.role
+
+    # Carried for the same reason as `role`: the parser's default (false) is
+    # right for a pool that says nothing and wrong for the pool that is Spot.
+    # It arms the controller re-running a job whose host was reclaimed
+    # (preempt-decision.sh); a Spot pool that arrived as `false` would lose
+    # those jobs silently again.
+    spot = var.spot
   }
 }
 
@@ -335,6 +342,11 @@ output "metric_names" {
       # deferred, not lost. Sustained non-zero means OUTCOME_BUDGET is too small
       # for this repository's throughput and the other two are lagging.
       "ci_outcome_runs_skipped",
+      # Runs the controller re-ran because a Spot host was reclaimed under a
+      # job (outcome=rerun), and lost jobs it did NOT re-run (outcome=declined:
+      # cap reached, re-run refused, or the host's fate unreadable). Per-tick
+      # deltas; sum over a window. preempt-decision.sh.
+      "ci_preempted_reruns",
       # --- the merge queue, as opposed to the pool ----------------------------
       # Open pull requests that are GREEN and can never enter the merge queue,
       # grouped by the entry condition they fail (`draft`, `base`,

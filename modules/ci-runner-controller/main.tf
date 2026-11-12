@@ -50,6 +50,7 @@ locals {
     file("${local.pool_scripts}/host-ownership.sh"),
     file("${local.pool_scripts}/orphan-decision.sh"),
     file("${local.pool_scripts}/pinned-job-decision.sh"),
+    file("${local.pool_scripts}/preempt-decision.sh"),
     file("${local.pool_scripts}/recycle-decision.sh"),
     file("${local.pool_scripts}/beacon-decision.sh"),
     # The pin-hold veto, on every controller for the same reason the pool module

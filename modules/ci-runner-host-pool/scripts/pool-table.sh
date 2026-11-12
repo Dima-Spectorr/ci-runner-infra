@@ -65,6 +65,9 @@
 #   18 jobs_per_host            jobs one host absorbs (slots minus autoscaler
 #                               headroom); the controller converts hosts in a
 #                               make-before-break recycle into demand with it
+#   19 spot                     true | false — whether the hosts are Spot VMs,
+#                               so a failed job whose host vanished is re-run
+#                               (preempt-decision.sh)
 #
 # Echoes rows and returns 0 when at least one row is valid; returns 1 when the
 # document cannot be parsed at all or yields no valid row.
@@ -129,17 +132,22 @@ pool_table_parse() {
       (if (.recycle_cordon_stops_agents == true or .recycle_cordon_stops_agents == "true")
        then "true" else "false" end),
       # Defaults to slots, the value the module renders when headroom is 0.
-      (.jobs_per_host // .slots // 1)
+      (.jobs_per_host // .slots // 1),
+      # Compared like the two booleans above. A pool that says nothing is NOT
+      # Spot: this column arms the controller re-running failed jobs, and the
+      # string "false" being true in jq would re-run genuine failures on an
+      # on-demand pool whose hosts happened to be recycled.
+      (if (.spot == true or .spot == "true") then "true" else "false" end)
     ] | @tsv | gsub("\u001f"; " ")' 2>/dev/null | tr '\t' '\037') || {
     echo "reject::the pool table is not valid JSON" >&2
     return 1
   }
 
   local name mig region slots minh maxh grace reg_grace ticks recycle
-  local host_os mint role beacon pin labels cordon_stop jph
+  local host_os mint role beacon pin labels cordon_stop jph spot
   local kept=0 why
   while IFS=$'\037' read -r name mig region slots minh maxh grace reg_grace \
-    ticks recycle host_os mint role beacon pin labels cordon_stop jph; do
+    ticks recycle host_os mint role beacon pin labels cordon_stop jph spot; do
     [ -n "${name:-}" ] || continue
 
     # First reason wins, and every test is guarded on the ones before it, so a
@@ -217,10 +225,10 @@ pool_table_parse() {
       continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$mig" "$region" "$slots" "$minh" "$maxh" "$grace" "$reg_grace" \
       "$ticks" "$recycle" "$host_os" "$mint" "$role" "$beacon" "$pin" "$labels" \
-      "$cordon_stop" "$jph"
+      "$cordon_stop" "$jph" "$spot"
     kept=$((kept + 1))
   done <<POOL_TABLE_EOF
 $rows
