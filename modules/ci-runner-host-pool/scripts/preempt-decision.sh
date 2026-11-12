@@ -1,6 +1,7 @@
+#!/usr/bin/env bash
 # ci-runner-host-pool — re-running a job whose Spot host was reclaimed.
 #
-# No shebang on purpose: like every *-decision.sh it is CONCATENATED into the
+# Like every *-decision.sh it is CONCATENATED into the
 # controller's startup script (after host-ownership.sh, whose pool_slot_host it
 # calls) and sourced by scripts/ci/preempt-decision.selftest.sh.
 #

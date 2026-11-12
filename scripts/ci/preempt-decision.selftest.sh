@@ -114,6 +114,7 @@ for fn in preempt_host_verdict preempt_rerun_decision; do
     printf 'FAIL the controller never calls %s\n' "$fn"; FAIL=$((FAIL + 1))
   fi
 done
+# shellcheck disable=SC2016  # the literal call text, $-signs included, is what is grepped for.
 if grep -q 'gh_actions_post "$id" "$verb"' "$STARTUP" && grep -q 'verb=rerun-failed-jobs' "$STARTUP"; then
   printf 'ok   the controller posts rerun-failed-jobs\n'; PASS=$((PASS + 1))
 else

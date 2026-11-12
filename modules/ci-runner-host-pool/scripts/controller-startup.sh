@@ -3211,14 +3211,14 @@ preempt_ledger_write() { # <run_id> <state> <attempt> <epoch> <acted> [body]
 # host it was pinned to, which no pool's match set lists) and remembered,
 # because a pinned run must be re-run in full (adr-pr-host-affinity.md).
 preempt_note_candidates() {
-  local id="$1" att="$2" jobs="$3" f prev st patt pstamp acted rows
+  local id="$1" att="$2" jobs="$3" f prev st patt acted rows
   case "$att" in "" | *[!0-9]*) return 1 ;; esac
   f="$STATE_DIR/preempt-$id"
   acted=-
   if [ -f "$f" ]; then
     prev=$(head -n1 "$f" 2>/dev/null)
-    st="" patt="" pstamp="" acted=""
-    read -r st patt pstamp acted <<<"$prev"
+    st="" patt="" acted=""
+    read -r st patt _ acted <<<"$prev"
     # Already recorded for this attempt (or a later one): nothing new.
     case "$patt" in "" | *[!0-9]*) ;; *) [ "$patt" -ge "$att" ] && return 0 ;; esac
     acted="${acted:--}"
@@ -3245,7 +3245,7 @@ preempt_note_candidates() {
   if [ -z "$rows" ]; then
     # A run the controller re-ran whose new attempt failed for a reason with a
     # failed step: a real failure, and the re-read is not repeated.
-    [ -f "$f" ] && preempt_ledger_write "$id" done "$att" "" "$acted"
+    [ -f "$f" ] && preempt_ledger_write "$id" "done" "$att" "" "$acted"
     return 1
   fi
   preempt_ledger_write "$id" pending "$att" "" "$acted" "$rows"
@@ -3260,12 +3260,12 @@ preempt_note_candidates() {
 # read again — once per attempt, inside the outcome budget, and only when the
 # new attempt failed.
 preempt_recheck_seen() {
-  local id="$1" att="$2" concl="$3" deadline="$4" f st patt pstamp acted jobs
+  local id="$1" att="$2" concl="$3" deadline="$4" f st patt acted jobs
   [ "$concl" = failure ] || return 0
   f="$STATE_DIR/preempt-$id"
   [ -f "$f" ] || return 0
-  st="" patt="" pstamp="" acted=""
-  read -r st patt pstamp acted <<<"$(head -n1 "$f" 2>/dev/null)"
+  st="" patt="" acted=""
+  read -r st patt _ acted <<<"$(head -n1 "$f" 2>/dev/null)"
   [ "$st" = rerun ] || return 0
   case "$att" in "" | *[!0-9]*) return 0 ;; esac
   case "$acted" in "" | *[!0-9]*) return 0 ;; esac
@@ -3391,7 +3391,7 @@ rerun_preempted_jobs() {
             "run $id attempt $att: $lost_why, and it is NOT re-run: ${decision#declined:}"
           ;;
         done:*)
-          preempt_ledger_write "$id" done "$att" "$stamp" "$acted"
+          preempt_ledger_write "$id" "done" "$att" "$stamp" "$acted"
           log "run $id attempt $att: lost a job to a reclaimed host, nothing to do (${decision#done:})"
           ;;
         *)
@@ -3402,7 +3402,7 @@ rerun_preempted_jobs() {
     fi
 
     if [ -z "$keep" ]; then
-      preempt_ledger_write "$id" done "$att" "$stamp" "$acted"
+      preempt_ledger_write "$id" "done" "$att" "$stamp" "$acted"
       continue
     fi
     case "$stamp" in "" | *[!0-9]*) stamp=$now ;; esac

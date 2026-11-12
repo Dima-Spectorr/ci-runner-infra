@@ -57,7 +57,7 @@ select_out=$(
 
   declare -A P_MIG P_REGION P_SLOTS P_MIN P_MAX P_GRACE P_REGGRACE P_TICKS
   declare -A P_RECYCLE P_HOST_OS P_MINT P_ROLE P_BEACON P_PIN P_LABELS
-  declare -A P_CORDON_STOP P_JPH
+  declare -A P_CORDON_STOP P_JPH P_SPOT
   # D_EXPIRED is declared even though pool_select reads it as `${...:-0}`: an
   # associative subscript on a variable bash has never seen is parsed as
   # ARITHMETIC, so `${D_EXPIRED[$POOL]:-0}` with POOL=a dies under `set -u` as
@@ -313,7 +313,7 @@ legacy=$(
   printf '%s' "$POOLS_JSON" | pool_table_parse 2>/dev/null | tr '\t' '|'
 )
 check "legacy: one row, and every absent key took its default" \
-  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false|3" \
+  "telnet|ci-runner-host-telnet|region-1|3|0|6|900|600|3|1|linux|false|ci|30|900|self-hosted,linux,gcp|false|3|false" \
   "$legacy"
 
 # --- 5. `background` is in the LINUX pool's match set only (#1533) ------------
