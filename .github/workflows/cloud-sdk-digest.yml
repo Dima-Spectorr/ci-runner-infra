@@ -1,0 +1,115 @@
+name: Cloud SDK digest
+
+# IS THE PINNED `cloud-sdk:slim` DIGEST STILL CURRENT? (#1614)
+#
+# `ci-runner-apply-trigger` and `ci-runner-cache-warmer` pin Google's
+# `gcr.io/google.com/cloudsdktool/cloud-sdk` image by `@sha256:` digest so a
+# moving tag cannot alter the destroy guard or the cache publisher without a
+# reviewed merge (#1588). This daily check compares those pins with the current
+# upstream `slim` manifest (verified by hashing the manifest bytes, zero GCP
+# credentials needed) and keeps ONE bump pull request open on
+# `automation/cloud-sdk-digest`.
+#
+# Because schedules run from the default branch only, `cloud-sdk-digest.selftest.sh`
+# in `ci.yml` proves the rules and PR contents on every pull request.
+
+on:
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Report only; open or move no pull request'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-sdk-digest
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check cloud-sdk digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      vars.MERGE_LANE_ENABLED == 'true' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Mint the App token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Run the check
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CSD_REPO: ${{ github.repository }}
+          CSD_BASE: ${{ github.event.repository.default_branch }}
+          CSD_DRY_RUN: ${{ inputs.dry-run && '1' || '0' }}
+          CSD_REPORT: report.txt
+        run: |
+          set -uo pipefail
+          bash scripts/ci/cloud-sdk-digest-watch.sh 2>&1 | tee log.txt
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Keep the standing issue
+        if: always() && steps.check.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          title="Cloud SDK digest check: pinned image is stale or out of sync"
+          num=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          {
+            echo "### $(date -u +%Y-%m-%d\ %H:%M) UTC"
+            echo
+            echo '```'
+            tr -d '`@' < report.txt
+            echo '```'
+            echo
+            echo "[run]($RUN_URL)"
+          } > comment.md
+          if [ "$STATUS" != 0 ]; then
+            if [ -n "$num" ]; then
+              gh issue comment "$num" --repo "$REPO" --body-file comment.md
+            else
+              gh issue create --repo "$REPO" --title "$title" --body-file comment.md
+            fi
+          elif [ -n "$num" ]; then
+            gh issue close "$num" --repo "$REPO" --reason completed --comment "$(cat comment.md)"
+          fi
+
+      - name: "Fail on any fail: finding"
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+        run: |
+          [ "$STATUS" = "0" ] || {
+            echo "cloud-sdk-digest reported failures; see the report above" >&2
+            exit 1
+          }
