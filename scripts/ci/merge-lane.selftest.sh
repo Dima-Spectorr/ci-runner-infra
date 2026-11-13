@@ -3764,7 +3764,7 @@ behavioural_refusal_cases() {
   local unacted
   unacted="$(lane_log_unacted "$(printf '%s\t%s\t%s\t%s\t%s\n' \
     a 11 s1 'merge:ready green=4' '' b 12 s2 'merge:ready green=4' '' c 13 s3 'update:behind' '')" ' 11' 'the reason')"
-  if [ "$unacted" = "lane: #12 NOT acted on this pass (merge:ready green=4) — the reason" ]; then
+  if [ "$unacted" = "lane: not acted on this pass: #12 (merge:ready green=4) — the reason" ]; then
     printf 'PASS %s\n' "an unreached merge is named with the reason; a handled one and a non-merge are not"
   else
     printf 'FAIL lane_log_unacted printed %q\n' "$unacted"

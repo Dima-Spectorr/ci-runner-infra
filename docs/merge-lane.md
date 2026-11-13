@@ -1577,7 +1577,7 @@ contributor can act on are also commented on the pull request once per head sha
 (`<!-- merge-lane:refused:<sha> -->`).
 
 **Every `merge` the pass ranked and did not act on gets a line saying why**
-(`lane: #N NOT acted on this pass (<verdict>) — <reason>`): the batch was used
+(`lane: not acted on this pass: #N (<verdict>) — <reason>`; it does not start with `lane: #N`, which is a verdict line): the batch was used
 up, the pass deadline came, the base-health check stopped the batch, a refusal
 ended the pass, or the base moved or could not be re-read. Without it a run
 that logs a page of `merge:ready` and then `done, 0 action(s)` has nowhere left

@@ -3115,7 +3115,7 @@ lane_log_unacted() {
     [ -n "$num" ] || continue
     [ "${row_verdict%%:*}" = "merge" ] || continue
     case "$handled" in *" $num "*) continue ;; esac
-    echo "lane: #$num NOT acted on this pass ($row_verdict) — $reason"
+    echo "lane: not acted on this pass: #$num ($row_verdict) — $reason"
   done <<<"$ranked"
   return 0
 }
