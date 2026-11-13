@@ -28,3 +28,9 @@
 *.yml  text eol=lf
 *.yaml text eol=lf
 *.md   text eol=lf
+*.txt  text eol=lf
+*.tsv  text eol=lf
+*.py   text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+VERSION text eol=lf
