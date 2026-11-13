@@ -1422,7 +1422,7 @@ mutate "the slot share sized from the whole machine" "$MAIN" \
   publishes_the_slot_share
 
 mutate "var.gcloud_image put back on the floating :slim tag" "$VARS" \
-  's@cloud-sdk@sha256:[0-9a-f]*"@cloud-sdk:slim"@' \
+  's|cloud-sdk@sha256:[0-9a-f]*"|cloud-sdk:slim"|' \
   pins_the_gcloud_image_default
 
 mutate "var.gcloud_image digest validation dropped" "$VARS" \
