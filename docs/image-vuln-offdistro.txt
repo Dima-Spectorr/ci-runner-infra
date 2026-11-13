@@ -45,12 +45,14 @@
 # What each group is, so a reader can judge a new line rather than pattern-match
 # it in:
 #
-#   linux-kernel (105)  grype read the version out of the kernel binary and
-#                       compared it against upstream. "Fixed in 6.19.9" against
-#                       an Ubuntu ABI revision is not a statement about whether
-#                       Ubuntu backported it — the `deb` entries for the SAME
-#                       kernel produce thousands of matches and zero blocking,
-#                       because there Ubuntu's own data is consulted.
+#   linux-kernel (105)  historical seed. Since #678 `image-vuln-verdict.sh`
+#                       treats a `linux-kernel` binary whose ABI matches an
+#                       installed distro kernel package in the same scan (and
+#                       any non-distro match whose CVE is already matched on a
+#                       distro package in the same scan) as `distro-covered`
+#                       rather than `offdistro`. The historical lines stay in
+#                       place so the baseline remains seeded and a standalone
+#                       kernel binary with no distro package still enforces.
 #   golang.org/x/crypto (8)  vendored inside dockerd, containerd and snapd. This
 #                       image cannot upgrade the module independently of the
 #                       distro packages that ship the binaries.

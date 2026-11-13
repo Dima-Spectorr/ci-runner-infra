@@ -98,16 +98,19 @@ usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" >&2; exit 2; }
 #
 #   #FINDING<TAB>id<TAB>severity<TAB>package<TAB>version<TAB>fix<TAB>state
 #   #EXPIRED<TAB>id<TAB>expiry<TAB>reason
-#   #OFFDISTRO<TAB>id<TAB>package    — one per DISTINCT pair, for the baseline
-#   #COUNT<TAB>total<TAB>blocking<TAB>ignored<TAB>expired<TAB>offdistro
+#   #OFFDISTRO<TAB>id<TAB>package<TAB>type — one per DISTINCT pair, for the baseline
+#   #COUNT<TAB>total<TAB>blocking<TAB>ignored<TAB>expired<TAB>offdistro<TAB>distro_covered
 #
-# `state` is blocking | ignored | offdistro | reported. No field may be empty: `read` with
+# `state` is blocking | ignored | offdistro | distro-covered | reported. No field may be empty: `read` with
 # `IFS=$'\t'` still treats a tab as IFS WHITESPACE and collapses a run of them,
 # so one empty column silently shifts every column after it — which is how a
 # package with no fix version arrives as its own severity.
 verdict() {
   python3 - "$1" "$2" "$3" "$4" <<'PY'
-import json, sys
+import json, re, sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(newline="\n")
 
 report_path, fail_on, ignores_path, today = sys.argv[1:5]
 
@@ -190,10 +193,50 @@ if ignores_path:
 def out(*fields):
     print("\t".join(str(f) if str(f) != "" else "-" for f in fields))
 
-total = blocking = ignored = expired = offdistro = 0
+# Pass 1 (#678): collect what the distro security feed in THIS report already
+# judges, so a second cataloger reading the same OS artifact off disk does not
+# re-enter the off-distro baseline as an unjudged binary finding:
+#   1. Any vulnerability id (or related CVE alias) matched on a deb/rpm/apk in
+#      the same scan has already been judged by the distro feed — if fixable at
+#      or above the floor, that distro match blocks on its own as VULN1.
+#   2. Any installed distro kernel package (`linux-*` / `kernel*` deb/rpm/apk)
+#      already subjects that kernel ABI (`X.Y.Z-N`) to the distro feed, even for
+#      CVEs the distro marked "Not affected" or fixed in an earlier ABI (which
+#      therefore produce no deb match while syft's `linux-kernel` binary
+#      cataloger still compares the ABI string against upstream mainline).
+KERNEL_ABI_IN_TEXT = re.compile(r"(\d+\.\d+\.\d+-\d+)")
+KERNEL_VER_ABI = re.compile(r"^(?:\d+:)?(\d+\.\d+\.\d+-\d+)")
+distro_vuln_ids = set()
+distro_kernel_abis = set()
+
+for m in matches:
+    art = m.get("artifact") or {}
+    atype = (art.get("type") or "").lower()
+    if atype not in DISTRO_TYPES:
+        continue
+    vuln = m.get("vulnerability") or {}
+    vid = vuln.get("id")
+    if vid:
+        distro_vuln_ids.add(vid)
+    for rv in m.get("relatedVulnerabilities") or []:
+        rvid = (rv or {}).get("id")
+        if rvid:
+            distro_vuln_ids.add(rvid)
+    aname = (art.get("name") or "").lower()
+    aver = art.get("version") or ""
+    if aname.startswith(("linux-", "kernel")) or "kernel" in aname:
+        vm = KERNEL_VER_ABI.match(aver)
+        if vm:
+            distro_kernel_abis.add(vm.group(1))
+        nm = KERNEL_ABI_IN_TEXT.search(aname)
+        if nm:
+            distro_kernel_abis.add(nm.group(1))
+
+total = blocking = ignored = expired = offdistro = distro_covered = 0
 seen_expired = set()
 # Insertion-ordered so the seed block a human pastes is stable between builds and
 # a diff of it reads as the change it is. A set would reorder on every run.
+# Maps (id, package) -> list of distinct cataloger types seen for that pair.
 offdistro_pairs = {}
 
 for m in matches:
@@ -220,15 +263,30 @@ for m in matches:
     state = "reported"
 
     if at_or_above and fixable and not provenance_blocks:
-        # Counted separately, so "the gate found nothing" and "the gate cannot
-        # speak to what it found" never render as the same line.
-        state = "offdistro"
-        offdistro += 1
-        # By (id, package), not by count and not by location: grype reports the
-        # same vendored module once per binary that carries it, so a count moves
-        # when a distro repackages something and says nothing about this image's
-        # exposure. The pair is the statement the baseline records.
-        offdistro_pairs.setdefault((vid, art.get("name") or "-"), None)
+        all_vids = {vid}
+        for rv in m.get("relatedVulnerabilities") or []:
+            rvid = (rv or {}).get("id")
+            if rvid:
+                all_vids.add(rvid)
+        kern_m = KERNEL_VER_ABI.match(art.get("version") or "") if atype == "linux-kernel" else None
+        covered_by_distro = bool(all_vids & distro_vuln_ids) or (
+            kern_m is not None and kern_m.group(1) in distro_kernel_abis
+        )
+        if covered_by_distro:
+            state = "distro-covered"
+            distro_covered += 1
+        else:
+            # Counted separately, so "the gate found nothing" and "the gate cannot
+            # speak to what it found" never render as the same line.
+            state = "offdistro"
+            offdistro += 1
+            # By (id, package), not by count and not by location: grype reports the
+            # same vendored module once per binary that carries it, so a count moves
+            # when a distro repackages something and says nothing about this image's
+            # exposure. The pair is the statement the baseline records.
+            pair_types = offdistro_pairs.setdefault((vid, art.get("name") or "-"), [])
+            if atype not in pair_types:
+                pair_types.append(atype)
 
     if at_or_above and fixable and provenance_blocks:
         if vid in ignores:
@@ -251,10 +309,10 @@ for m in matches:
 
     out("#FINDING", vid, sev, art.get("name") or "-", art.get("version") or "-", fixed_in, state)
 
-for vid, pkg in offdistro_pairs:
-    out("#OFFDISTRO", vid, pkg)
+for (vid, pkg), pair_types in offdistro_pairs.items():
+    out("#OFFDISTRO", vid, pkg, ",".join(pair_types) or "non-distro")
 
-out("#COUNT", total, blocking, ignored, expired, offdistro)
+out("#COUNT", total, blocking, ignored, expired, offdistro, distro_covered)
 PY
 }
 
@@ -304,10 +362,11 @@ run() {
     echo "::error::[VULN0] the scan report could not be read — treating as a failed scan, not as a clean image" >&2
     return 2
   fi
+  records="${records//$'\r'/}"
 
-  local total blocking ignored expired offdistro
+  local total blocking ignored expired offdistro distro_covered
   # shellcheck disable=SC2034
-  read -r _ total blocking ignored expired offdistro <<< "$(printf '%s\n' "$records" | grep '^#COUNT' | tr '\t' ' ')"
+  read -r _ total blocking ignored expired offdistro distro_covered <<< "$(printf '%s\n' "$records" | grep '^#COUNT' | tr '\t' ' ')"
 
   if [ "${total:-0}" -eq 0 ]; then
     echo "::error::[VULN0] the scan matched nothing at all. A whole-filesystem scan of this image matching zero vulnerabilities is an empty SBOM or a scanner that did not run, not a clean image" >&2
@@ -323,7 +382,12 @@ run() {
   # Computed BEFORE the summary line, because a new pair adds to `blocking` and a
   # summary that disagreed with the errors printed under it would read as those
   # errors being spurious.
-  local seen known new_pairs stale_pairs baseline_state
+  local seen known new_pairs stale_pairs baseline_state o_id o_pkg o_types
+  local -A pair_types=()
+  while IFS=$'\t' read -r _ o_id o_pkg o_types; do
+    [ -n "${o_id:-}" ] || continue
+    pair_types["$o_id $o_pkg"]="${o_types:-non-distro}"
+  done < <(printf '%s\n' "$records" | grep '^#OFFDISTRO' || true)
   seen="$(printf '%s\n' "$records" | grep '^#OFFDISTRO' | cut -f2,3 | tr '\t' ' ' | sort -u)"
 
   known=""
@@ -349,6 +413,9 @@ run() {
     local lineno=0 entries=0 line f1 f2 f3 exp
     while IFS= read -r line || [ -n "$line" ]; do
       lineno=$((lineno + 1))
+      # Strip trailing CR so a Windows CRLF checkout cannot break blank/comment
+      # detection or attach \r to package/expiry tokens (#1495).
+      line="${line%$'\r'}"
       case "$line" in ''|'#'*) continue ;; esac
       f3=""
       read -r f1 f2 f3 _ <<< "$line"
@@ -391,7 +458,9 @@ run() {
   n_stale=$(printf '%s\n' "$stale_pairs" | grep -c . || true)
   [ "$baseline_state" = "seeded" ] && blocking=$((blocking + n_new))
 
-  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s), $offdistro fixable off-distro ($n_new not in the baseline)"
+  local dc_note=""
+  [ "${distro_covered:-0}" -gt 0 ] && dc_note=", $distro_covered distro-covered duplicate(s)"
+  echo "image scan: $total finding(s), floor=$FAIL_ON, $blocking blocking, $ignored ignored, $expired expired ignore(s), $offdistro fixable off-distro ($n_new not in the baseline)$dc_note"
 
   if [ "$baseline_state" != "seeded" ]; then
     # The state somebody could leave forever, so it is said plainly and the seed
@@ -403,6 +472,7 @@ run() {
     printf '%s\n' "$seen" | grep -v '^$' | sed 's/^/    /' || true
   else
     echo "off-distro tracking: ENFORCE — ${n_new} new pair(s), ${n_stale} baseline entry(ies) no longer seen, ${#expired_line[@]} expired exception(s)"
+    local ptype
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       # An expired exception is named as such, with its line, rather than as a
@@ -412,7 +482,8 @@ run() {
         echo "::error::[VULN3] off-distro exception expired: $BASELINE ${expired_line[$line]} — the image still carries $line. Upgrade whatever brings it in, or re-affirm the line with a new expires= date and a written conclusion in a pull request."
         continue
       fi
-      echo "::error::[VULN3] off-distro finding not in the baseline: $line — a module vendored into an image binary that this image has not carried before. Review it, then add it to $BASELINE in a pull request, or remove whatever brought it in."
+      ptype="${pair_types[$line]:-non-distro}"
+      echo "::error::[VULN3] off-distro finding not in the baseline: $line (matched as $ptype, outside deb/rpm/apk package metadata) — this image has not carried this pair before. Review what installed it, then add it to $BASELINE in a pull request or remove whatever brought it in."
     done <<< "$new_pairs"
     # An expired line whose pair is gone is the outcome the deadline asked for:
     # reported for pruning, never blocking — the stale-entry rule below.
@@ -443,7 +514,8 @@ run() {
       # the only reason it does not block is that grype matched it off a binary
       # rather than through the distro. Rendering it as an ordinary report would
       # hide exactly the distinction this state exists to make.
-      offdistro) echo "  off-distro $sev $id in $pkg $ver (fixed in $fix) — matched off a binary, not an installed package; not blocking" ;;
+      offdistro) echo "  off-distro $sev $id in $pkg $ver (fixed in $fix) — matched outside deb/rpm/apk package metadata; not blocking" ;;
+      distro-covered) echo "  distro-covered $sev $id in $pkg $ver (upstream fix: $fix) — covered by an installed OS package in this scan; distro verdict applies" ;;
       *)        echo "  reported $sev $id in $pkg $ver (fix: $fix)" ;;
     esac
   done < <(printf '%s\n' "$records" | grep '^#FINDING' || true)
@@ -788,6 +860,64 @@ selftest() {
   # — a bash internal error where the caller needs a usage message.
   check "a flag with no value is a usage error, not an unbound variable" 2 "needs a value" \
     --report
+
+  # ── distro-covered duplicates (#678) ──────────────────────────────────────
+  # Seeded baseline with NO kernel entries: any off-distro pair that reaches the
+  # baseline check will block as VULN3.
+  printf 'GHSA-seed seeded-pkg permanent\n' > "$tmp/base-nokern.txt"
+
+  # 1. Kernel binary CVE that ALSO matched an installed deb (`linux-gcp`) where
+  #    the distro feed rated it medium/not-fixed: already judged, never VULN3.
+  report "$(match CVE-K1 critical fixed 6.19.9 linux-kernel 6.17.0-1022-gcp linux-kernel),$(match CVE-K1 medium not-fixed - linux-gcp 6.17.0-1022.25 deb)" \
+    > "$tmp/kern-dup.json"
+  check "a kernel binary CVE already matched on a deb does not block as VULN3" 0 "distro-covered critical CVE-K1" \
+    --report "$tmp/kern-dup.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # 2. Kernel binary CVE the distro marked 'Not affected' or fixed in an older
+  #    ABI (so grype emits NO deb match for CVE-K2), while the installed deb
+  #    kernel of that same ABI IS present in the scan on another CVE.
+  report "$(match CVE-K2 critical fixed 7.0.10 linux-kernel 7.0.0-1011-gcp linux-kernel),$(match CVE-OTHER low not-fixed - linux-gcp 7.0.0-1011.11~24.04.1 deb)" \
+    > "$tmp/kern-abi.json"
+  check "an installed distro kernel binary whose ABI is in the scan does not block as VULN3" 0 "1 distro-covered duplicate(s)" \
+    --report "$tmp/kern-abi.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # 3. If the distro feed DOES report a fixable critical on the deb kernel, the
+  #    deb finding still blocks as VULN1 — nothing is weakened.
+  report "$(match CVE-K3 critical fixed 7.0.12 linux-kernel 7.0.0-1011-gcp linux-kernel),$(match CVE-K3 critical fixed 7.0.0-1012.12 linux-gcp 7.0.0-1011.11~24.04.1 deb)" \
+    > "$tmp/kern-fixable-deb.json"
+  check "a fixable critical on the installed deb kernel still blocks as VULN1" 1 "VULN1" \
+    --report "$tmp/kern-fixable-deb.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # 4. Non-kernel duplicate: a language cataloger match (e.g. python dist-info
+  #    carrying relatedVulnerabilities -> CVE-DUP) whose CVE is already judged
+  #    on a deb in the same scan does not double-count as VULN3.
+  printf '{"matches":[{"vulnerability":{"id":"GHSA-dup","severity":"critical","fix":{"state":"fixed","versions":["2.0.0"]}},"relatedVulnerabilities":[{"id":"CVE-DUP"}],"artifact":{"name":"certifi","version":"2023.11.17","type":"python"}},{"vulnerability":{"id":"CVE-DUP","severity":"low","fix":{"state":"not-fixed","versions":[]}},"artifact":{"name":"python3-certifi","version":"2023.11.17-1","type":"deb"}}]}\n' \
+    > "$tmp/py-dup.json"
+  check "a non-distro match whose related CVE is judged on a deb does not block as VULN3" 0 "distro-covered critical GHSA-dup" \
+    --report "$tmp/py-dup.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # 5. A standalone/foreign kernel binary whose ABI matches NO installed distro
+  #    kernel package in the scan STILL blocks as VULN3, and VULN3 names the
+  #    matched cataloger type rather than claiming a vendored module.
+  report "$(match CVE-FOREIGN critical fixed 6.19.9 linux-kernel 6.1.0-99-custom linux-kernel),$(match CVE-OTHER low not-fixed - linux-gcp 7.0.0-1011.11~24.04.1 deb)" \
+    > "$tmp/kern-foreign.json"
+  check "a kernel binary not backed by an installed distro kernel still blocks as VULN3" 1 "matched as linux-kernel, outside deb/rpm/apk package metadata" \
+    --report "$tmp/kern-foreign.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # 6. THE CORE CONSTRAINT (#678): a genuinely new vendored Go module in a scan
+  #    alongside distro kernel packages STILL blocks as VULN3 and names go-module.
+  report "$(match GHSA-new-vendored critical fixed 1.4.2 github.com/example/vendored v1.4.0 go-module),$(match CVE-OTHER low not-fixed - linux-gcp 7.0.0-1011.11~24.04.1 deb)" \
+    > "$tmp/new-vendored.json"
+  check "a genuinely new vendored module alongside distro packages still blocks as VULN3" 1 "VULN3.*GHSA-new-vendored github.com/example/vendored (matched as go-module" \
+    --report "$tmp/new-vendored.json" --offdistro-baseline "$tmp/base-nokern.txt" --today 2026-01-01
+
+  # ── CRLF resilience on Windows checkouts (#1495) ──────────────────────────
+  printf '# header with CRLF\r\n\r\nGHSA-x golang.org/x/crypto expires=2026-12-31 crlf note\r\n' > "$tmp/base-crlf.txt"
+  check "a CRLF off-distro baseline parses comments, blanks and expiry cleanly" 0 "ENFORCE — 0 new pair(s)" \
+    --report "$tmp/gomod.json" --offdistro-baseline "$tmp/base-crlf.txt" --today 2026-06-01
+  printf '# ignore header\r\n\r\nCVE-1 2026-12-31 crlf ignore reason\r\n' > "$tmp/ignores-crlf.txt"
+  check "a CRLF ignores file parses cleanly" 0 "ignored  critical CVE-1" \
+    --report "$tmp/fixable.json" --ignores "$tmp/ignores-crlf.txt" --today 2026-06-01
 
   rm -rf "$tmp"
   [ "$status" -eq 0 ] && echo "image-vuln-verdict self-test: all fixtures pass"
