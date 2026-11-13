@@ -3110,12 +3110,12 @@ lane_comment_refusal_once() {
 # already reported on itself (merged, or skipped with its own warning).
 # ---------------------------------------------------------------------------
 lane_log_unacted() {
-  local ranked="$1" handled=" $2 " reason="${3:-not reached this pass}" _key num _sha verdict _rest
-  while IFS=$'\t' read -r _key num _sha verdict _rest; do
+  local ranked="$1" handled=" $2 " reason="${3:-not reached this pass}" _key num _sha row_verdict _rest
+  while IFS=$'\t' read -r _key num _sha row_verdict _rest; do
     [ -n "$num" ] || continue
-    [ "${verdict%%:*}" = "merge" ] || continue
+    [ "${row_verdict%%:*}" = "merge" ] || continue
     case "$handled" in *" $num "*) continue ;; esac
-    echo "lane: #$num NOT acted on this pass ($verdict) — $reason"
+    echo "lane: #$num NOT acted on this pass ($row_verdict) — $reason"
   done <<<"$ranked"
   return 0
 }
