@@ -148,14 +148,12 @@ locals {
   #
   # The allowed types reach a shell command, inside single quotes; the variable's
   # validation admits only `[a-z][a-z0-9_]*`, so no value can close them.
-  # The gcloud/jq/python image, pinned by DIGEST (#1588). The destroy guard runs
-  # in it, so a tag that moves can change the reader that decides what an
-  # unattended apply may destroy, with nothing merged here. Resolved 2026-10-16
-  # from `cloud-sdk:slim`; to bump it, re-resolve that tag
-  #   gcloud container images describe gcr.io/google.com/cloudsdktool/cloud-sdk:slim \
-  #     --project=<any> --format='value(image_summary.digest)'
-  # and replace the digest in one PR, so the self-test and a reviewer see it.
-  cloud_sdk_image = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:ffd36b9b80bb08b2dea60b58ca2b60dfa3a40a3c00f3e5732d6d113f4e7ffa45"
+  # The gcloud/jq/python image, pinned by DIGEST (#1588, #1614). The destroy
+  # guard runs in it, so a tag that moves can change the reader that decides
+  # what an unattended apply may destroy, with nothing merged here. Kept in
+  # step with ci-runner-cache-warmer's var.gcloud_image by cloud-sdk-digest.yml
+  # (scripts/ci/cloud-sdk-digest.sh).
+  cloud_sdk_image = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e8394c66f4f66336af311343ff9a84c84521f8c1113ebc8abfe98bab9a155099"
 
   guard_script_gz    = base64gzip(file("${path.module}/../../scripts/ci/tf-apply-guard.sh"))
   guard_allowed_args = join(" ", [for t in var.unattended_destroy_allowed_types : "'${t}'"])

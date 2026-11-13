@@ -344,9 +344,14 @@ variable "cache_scan_allow_file" {
 }
 
 variable "gcloud_image" {
-  description = "Image the two publishing steps run in. Needs `gcloud storage` and the shell utilities the publishing script uses."
+  description = "Image the publishing and staging steps run in, pinned by @sha256 digest (#1614). Kept in step with ci-runner-apply-trigger's local.cloud_sdk_image by cloud-sdk-digest.yml."
   type        = string
-  default     = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+  default     = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e8394c66f4f66336af311343ff9a84c84521f8c1113ebc8abfe98bab9a155099"
+
+  validation {
+    condition     = can(regex("^[^[:space:]\"'$`\\\\]+@sha256:[0-9a-f]{64}$", var.gcloud_image))
+    error_message = "gcloud_image must be pinned by @sha256:<64-hex> digest (#1614); a floating tag lets the publishing environment change with nothing merged."
+  }
 }
 
 variable "machine_type" {

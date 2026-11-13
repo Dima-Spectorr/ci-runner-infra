@@ -944,6 +944,33 @@ if publishes_while_building "$TURBO"; then ok; else
   bad "warm-turbo.sh, run while the build is still going, did not publish a finished artifact at once, offered an unfinished one, refused a not-yet-whole one for good, published one twice, or did not end after the build did"
 fi
 
+# 26. THE GCLOUD IMAGE IS PINNED BY DIGEST (#1614). The warmer's publishing
+#     steps hold the bucket write grant; a floating `:slim` tag lets that
+#     container change with nothing merged here, and a caller override without
+#     `@sha256:` reintroduces the same drift.
+pins_the_gcloud_image_default() { # <variables.tf>
+  local blk
+  blk=$(block_of "$1" "gcloud_image")
+  [ -n "$blk" ] || return 1
+  matches "$blk" '^[[:space:]]*default[[:space:]]*=[[:space:]]*"gcr\.io/google\.com/cloudsdktool/cloud-sdk@sha256:[0-9a-f]{64}"[[:space:]]*$' || return 1
+  matches "$blk" '@sha256:\[0-9a-f\]\{64\}'
+}
+
+uses_the_gcloud_image_variable() { # <main.tf>
+  local code
+  code=$(code_of "$1")
+  [ "$(printf '%s\n' "$code" | grep -cE '^[[:space:]]*name[[:space:]]*=[[:space:]]*var\.gcloud_image$')" -eq 5 ] || return 1
+  ! matches "$code" 'cloud-sdk:'
+}
+
+if pins_the_gcloud_image_default "$VARS"; then ok; else
+  bad "var.gcloud_image in variables.tf is no longer digest-pinned to gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:<64-hex> or lacks its @sha256 validation (#1614)"
+fi
+
+if uses_the_gcloud_image_variable "$MAIN"; then ok; else
+  bad "a cloud-sdk step in ci-runner-cache-warmer/main.tf bypasses var.gcloud_image or names a floating cloud-sdk tag (#1614)"
+fi
+
 # --- mutations -----------------------------------------------------------------
 
 mutate() { # <description> <file> <sed-program> <predicate>
@@ -1393,6 +1420,18 @@ mutate "the slot share no longer floored at 1" "$MAIN" \
 mutate "the slot share sized from the whole machine" "$MAIN" \
   's@\$(( \$(nproc) / \${local\.turbo_default_concurrency} ))@$(nproc)@' \
   publishes_the_slot_share
+
+mutate "var.gcloud_image put back on the floating :slim tag" "$VARS" \
+  's|cloud-sdk@sha256:[0-9a-f]*"|cloud-sdk:slim"|' \
+  pins_the_gcloud_image_default
+
+mutate "var.gcloud_image digest validation dropped" "$VARS" \
+  's|@sha256:\[0-9a-f\]{64}|:.*|' \
+  pins_the_gcloud_image_default
+
+mutate "a warmer step hardcodes cloud-sdk:slim instead of var.gcloud_image" "$MAIN" \
+  '0,/name   = var\.gcloud_image/ s|name   = var\.gcloud_image|name   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"|' \
+  uses_the_gcloud_image_variable
 
 printf 'cache-warmer selftest: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

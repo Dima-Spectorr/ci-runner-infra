@@ -900,6 +900,13 @@ jobs:
       - name: runner-version self-test
         run: bash scripts/ci/runner-version.selftest.sh
 
+      # cloud-sdk-digest.yml is scheduled too (#1614): proves the two cloud-sdk
+      # pins in ci-runner-apply-trigger and ci-runner-cache-warmer agree, that
+      # csd_bump rewrites both or neither, and that manifest digests are hashed
+      # from body bytes rather than taken on header trust.
+      - name: cloud-sdk-digest self-test
+        run: bash scripts/ci/cloud-sdk-digest.selftest.sh
+
       # `ci_orphan_registrations_reaped` was published from the day the reaper
       # landed and never declared in the module output that dashboards and alert
       # policies are built from, so nothing looked at it. The reverse drift is
