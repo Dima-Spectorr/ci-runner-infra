@@ -1574,12 +1574,19 @@ skipped — the candidate is not merged, not counted, not demoted, and the batch
 goes on to the next one; `lane_report_refusal()` returns `2` for them instead of
 `1`. Every skip is named in the run log in GitHub's own words, and the ones a
 contributor can act on are also commented on the pull request once per head sha
-(`<!-- merge-lane:refused:<sha> -->`). The skip arms, in order:
+(`<!-- merge-lane:refused:<sha> -->`).
+
+**Every `merge` the pass ranked and did not act on gets a line saying why**
+(`lane: #N NOT acted on this pass (<verdict>) — <reason>`): the batch was used
+up, the pass deadline came, the base-health check stopped the batch, a refusal
+ended the pass, or the base moved or could not be re-read. Without it a run
+that logs a page of `merge:ready` and then `done, 0 action(s)` has nowhere left
+to look. The skip arms, in order:
 
 | GitHub says | Why it is this pull request only | Commented |
 |---|---|---|
 | ``… without `workflows` permission`` (403) | the App may not write `.github/workflows/**` on this installation — see above | no (an installation fix, not the author's) |
-| `Required status check "X" is expected.` (405) | a check_suite disagreement about this head — see "Superseded check_suite vs a required context" | yes |
+| `Required status check "X" is expected.` or `N of M required status checks are expected.` (405) | a check_suite disagreement about this head — see "Superseded check_suite vs a required context". GitHub uses both wordings; matching only the first ended every pass on a consumer for over an hour (2026-11-13), behind one pull request whose ruleset still read a cancelled duplicate CI run | yes |
 | `Waiting on code owner review from …` / `… approving review is required …` / `A conversation must be resolved …` (405) | the ruleset or branch protection also requires a review, which the lane's check-based read cannot see, so the pull request reads `merge:ready` | yes |
 
 The review arm is measured: a consumer repository's run 36408270569 (lane v5.107.1,

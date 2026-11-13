@@ -1522,6 +1522,17 @@ names_the_workflows_permission_refusal() {
   matches "$code" '^      return 2$'
 }
 
+# A run that logs ten `merge:ready` lines and then `done, 0 action(s)` with no
+# other line sends an operator to pull requests that are clean, with nowhere
+# left to look (entity-platform, 2026-11-13). Every `merge` the batch did not
+# reach gets a line saying why, written once the loop has stopped.
+logs_every_unacted_merge() {
+  local code
+  code=$(code_of "$1")
+  matches "$code" '^lane_log_unacted\(\) \{$' || return 1
+  matches "$code" '^  lane_log_unacted "\$ranked" "\$handled" "\$stop_reason"$'
+}
+
 # Measured on a consumer's run 35428114193: the merge API refused a
 # `merge:ready` candidate with a 405, "Required status check \"CI summary
 # (rollup)\" is expected." — a disagreement between the lane's own read and
@@ -1534,7 +1545,10 @@ names_the_workflows_permission_refusal() {
 names_the_required_status_check_refusal() {
   local code
   code=$(code_of "$1")
-  matches "$code" "^    \*'Required status check'\*'is expected'\*)\$" || return 1
+  # Both of GitHub's wordings, on the one arm: a single name, or a count
+  # ("3 of 4 required status checks are expected." — entity-platform,
+  # 2026-11-13, which ended every pass for over an hour).
+  matches "$code" "^    \*'Required status check'\*'is expected'\*[|]\*'required status checks are expected'\*)\$" || return 1
   matches "$code" '^      return 2$' || return 1
   # And it must not fail silently on the pull request itself — an Action log
   # rotates out of easy reach; the comment is what the author and an operator
@@ -2214,6 +2228,7 @@ check stops_batching_at_the_pass_deadline "$DRIVER" "the batch keeps merging pas
 check ends_the_batch_on_a_refusal "$DRIVER" "a refused action does not stop the batch, so the lane keeps working down a ranking the refusal just proved stale"
 check quotes_what_github_actually_said "$DRIVER" "a refusal is reported as a guess while GitHub's own reason is thrown away, so a lane that logs merge:ready and then acts on nothing cannot be diagnosed at all"
 check names_the_workflows_permission_refusal "$DRIVER" "a pull request the App may never merge — it touches a workflow file — reads as a transient refusal and ends the batch on every pass, so one of them starves the whole repository"
+check logs_every_unacted_merge "$DRIVER" "a merge:ready pull request the pass did not act on leaves no line in the run saying why, so '0 action(s)' after a page of merge:ready reads as a lane that decided nothing"
 check names_the_required_status_check_refusal "$DRIVER" "a required-status-check 405 — the lane's own read disagreeing with GitHub's ruleset about ONE candidate's head — reads as a transient refusal and ends the batch on every pass, so the oldest ready pull request starves every candidate behind it"
 check names_the_review_refusal "$DRIVER" "a 405 for a missing code-owner or approving review — a requirement on ONE pull request the lane's check read cannot see — reads as a transient refusal and ends the batch on every pass, so one unreviewed pull request at the head of the ranking stops every merge in the repository"
 check names_the_failing_status_check_refusal "$DRIVER" "a 405 saying a required check is FAILING while the lane read it green — a dispatched green re-run the ruleset does not count, over a failed pull-request run — reads as a transient refusal and ends the batch on every pass behind one candidate"
@@ -2688,7 +2703,11 @@ mutate "gh's stderr goes back to the log instead of the annotation" "$DRIVER" \
 mutate "the workflows-permission refusal stops being named" "$DRIVER" \
   "s@^    \*'workflows'\*permission\*)\$@    *'workflows-never'*permission*)@" names_the_workflows_permission_refusal
 mutate "the required-status-check refusal stops being named" "$DRIVER" \
-  "s@^    \*'Required status check'\*'is expected'\*)\$@    *'Required status check-never'*'is expected'*)@" names_the_required_status_check_refusal
+  "s@^    \*'Required status check'\*'is expected'\*|@    *'Required status check-never'*'is expected'*|@" names_the_required_status_check_refusal
+mutate "the count form of the required-status-check refusal stops being named" "$DRIVER" \
+  "s@|\*'required status checks are expected'\*)\$@)@" names_the_required_status_check_refusal
+mutate "a merge:ready pull request the pass does not reach goes unexplained" "$DRIVER" \
+  's@^  lane_log_unacted "\$ranked" "\$handled" "\$stop_reason"$@  :@' logs_every_unacted_merge
 mutate "the required-status-check refusal stops commenting on the pull request" "$DRIVER" \
   's@already_commented_refusal "\$num" "\$sha"@false@' names_the_required_status_check_refusal
 mutate "the failing-status-check refusal stops being named" "$DRIVER" \
@@ -3733,7 +3752,7 @@ behavioural_refusal_cases() {
     esac
   }
   local fn
-  for fn in refused_marker already_commented_refusal lane_comment_refusal_once lane_report_refusal; do
+  for fn in refused_marker already_commented_refusal lane_comment_refusal_once lane_report_refusal lane_log_unacted; do
     eval "$(sed -n "/^${fn}() {/,/^}/p" "$DRIVER")"
     if ! declare -F "$fn" >/dev/null 2>&1; then
       echo "FAIL $fn could not be lifted out of the driver, so no refusal case ran"
@@ -3741,6 +3760,15 @@ behavioural_refusal_cases() {
       return
     fi
   done
+
+  local unacted
+  unacted="$(lane_log_unacted "$(printf '%s\t%s\t%s\t%s\t%s\n' \
+    a 11 s1 'merge:ready green=4' '' b 12 s2 'merge:ready green=4' '' c 13 s3 'update:behind' '')" ' 11' 'the reason')"
+  if [ "$unacted" = "lane: #12 NOT acted on this pass (merge:ready green=4) — the reason" ]; then
+    printf 'PASS %s\n' "an unreached merge is named with the reason; a handled one and a non-merge are not"
+  else
+    printf 'FAIL lane_log_unacted printed %q\n' "$unacted"
+  fi
 
   _rc_case() { # <label> <want-rc> <err> <sha>
     local rc=0
@@ -3754,6 +3782,8 @@ Waiting on code owner review from some-owner. (HTTP 405)'
   _rc_case "a code-owner review 405 skips the candidate, not the pass" 2 "$codeowner" aaaa1111
   _rc_case "an approving-review 405 skips the candidate" 2 'gh: At least 1 approving review is required by reviewers with write access. (HTTP 405)' bbbb2222
   _rc_case "a required-status-check 405 still skips the candidate" 2 'gh: Required status check "ci" is expected. (HTTP 405)' cccc3333
+  # entity-platform runs 43407705521..43409199165, verbatim: the count form.
+  _rc_case "the count form of the required-status-check 405 skips the candidate, not the pass" 2 'gh: Repository rule violations found  3 of 4 required status checks are expected.   (HTTP 405)' 99990000
   _rc_case "a failing-required-check 405 skips the candidate, not the pass" 2 'gh: Repository rule violations found  Required status check "ci" is failing.   (HTTP 405)' ffff6666
   _rc_case "a workflows-permission refusal still skips the candidate" 2 'gh: refusing to allow a GitHub App to create or update workflow without `workflows` permission (HTTP 403)' ''
   _rc_case "an unrecognised refusal still ends the pass" 1 'gh: Head branch was modified. Review and try the merge again. (HTTP 409)' dddd4444
