@@ -2764,6 +2764,7 @@ lane_walk() {
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "::notice::dry-run — would take '$action_verdict' on #$action_num"
+    lane_log_unacted "$ranked" "$action_num" "dry run: nothing is acted on"
     return 1
   fi
 
@@ -2779,10 +2780,12 @@ lane_walk() {
   local base_now
   if ! base_now="$(lane_read_base_tip)"; then
     echo "::warning::$LANE_BASE tip re-read FAILED after $LANE_BASE_READ_ATTEMPTS attempts (${base_now:-no error text}) — a read failure, not a move; nothing acted on this pass."
+    lane_log_unacted "$ranked" '' "the $LANE_BASE tip re-read failed, so nothing is acted on this pass"
     return 1
   fi
   if [ "$base_now" != "$base_sha" ]; then
     echo "::warning::$LANE_BASE moved while this pass was reading (${base_sha:0:8} → ${base_now:0:8}) — nothing acted on, re-reading."
+    lane_log_unacted "$ranked" '' "$LANE_BASE moved while this pass was reading, so nothing is acted on until it is re-read"
     return 1
   fi
 
@@ -2816,12 +2819,17 @@ lane_walk() {
   batch="$(lane_batch_size "$LANE_STRICT" "$MAX_ACTIONS" "$acted" "$LANE_BASE_RED")"
 
   PASS_ACTED=0
+  # What the pass reached, and why it stopped: every `merge` in the ranking that
+  # is in neither gets one line after the loop (`lane_log_unacted`).
+  local handled='' stop_reason=''
   while IFS=$'\t' read -r _ action_num action_sha action_verdict action_unreviewed; do
     [ -n "$action_num" ] || continue
+    stop_reason="this pass's batch of $batch action(s) is used up (a strict or red base acts once per pass, otherwise max-actions bounds the run); the next pass takes it"
     [ "$PASS_ACTED" -lt "$batch" ] || break
     if [ "$PASS_ACTED" -gt 0 ]; then
       # Only merges batch. A `drop` is a comment the lane owes anyway, but an
       # `update` starts a CI run the next candidate might depend on.
+      stop_reason="the batch ends at the first action that is not a merge (#$action_num, $action_verdict); the next pass re-reads"
       [ "${action_verdict%%:*}" = "merge" ] || break
       # And only within the pass deadline. The FIRST action is deliberately
       # exempt: a pass that ran out of time still acts on the best candidate it
@@ -2831,6 +2839,7 @@ lane_walk() {
       # the queue snapshot and the annotation that explain the truncation.
       if lane_pass_expired "$LANE_STARTED" "$PASS_BUDGET" "$(date -u +%s)"; then
         echo "lane: pass deadline reached after $PASS_ACTED action(s) — the rest wait for the next pass"
+        stop_reason="the pass deadline was reached after $PASS_ACTED action(s)"
         break
       fi
       # AND ONLY ONTO A BASE THAT HAS ANSWERED FOR ITSELF SINCE THE LAST MERGE.
@@ -2845,11 +2854,13 @@ lane_walk() {
         if ! tip_read="$(gh api "repos/$R/commits/$LANE_BASE" --jq '.sha + " " + .commit.committer.date' 2>/dev/null)" \
           || [ -z "$tip_read" ]; then
           echo "lane: could not re-read $LANE_BASE after merging — stopping the batch here, the next pass re-reads the world"
+          stop_reason="$LANE_BASE could not be re-read after the last merge"
           break
         fi
         read -r tip_now tip_at <<<"$tip_read"
         if ! lane_base_is_vouched "$tip_now" "$tip_at"; then
           echo "::notice::lane: merged $PASS_ACTED, stopping the batch — the base-health check on ${tip_now:0:8} is '$LANE_BASE_VERDICT'. Merging the rest now would pile them onto a tip nothing has vouched for since the last merge. The lane resumes as soon as it answers."
+          stop_reason="the base-health check on ${tip_now:0:8} is '$LANE_BASE_VERDICT', and nothing merges onto an unvouched tip"
           break
         fi
       fi
@@ -2895,14 +2906,17 @@ lane_walk() {
     fi
 
     local take_rc=0
+    handled="$handled $action_num"
     lane_take_action "$action_num" "$action_sha" "$action_verdict" || take_rc=$?
     if [ "$take_rc" -ne 0 ]; then
+      stop_reason="GitHub's refusal of #$action_num (quoted above) ended the pass; the next pass re-reads"
       [ "$take_rc" -eq 2 ] || break
       continue
     fi
     PASS_ACTED=$((PASS_ACTED + 1))
     if [ -n "$LANE_BASE_RED" ]; then LANE_BASE_FIX_MERGED=1; fi
   done <<<"$ranked"
+  lane_log_unacted "$ranked" "$handled" "$stop_reason"
 
   [ "$PASS_ACTED" -gt 0 ]
 }
@@ -3087,6 +3101,26 @@ lane_comment_refusal_once() {
 }
 
 # ---------------------------------------------------------------------------
+# lane_log_unacted <ranked> <handled> <reason>
+#
+# One line for every `merge` in the ranking the pass did not reach, with why.
+# A run that logs ten `merge:ready` lines and then `done, 0 action(s)` and
+# nothing else sends an operator to the pull requests, which are clean, and
+# leaves nowhere to look. `handled` is the space-separated numbers the batch
+# already reported on itself (merged, or skipped with its own warning).
+# ---------------------------------------------------------------------------
+lane_log_unacted() {
+  local ranked="$1" handled=" $2 " reason="${3:-not reached this pass}" _key num _sha row_verdict _rest
+  while IFS=$'\t' read -r _key num _sha row_verdict _rest; do
+    [ -n "$num" ] || continue
+    [ "${row_verdict%%:*}" = "merge" ] || continue
+    case "$handled" in *" $num "*) continue ;; esac
+    echo "lane: not acted on this pass: #$num ($row_verdict) — $reason"
+  done <<<"$ranked"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Say why GitHub refused, in GitHub's own words, and RETURN the code the caller
 # passes on: 2 when the refusal is about this pull request alone, so the batch
 # can go on, 1 when the world moved and the pass has to re-read it.
@@ -3112,8 +3146,13 @@ lane_report_refusal() {
       echo "::error::$what of #$num was refused: the merge App may not write \`.github/workflows/**\` on this installation. Grant the App the \"Workflows\" repository permission (read and write) and accept the request on each installation — until then EVERY pull request that touches a workflow file is unmergeable by the lane, and only those. GitHub said: $err"
       return 2
       ;;
-    *'Required status check'*'is expected'*)
-      # THE HEAD-OF-LINE BLOCKER. Measured on Telnet-Emulation run 35428114193:
+    *'Required status check'*'is expected'*|*'required status checks are expected'*)
+      # THE HEAD-OF-LINE BLOCKER. GitHub words it two ways: one name
+      # ("Required status check \"ci\" is expected.") or a count ("3 of 4
+      # required status checks are expected."). Matching only the first let the
+      # count form fall to the default arm and end every pass on entity-platform
+      # from 10:14Z on 2026-11-13: one pull request whose ruleset still read a
+      # cancelled duplicate CI run held ten CLEAN ones behind it. Measured on Telnet-Emulation run 35428114193:
       # `check_counts` had read a completed, successful `CI summary (rollup)`
       # for this exact head sha and ranked the pull request `merge:ready`, then
       # the merge API refused it with this 405 because the RULESET disagreed —
