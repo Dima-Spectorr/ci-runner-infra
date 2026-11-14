@@ -18,7 +18,7 @@ Next to the pool, once per repository:
 
 ```hcl
 module "ci_cache_warmer" {
-  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.162.0"
+  source = "git::https://github.com/<owner>/ci-runner-infra.git//modules/ci-runner-cache-warmer?ref=v5.163.0"
 
   project_id   = var.project_id
   region       = var.region
@@ -250,8 +250,35 @@ self-test holds those together.
 Because a warm with nothing changed is now a replay plus a few metadata reads,
 it can run far more often than nightly. Recommended: `schedule = "*/15 * * * *"`
 (or hourly, `"0 * * * *"`) so `main`'s newest hashes are in the pool within
-minutes of a merge. Overlapping warms are safe — uploads are write-once and a
-412 counts as already present — and the scheduler does not retry a missed fire.
+minutes of a merge. The scheduler does not retry a missed fire.
+
+### One warm at a time
+
+At most one warm runs per pool and repository, whatever commit each one is for.
+Measured on IntegrateIT (issue #33507, 2026-11-14): with a 15-minute schedule
+and warms taking 15–43 minutes, up to 3 ran at once and held Cloud Build
+capacity while deploy builds in the same project sat QUEUED until their queue
+TTL expired. An hourly schedule alone does not prevent it — a warm delayed in
+the queue still overlaps the next fire.
+
+The `claim` step takes a lease that names no commit,
+`turbo/<owner>/<repo>/warm-claims/inflight-<window>-<n>` (window = time ÷
+`build_timeout`), with `ifGenerationMatch=0`. Before taking one it reads the
+previous and current window's leases; any lease without a `-done` twin and
+younger than `build_timeout` is a running warm, and this warm skips install,
+build and publish and exits 0. After taking one it reads again across the
+window boundary and yields to any live lease created first, so two warms that
+raced still leave exactly one building. `mark-warmed` releases the lease by
+writing its `-done` twin — also when the build failed, since the build step
+swallows its own failure. A warm that crashed or timed out leaves its lease,
+which stops counting after `build_timeout`.
+
+The lease is built from what the warmer identity already holds — create
+(`ifGenerationMatch=0`) and read under its turbo prefix, no delete, overwrite or
+list — so it widens no grant. Every unexpected answer (no token, an unreadable
+lease, an HTTP status it does not expect) is logged and the warm runs: it fails
+open to warming. The per-commit `-done` check is unchanged — a commit already
+warmed in the current 12-hour slot is skipped too.
 
 ## Migrating off `ci-runner-cache-publisher`
 

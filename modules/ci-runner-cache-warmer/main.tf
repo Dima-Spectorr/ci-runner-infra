@@ -396,24 +396,54 @@ locals {
   # queue p90 266 s with a warm running, 59 s without). 108 warms also started
   # while the previous one was still building the same commit.
   #
-  # So a warm skips its commit only when, in the current 12-hour slot, another
-  # warm already FINISHED it (a `-done` object the last step writes after every
-  # step before it succeeded and the build itself did not fail), or another warm
-  # is STILL building it (a write-once claim younger than the build timeout).
-  # A claim older than that belongs to a warm that died — timed out, crashed,
-  # failed a step — and this warm runs: a failure is never hidden behind a skip
-  # for the rest of the slot. The slot, not the commit alone, is in the names so
-  # an idle branch is still rewarmed twice a day — the snapshot store has an age
-  # bound, and a branch that sits still for a week must not age out of it. Both
-  # objects sit under the turbo prefix this identity may already create in and
-  # read, so no grant widens, and the bucket's own age bound deletes old ones.
+  # So a warm skips its commit when, in the current 12-hour slot, another warm
+  # already FINISHED it (a `-done` object the last step writes after every step
+  # before it succeeded and the build itself did not fail). The slot, not the
+  # commit alone, is in the name so an idle branch is still rewarmed twice a day
+  # — the snapshot store has an age bound, and a branch that sits still for a
+  # week must not age out of it.
   #
-  # FAIL-OPEN TO WARMING. No SHA, no token, an unreadable claim, or any answer
+  # AND AT MOST ONE WARM RUNS AT A TIME, WHATEVER COMMIT EACH IS FOR. The claim
+  # used to be per `<sha>-<slot>`, so two warms of DIFFERENT commits both ran.
+  # Measured on IntegrateIT (issue #33507, 2026-11-14): the trigger fired every
+  # 15 minutes, warms took 15-43 minutes, up to 3 ran at once on 32-core
+  # workers, and deploy builds in the same project sat QUEUED behind them until
+  # their queue TTL expired. Moving the schedule to hourly is not enough on its
+  # own: a warm delayed in the queue still overlaps the next fire.
+  #
+  # So a running warm holds a LEASE that names no commit:
+  # `warm-claims/inflight-<window>-<n>`, where the window is the time divided
+  # by the build timeout and n counts up from 0 inside it. A lease is LIVE while
+  # it has no `-done` twin and is younger than the build timeout — Cloud Build
+  # has killed any build older than that, so a live lease is a running warm. A
+  # warm reads the previous and current window (walking n until a 404), skips
+  # if any lease is live, and otherwise creates the first free n with
+  # ifGenerationMatch=0; a 412 means another warm took that n first, and it
+  # reads again. Two warms that both read before either created can still land
+  # in adjacent windows, so after creating, a warm reads the window either side
+  # too and yields to any live lease created before its own (ties by name):
+  # exactly one of them builds.
+  #
+  # Why this shape: the warmer may only CREATE (ifGenerationMatch=0) and GET
+  # under the turbo prefix — no delete, no overwrite, no list (see the grants
+  # below for why a list is refused). A lease is therefore released by writing
+  # its `-done` twin, never by deleting it, and found by GETting names it can
+  # compute, never by listing. The bucket's own age bound deletes old ones.
+  #
+  # Released by the last step, which Cloud Build reaches whenever every step
+  # before it passed — including a warm whose build failed, because the build
+  # step swallows its own failure. Only a warm that died (timed out, crashed, a
+  # later step failed) leaves a lease, and that lease stops counting once it is
+  # older than the build timeout: a dead warm never blocks the next one for
+  # longer than one warm could have run.
+  #
+  # FAIL-OPEN TO WARMING. No SHA, no token, an unreadable lease, or any answer
   # the step does not expect is logged and the warm runs exactly as it did
   # before these steps existed.
   skip_marker        = "${local.staged_dir}/skip"
-  skip_guard         = "if [ -f ${local.skip_marker} ]; then echo '[warm] skipped: this commit is already warmed, or being warmed, in this slot (see the claim step)'; exit 0; fi\n"
+  skip_guard         = "if [ -f ${local.skip_marker} ]; then echo '[warm] skipped: this commit is already warmed in this slot, or another warm is running (see the claim step)'; exit 0; fi\n"
   build_failed       = "${local.staged_dir}/build-failed"
+  lease_file         = "${local.staged_dir}/lease"
   claim_slot_seconds = 43200
   claim_inflight_s   = tonumber(trimsuffix(var.build_timeout, "s"))
   claim_prefix_enc   = replace("${local.turbo_prefix}warm-claims/", "/", "%2F")
@@ -452,39 +482,122 @@ locals {
     }
   EOT
 
+  # `born NAME` prints the object's timeCreated in epoch seconds and returns 0,
+  # returns 1 on a 404, and 2 on any other answer (which the caller fails open
+  # on). `scan FIRST LAST` walks the leases of windows FIRST..LAST and leaves
+  # every LIVE one in `live` as `<born>:<window>-<n>`, and the first free n of
+  # the current window in `free`; it returns 1 on any answer it cannot read.
   claim_script = <<-EOT
     ${local.claim_common}
-    rm -f ${local.skip_marker} ${local.build_failed}
-    if get "$name-done" | grep -q '"timeCreated"'; then
+    rm -f ${local.skip_marker} ${local.build_failed} ${local.lease_file}
+    skip() {
       touch ${local.skip_marker}
-      echo "[warm] $WARM_SHA was already warmed in slot $slot; install, build and publish are skipped"
+      echo "[warm] $1; install, build and publish are skipped"
+      exit 0
+    }
+    if get "$name-done" | grep -q '"timeCreated"'; then
+      skip "$WARM_SHA was already warmed in slot $slot"
+    fi
+    hold=${local.claim_inflight_s}
+    lp="${local.claim_prefix_enc}inflight-"
+    win=$(( $(date -u +%s) / hold ))
+    born() {
+      out=$(curl -sS --proto '=https' --connect-timeout 10 --max-time 60 -K <(auth) \
+        -w '\n%%{http_code}' "$api/storage/v1/b/${var.cache_bucket}/o/$1" 2>/dev/null) || true
+      case "$(printf '%s' "$out" | tail -n 1)" in
+        200)
+          t=$(printf '%s' "$out" | grep -o '"timeCreated": *"[^"]*"' | cut -d'"' -f4)
+          date -u -d "$t" +%s 2>/dev/null || return 2
+          ;;
+        404) return 1 ;;
+        *) return 2 ;;
+      esac
+    }
+    scan() {
+      live=""
+      free=0
+      for w in $(seq "$1" "$2"); do
+        n=0
+        while [ "$n" -lt 64 ]; do
+          b=$(born "$lp$w-$n")
+          r=$?
+          [ "$r" -eq 1 ] && break
+          [ "$r" -eq 0 ] || return 1
+          born "$lp$w-$n-done" >/dev/null
+          r=$?
+          [ "$r" -eq 2 ] && return 1
+          if [ "$r" -eq 1 ] && [ $(( $(date -u +%s) - b )) -lt "$hold" ]; then
+            live="$live $b:$w-$n"
+          fi
+          n=$((n + 1))
+        done
+        [ "$n" -lt 64 ] || return 1
+        [ "$w" -eq "$win" ] && free=$n
+      done
+      return 0
+    }
+    mine=""
+    for try in 1 2 3 4 5; do
+      if ! scan $((win - 1)) "$win"; then
+        echo "[warm] a warm-lease read answered something unexpected; warming without a lease" >&2
+        exit 0
+      fi
+      if [ -n "$live" ]; then
+        skip "another warm is running (live lease:$live; born:lease, held up to $hold s)"
+      fi
+      code=$(put "$lp$win-$free")
+      case "$code" in
+        200 | 201)
+          mine="$win-$free"
+          break
+          ;;
+        412) echo "[warm] lease $win-$free was taken a moment ago; reading again" ;;
+        *)
+          echo "[warm] taking a warm lease answered HTTP $code; warming without one" >&2
+          exit 0
+          ;;
+      esac
+    done
+    if [ -z "$mine" ]; then
+      echo "[warm] no free warm lease after 5 tries; warming without one" >&2
       exit 0
     fi
-    code=$(put "$name")
-    case "$code" in
-      200 | 201) echo "[warm] claimed $WARM_SHA for slot $slot; warming" ;;
-      412)
-        created=$(get "$name" | grep -o '"timeCreated": *"[^"]*"' | cut -d'"' -f4)
-        born=$(date -u -d "$created" +%s 2>/dev/null) || born=0
-        age=$(( $(date -u +%s) - born ))
-        if [ "$born" -gt 0 ] && [ "$age" -lt ${local.claim_inflight_s} ]; then
-          touch ${local.skip_marker}
-          echo "[warm] another warm claimed $WARM_SHA $age s ago and is still within its timeout; install, build and publish are skipped"
-        else
-          echo "[warm] $WARM_SHA was claimed in slot $slot but never finished (claim age '$age' s); warming again"
+    echo "$mine" > ${local.lease_file}
+    me=$(born "$lp$mine") || me=""
+    if [ -n "$me" ] && scan $((win - 1)) $((win + 1)); then
+      for e in $live; do
+        b=$(printf '%s' "$e" | cut -d: -f1)
+        l=$(printf '%s' "$e" | cut -d: -f2)
+        [ "$l" = "$mine" ] && continue
+        if [ "$b" -lt "$me" ] || { [ "$b" -eq "$me" ] && [[ "$l" < "$mine" ]]; }; then
+          put "$lp$mine-done" >/dev/null
+          rm -f ${local.lease_file}
+          skip "lease $l was taken before this warm's $mine; yielding to it"
         fi
-        ;;
-      *) echo "[warm] the claim answered HTTP $code; warming without one" >&2 ;;
-    esac
+      done
+    else
+      echo "[warm] could not re-read the warm leases after taking $mine; warming" >&2
+    fi
+    echo "[warm] took warm lease $mine for $WARM_SHA; no other warm runs until it is released or $hold s old"
     exit 0
   EOT
 
   # Runs last, so Cloud Build reaches it only when every step before it passed.
-  # The build step swallows its own failure (it still publishes what it made),
-  # so it leaves a marker instead, and a failed build is never marked warmed.
+  # It RELEASES the lease first, whatever the build did: a failed build is still
+  # a finished warm, and the next one may run. The build step swallows its own
+  # failure (it still publishes what it made), so it leaves a marker instead,
+  # and a failed build is never marked warmed.
   mark_script = <<-EOT
     ${local.claim_common}
     if [ -f ${local.skip_marker} ]; then exit 0; fi
+    lease=$(cat ${local.lease_file} 2>/dev/null) || lease=""
+    if printf '%s' "$lease" | grep -Eq '^[0-9]+-[0-9]+$'; then
+      code=$(put "${local.claim_prefix_enc}inflight-$lease-done")
+      case "$code" in
+        200 | 201 | 412) echo "[warm] released warm lease $lease" ;;
+        *) echo "[warm] releasing warm lease $lease answered HTTP $code; it lapses after ${local.claim_inflight_s} s" >&2 ;;
+      esac
+    fi
     if [ -f ${local.build_failed} ]; then
       echo "[warm] the build failed; $WARM_SHA is not marked warmed, so the next warm retries it" >&2
       exit 0
@@ -965,7 +1078,8 @@ resource "google_cloudbuild_trigger" "warm" {
       script = local.stage_script
     }
 
-    # 0b. THE CLAIM: one warm per commit per 12-hour slot (see `claim_script`).
+    # 0b. THE CLAIM: one warm per commit per 12-hour slot, and at most one warm
+    #     running at a time whatever its commit (see `claim_script`).
     #     Runs before any repository code, in the gcloud image, and every later
     #     step exits at once when it leaves the skip marker. `$COMMIT_SHA` and
     #     `$BUILD_ID` are Cloud Build substitutions, expanded in `env` (never in
@@ -1101,8 +1215,9 @@ resource "google_cloudbuild_trigger" "warm" {
       ]
     }
 
-    # 5. THE COMMIT, marked warmed — only reached when every step above passed,
-    #    and it declines when the build left its failure marker. See claim_script.
+    # 5. THE LEASE RELEASED AND THE COMMIT MARKED WARMED — only reached when
+    #    every step above passed. The lease is released even when the build left
+    #    its failure marker; the commit is not marked then. See claim_script.
     step {
       id     = "mark-warmed"
       name   = var.gcloud_image

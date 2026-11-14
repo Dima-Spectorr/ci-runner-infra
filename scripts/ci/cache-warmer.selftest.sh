@@ -834,10 +834,11 @@ if publishes_beside_the_build "$MAIN"; then ok; else
   bad "publish-turbo no longer runs beside the build, or the build's end is never marked (a publisher that waits forever) or a stale marker survives — every artifact is published only after the last lint task again"
 fi
 
-# 9b. A warm of a commit already warmed in this slot does no work: the claim
-#     step creates <sha>-<slot> with ifGenerationMatch=0 (412 = already claimed
-#     → skip marker), clears a stale marker first, fails OPEN on every other
-#     answer, and the build + both publishers honour the marker.
+# 9b. A warm does no work when its commit is already warmed in this slot, or
+#     when another warm (of any commit) holds a live lease: the claim step
+#     creates its lease with ifGenerationMatch=0, clears a stale marker first,
+#     fails OPEN on every other answer, and the build + both publishers honour
+#     the marker.
 skips_an_already_warmed_commit() { # <main.tf>
   local code claim
   code=$(code_of "$1")
@@ -845,11 +846,24 @@ skips_an_already_warmed_commit() { # <main.tf>
   [ -n "$claim" ] || return 1
   matches "$claim" '"WARM_SHA=\$COMMIT_SHA"' || return 1
   matches "$code" 'ifGenerationMatch=0&name=\$1' || return 1
-  matches "$code" 'rm -f \$\{local\.skip_marker\} \$\{local\.build_failed\}' || return 1
-  # Skip only on a FINISHED warm, or one still inside its timeout — a claim
-  # left by a warm that died must not hide the failure for the whole slot.
+  matches "$code" 'rm -f \$\{local\.skip_marker\} \$\{local\.build_failed\} \$\{local\.lease_file\}' || return 1
+  # Skip a commit only once a warm FINISHED it in this slot.
   matches "$code" 'if get "\$name-done" \| grep -q' || return 1
-  matches "$code" '\[ "\$age" -lt \$\{local\.claim_inflight_s\} \]' || return 1
+  # AT MOST ONE WARM AT A TIME (IntegrateIT #33507): a lease naming no commit,
+  # read across the previous and current window, live only while it has no
+  # `-done` twin and is younger than the build timeout (a dead warm's lease
+  # lapses), yielded after a race to any live lease created first, and released
+  # by the mark step. scripts/ci/warm-lease.selftest.sh RUNS these; this holds
+  # their shape.
+  matches "$code" 'hold=\$\{local\.claim_inflight_s\}$' || return 1
+  matches "$code" 'lp="\$\{local\.claim_prefix_enc\}inflight-"$' || return 1
+  matches "$code" 'if ! scan \$\(\(win - 1\)\) "\$win"; then$' || return 1
+  matches "$code" '\[ \$\(\( \$\(date -u \+%s\) - b \)\) -lt "\$hold" \]' || return 1
+  matches "$code" 'if \[ -n "\$live" \]; then$' || return 1
+  matches "$code" 'scan \$\(\(win - 1\)\) \$\(\(win \+ 1\)\); then$' || return 1
+  matches "$code" 'if \[ "\$b" -lt "\$me" \]' || return 1
+  matches "$code" 'put "\$lp\$mine-done"' || return 1
+  matches "$code" 'code=\$\(put "\$\{local\.claim_prefix_enc\}inflight-\$lease-done"\)' || return 1
   matches "$code" 'claim_inflight_s   = tonumber\(trimsuffix\(var\.build_timeout, "s"\)\)' || return 1
   local mark
   mark=$(step_block "$code" mark-warmed)
@@ -1234,8 +1248,24 @@ mutate "a failed build is still marked warmed" "$MAIN" \
   's@|| { touch ${local\.build_failed}; echo@|| { echo@' \
   skips_an_already_warmed_commit
 
-mutate "a dead warm's claim hides the commit for the whole slot" "$MAIN" \
-  's@\[ "$age" -lt ${local\.claim_inflight_s} \]@true@' \
+mutate "a dead warm's lease blocks every later warm" "$MAIN" \
+  's@ -lt "$hold" \]@ -ge 0 ]@' \
+  skips_an_already_warmed_commit
+
+mutate "a live warm lease ignored" "$MAIN" \
+  's@if \[ -n "$live" \]; then@if false; then@' \
+  skips_an_already_warmed_commit
+
+mutate "the previous window's leases not read" "$MAIN" \
+  's@if ! scan $((win - 1)) "$win"; then@if ! scan "$win" "$win"; then@' \
+  skips_an_already_warmed_commit
+
+mutate "no yield to an earlier lease after a race" "$MAIN" \
+  's@if \[ "$b" -lt "$me" \]@if false@' \
+  skips_an_already_warmed_commit
+
+mutate "the warm lease never released by the mark step" "$MAIN" \
+  's@code=$(put "${local\.claim_prefix_enc}inflight-$lease-done")@code=201@' \
   skips_an_already_warmed_commit
 
 mutate "an empty derivation builds anyway" "$MAIN" \
