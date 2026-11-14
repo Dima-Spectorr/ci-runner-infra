@@ -126,7 +126,7 @@ LEASES="$STORE/turbo/o/r/warm-claims"
 warm() { # <claim|mark> <sha> -> the script's output; status in $?
   PATH="$T/bin:$PATH" FAKE_STORE="$STORE" WARM_SHA="$2" WARM_BUILD_ID="b-$2" bash "$T/$1.sh" 2>&1
 }
-reset() { rm -rf "${STORE:?}"/* "$STAGED"/*; }
+reset() { rm -rf "${STORE:?}"/* "${STAGED:?}"/*; }
 skipped() { [ -f "$STAGED/skip" ]; }
 lease() { cat "$STAGED/lease" 2>/dev/null; }
 # A lease object of window <w> index <n>, created <age> seconds ago.
