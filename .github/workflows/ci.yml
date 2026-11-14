@@ -1169,6 +1169,12 @@ jobs:
       - name: cache-warmer self-test
         run: bash scripts/ci/cache-warmer.selftest.sh
 
+      # The warmer's single-flight lease, RUN against a fake bucket: a second
+      # warm of another commit skips while one is live, a dead warm's lease
+      # lapses, a race yields to the earlier lease (IntegrateIT #33507).
+      - name: warm-lease self-test
+        run: bash scripts/ci/warm-lease.selftest.sh
+
       # The browser image a pool BAKES and the one a consumer is told to RUN are
       # two different lines that must name one release. When they drift nothing
       # fails — every UI job just quietly downloads two gigabytes it was meant
