@@ -541,8 +541,24 @@ lane_fetch_unused() {
 #
 # A Bot author's login is `name` in GraphQL and `name[bot]` in REST; the REST
 # form is written, because `pin-bump-actor` is configured in it.
+#
+# THE PAGES ARE ASKED FOR AT ONCE, AFTER A CHEAP WALK OF THE CURSORS. A page
+# of this query takes GitHub ~6.5s to answer, and a page could only be asked
+# with the cursor the page before it ended on: on IntegrateIT 2026-11-15 (lane
+# runs 43670915759 and 43671947062) 123 open pull requests were 5 serial pages
+# and ~33s of a ~40s pass, on the critical path of every merge cycle. So the
+# list is first walked with `LANE_SNAP_WALK_QUERY` — the same connection, the
+# same order, nothing but each pull request's number and cursor, 100 a page:
+# one point of the graphql bucket per 100 open (a page here is ~13), and one
+# call on a repository with fewer than 100 open. Every LANE_SNAP_PAGE-th cursor
+# is where a page of this query begins, so every page is asked at once, at
+# most FETCH_CONCURRENCY together (`0`/`1`: serially, as before). See "A SEAM
+# THAT DOES NOT MEET" below for why that changes no answer.
 # ---------------------------------------------------------------------------
 LANE_SNAP=''
+# The page size of LANE_SNAP_QUERY, which the cursor walk strides by. The
+# self-test holds the two equal.
+LANE_SNAP_PAGE=25
 # shellcheck disable=SC2016 # GraphQL variables, not shell ones
 LANE_SNAP_QUERY='query($owner: String!, $name: String!, $base: String!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
@@ -569,6 +585,15 @@ LANE_SNAP_QUERY='query($owner: String!, $name: String!, $base: String!, $endCurs
           }
         } } }
       }
+    }
+  }
+}'
+# shellcheck disable=SC2016 # GraphQL variables, not shell ones
+LANE_SNAP_WALK_QUERY='query laneOpenListCursors($owner: String!, $name: String!, $base: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, baseRefName: $base, first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      edges { cursor node { number } }
     }
   }
 }'
@@ -689,36 +714,31 @@ lane_snap_page_transient() {
 # stderr, on any page `lane_snap_page_ok` refuses; the caller treats that as a
 # blind lane, as it did the REST list.
 lane_snapshot() {
-  local dir="$1" cursor='' prev='' pages=0 tolerated=0 n more rc tries=0 reasked=0 wait
+  local dir="$1" cursor='' prev='' pages=0 tolerated=0 n more='' reasked=0 began total once
+  local par_pages=0 par_taken=0 par_walk=0 par_seam=''
   local page="$dir/page" err="$dir/page.err"
+  began="$(date -u +%s)"
   : >"$dir/nodes"
-  while :; do
-    rc=0
-    if [ -n "$cursor" ]; then
-      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" -f endCursor="$cursor" \
-        -f query="$LANE_SNAP_QUERY" >"$page" 2>"$err" || rc=$?
-    else
-      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" \
-        -f query="$LANE_SNAP_QUERY" >"$page" 2>"$err" || rc=$?
-    fi
+  rm -f "$dir/parallel" "$dir/parallel.fallback"
+  if [[ "${FETCH_CONCURRENCY:-1}" =~ ^[0-9]+$ ]] && [ "${FETCH_CONCURRENCY:-1}" -gt 1 ]; then
+    # 0: pages taken, and `more` says where the serial read goes on ('-': it
+    # does not). 1: a blind page. 2: no walk — the serial read, from the start.
+    local prc=0
+    lane_snap_parallel "$dir" || prc=$?
+    case "$prc" in
+      0) ;;
+      1) return 1 ;;
+      *)
+        : >"$dir/nodes"
+        more='' cursor='' prev='' pages=0 tolerated=0 reasked=0 par_pages=0
+        printf 'open list read serially: the cursor walk could not be read\n' >"$dir/parallel.fallback"
+        ;;
+    esac
+  fi
+  while [ "$more" != - ]; do
     pages=$((pages + 1))
-    if ! lane_snap_page_ok "$page"; then
-      # The same page, by the same cursor, once more after a short wait (#1581).
-      if [ "$tries" -lt "$LANE_SNAP_RETRIES" ] && lane_snap_page_transient "$page" "$err"; then
-        tries=$((tries + 1)) reasked=$((reasked + 1)) pages=$((pages - 1))
-        wait=$((2 + (tries - 1) * 3))
-        echo "page $((pages + 1)): $(tr '\n' ' ' <"$err" | cut -c1-120) — a server error; asking again in ${wait}s (retry $tries of $LANE_SNAP_RETRIES)" >&2
-        lane_snap_retry_sleep "$wait"
-        continue
-      fi
-      local said
-      said="$(jq -rc '[(.errors // [])[] | {type, path, message}] | .[:3]' "$page" 2>/dev/null)" \
-        || said="$(head -c 300 "$page")"
-      echo "page $pages (gh exit $rc): $(tr '\n' ' ' <"$err" | cut -c1-200) errors: ${said:0:300}" >&2
-      [ "$tries" -eq 0 ] || echo "page $pages: a server error on each of $((tries + 1)) attempts — not asked again this pass" >&2
-      return 1
-    fi
-    tries=0
+    lane_snap_ask "$pages" "$cursor" "$page" "$err" || return 1
+    reasked=$((reasked + $(<"$page.reasked")))
     n="$(jq '(.errors // []) | length' "$page" | tr -d '\r')"
     tolerated=$((tolerated + n))
     jq -c '.data.repository.pullRequests.nodes[]' "$page" | tr -d '\r' >>"$dir/nodes"
@@ -730,10 +750,185 @@ lane_snapshot() {
     fi
     prev="$more" cursor="$more"
   done
-  rm -f "$page" "$err"
+  rm -f "$page" "$err" "$page.reasked"
+  # A pull request on two pages is kept once, at its first (see "A SEAM THAT
+  # DOES NOT MEET"). A serial read never has one; nothing else changes order.
+  total="$(wc -l <"$dir/nodes" | tr -d ' ')"
+  jq -c -s 'reduce .[] as $n ({seen: {}, out: []};
+      ($n.number | tostring) as $k | if .seen[$k] then . else .seen[$k] = true | .out += [$n] end) | .out[]' \
+    "$dir/nodes" >"$dir/nodes.once" || return 1
+  tr -d '\r' <"$dir/nodes.once" >"$dir/nodes"
+  rm -f "$dir/nodes.once"
+  once="$(wc -l <"$dir/nodes" | tr -d ' ')"
   printf 'open list read in %s GraphQL page(s), %s pull request(s); %s check-suite app field(s) GraphQL could not resolve, their heads'"'"' checks read from REST; %s page read(s) asked again after a server error\n' \
-    "$pages" "$(wc -l <"$dir/nodes" | tr -d ' ')" "$tolerated" "$reasked" >"$dir/summary"
+    "$pages" "$once" "$tolerated" "$reasked" >"$dir/summary"
+  if [ "$par_pages" -gt 0 ]; then
+    printf 'open list read in parallel: %s page(s) asked at once, at most %s at a time, after a %s-page cursor walk; %s taken, %s read serially after them%s; %s duplicate(s) dropped; %ss in all\n' \
+      "$par_pages" "$FETCH_CONCURRENCY" "$par_walk" "$par_taken" "$((pages - par_pages))" \
+      "${par_seam:+ (page $par_seam did not end where the walk said the next one begins)}" \
+      "$((total - once))" "$(($(date -u +%s) - began))" >"$dir/parallel"
+  elif [ -s "$dir/parallel.fallback" ]; then
+    mv -f "$dir/parallel.fallback" "$dir/parallel"
+  fi
+  rm -f "$dir/parallel.fallback"
   lane_snap_write "$dir/nodes" "$R" "$dir"
+}
+
+# <page-number> <cursor> <page-file> <stderr-file> — one page of the open list,
+# by <cursor> (none for the first). Succeeds when <page-file> holds a page
+# `lane_snap_page_ok` takes, with how many times it was asked again after a
+# server error (#1581) in <page-file>.reasked. Fails, with what the API said on
+# stderr, on a page that is the lane blind.
+lane_snap_ask() {
+  local n="$1" cursor="$2" page="$3" err="$4" rc tries=0 wait said
+  while :; do
+    rc=0
+    if [ -n "$cursor" ]; then
+      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" -f endCursor="$cursor" \
+        -f query="$LANE_SNAP_QUERY" >"$page" 2>"$err" || rc=$?
+    else
+      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" \
+        -f query="$LANE_SNAP_QUERY" >"$page" 2>"$err" || rc=$?
+    fi
+    if ! lane_snap_page_ok "$page"; then
+      # The same page, by the same cursor, once more after a short wait (#1581).
+      if [ "$tries" -lt "$LANE_SNAP_RETRIES" ] && lane_snap_page_transient "$page" "$err"; then
+        tries=$((tries + 1))
+        wait=$((2 + (tries - 1) * 3))
+        echo "page $n: $(tr '\n' ' ' <"$err" | cut -c1-120) — a server error; asking again in ${wait}s (retry $tries of $LANE_SNAP_RETRIES)" >&2
+        lane_snap_retry_sleep "$wait"
+        continue
+      fi
+      said="$(jq -rc '[(.errors // [])[] | {type, path, message}] | .[:3]' "$page" 2>/dev/null)" \
+        || said="$(head -c 300 "$page")"
+      echo "page $n (gh exit $rc): $(tr '\n' ' ' <"$err" | cut -c1-200) errors: ${said:0:300}" >&2
+      [ "$tries" -eq 0 ] || echo "page $n: a server error on each of $((tries + 1)) attempts — not asked again this pass" >&2
+      return 1
+    fi
+    printf '%s' "$tries" >"$page.reasked"
+    return 0
+  done
+}
+
+# ---------------------------------------------------------------------------
+# A SEAM THAT DOES NOT MEET IS READ AGAIN SERIALLY.
+#
+# The walk and the pages are not one instant. A pull request opened between
+# them pushes page 1's last items past the cursor page 2 begins after; one
+# closed, reopened or retargeted onto the base moves every boundary after it.
+# Either would leave a GAP between two pages read at once — pull requests no
+# page holds — and a pull request the lane never sees is never merged and
+# never says why. So a page is taken only while the page before it ENDED on
+# the pull request the walk said the next page begins after. At the first
+# seam that does not meet, the pages after it are dropped and the read goes on
+# serially from where the last taken page ended: from there on it is the
+# serial read, by the cursors GitHub gives. The last page's `hasNextPage` is
+# followed the same way, so a list that grew since the walk is read to its
+# end. A pull request on two taken pages is kept once, at its first. A walk
+# that cannot be read, for any reason, is the serial read from the start: the
+# walk is a plan, never an answer.
+#
+# EVERY PAGE IS JUDGED AS BEFORE, by `lane_snap_ask`: the errors-array rule and
+# the re-ask after a server error (#1581). One blind page fails the pass
+# closed, taken or dropped.
+# ---------------------------------------------------------------------------
+
+# <dir> — the walk, then every page at once. Sets the caller's `more`,
+# `cursor`, `prev`, `pages`, `tolerated`, `reasked` and `par_*` (bash scoping
+# is dynamic). 0: pages taken into <dir>/nodes; 1: a blind page; 2: no walk.
+lane_snap_parallel() {
+  local dir="$1" walk="$dir/walk" wcursor='' wprev='' wmore num cur i k p jobs last next rc
+  local anchors=('') numbers=() pids=()
+  : >"$dir/walk.items"
+  while :; do
+    if [ -n "$wcursor" ]; then
+      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" -f endCursor="$wcursor" \
+        -f query="$LANE_SNAP_WALK_QUERY" >"$walk" 2>"$walk.err" || true
+    else
+      gh api graphql -F owner="${R%%/*}" -F name="${R#*/}" -F base="$LANE_BASE" \
+        -f query="$LANE_SNAP_WALK_QUERY" >"$walk" 2>"$walk.err" || true
+    fi
+    par_walk=$((par_walk + 1))
+    if ! jq -e '((.errors // []) | length) == 0
+        and (.data.repository.pullRequests.pageInfo | type) == "object"
+        and (.data.repository.pullRequests.edges | type) == "array"
+        and all(.data.repository.pullRequests.edges[];
+                (.cursor | type) == "string" and (.cursor | length) > 0 and (.node.number | type) == "number")' \
+      "$walk" >/dev/null 2>&1; then
+      echo "cursor walk page $par_walk: $(tr '\n' ' ' <"$walk.err" | cut -c1-160) — not a walk; the open list is read serially" >&2
+      rm -f "$walk" "$walk.err" "$dir/walk.items"
+      return 2
+    fi
+    jq -r '.data.repository.pullRequests.edges[] | "\(.node.number) \(.cursor)"' "$walk" | tr -d '\r' >>"$dir/walk.items"
+    wmore="$(jq -r '.data.repository.pullRequests.pageInfo | if .hasNextPage == true then (.endCursor // "") else "-" end' "$walk" | tr -d '\r')"
+    [ "$wmore" != - ] || break
+    if [ -z "$wmore" ] || [ "$wmore" = "$wprev" ]; then
+      echo "cursor walk page $par_walk says there is a next page but gives no new cursor ('$wmore') — the open list is read serially" >&2
+      rm -f "$walk" "$walk.err" "$dir/walk.items"
+      return 2
+    fi
+    wprev="$wmore" wcursor="$wmore"
+  done
+  rm -f "$walk" "$walk.err"
+  # Page k+1 begins after the walk's (k * LANE_SNAP_PAGE)-th pull request, and
+  # page k must end on it. A boundary on the last pull request begins nothing.
+  i=0
+  while read -r num cur; do
+    i=$((i + 1))
+    if [ $((i % LANE_SNAP_PAGE)) -eq 0 ]; then
+      numbers+=("$num")
+      anchors+=("$cur")
+    fi
+  done <"$dir/walk.items"
+  rm -f "$dir/walk.items"
+  if [ "${#numbers[@]}" -gt 0 ] && [ $((i % LANE_SNAP_PAGE)) -eq 0 ]; then
+    unset 'numbers[-1]' 'anchors[-1]'
+  fi
+  p="${#anchors[@]}" jobs="$FETCH_CONCURRENCY"
+  # At most <jobs> in flight: page i waits for page i-jobs, the oldest one
+  # still running. `set +e` and no EXIT trap, as `lane_fetch_spawn` says why.
+  for ((i = 0; i < p; i++)); do
+    if [ "$i" -ge "$jobs" ]; then wait "${pids[i - jobs]}" 2>/dev/null || true; fi
+    (
+      set +e
+      trap - EXIT
+      lane_snap_ask "$((i + 1))" "${anchors[i]}" "$dir/par.$i" "$dir/par.$i.err" 2>"$dir/par.$i.log"
+      printf '%s' "$?" >"$dir/par.$i.rc"
+    ) &
+    pids+=("$!")
+  done
+  wait "${pids[@]}" 2>/dev/null || true
+  par_pages="$p" pages=$((pages + p))
+  for ((k = 0; k < p; k++)); do
+    rc="$(cat "$dir/par.$k.rc" 2>/dev/null)"
+    if [ "$rc" != 0 ]; then
+      cat "$dir/par.$k.log" >&2 2>/dev/null
+      [ -n "$rc" ] || echo "page $((k + 1)): its read never finished" >&2
+      return 1
+    fi
+    reasked=$((reasked + $(<"$dir/par.$k.reasked")))
+  done
+  more=-
+  for ((k = 0; k < p; k++)); do
+    n="$(jq '(.errors // []) | length' "$dir/par.$k" | tr -d '\r')"
+    tolerated=$((tolerated + n))
+    jq -c '.data.repository.pullRequests.nodes[]' "$dir/par.$k" | tr -d '\r' >>"$dir/nodes"
+    par_taken=$((par_taken + 1))
+    next="$(jq -r '.data.repository.pullRequests.pageInfo | if .hasNextPage == true then (.endCursor // "") else "-" end' "$dir/par.$k" | tr -d '\r')"
+    [ "$next" != - ] || break
+    if [ -z "$next" ]; then
+      echo "page $((k + 1)) says there is a next page but gives no new cursor ('')" >&2
+      return 1
+    fi
+    last="$(jq -r '.data.repository.pullRequests.nodes[-1].number // ""' "$dir/par.$k" | tr -d '\r')"
+    if [ "$k" -eq $((p - 1)) ] || [ "$last" != "${numbers[k]}" ]; then
+      [ "$k" -eq $((p - 1)) ] || par_seam=$((k + 1))
+      more="$next" cursor="$next" prev="$next"
+      break
+    fi
+  done
+  for ((k = 0; k < p; k++)); do rm -f "$dir/par.$k" "$dir/par.$k".*; done
+  return 0
 }
 
 # `gh api [--paginate] <url> [--jq <program>]` answered from the snapshot, or
