@@ -829,6 +829,25 @@ field(s) GraphQL could not resolve, their heads' checks read from REST`. A Bot
 author's login has no `[bot]` suffix in GraphQL; the REST form is written,
 because `pin-bump-actor` is configured in it.
 
+**The pages are asked for at once, after a cheap walk of the cursors.** Read one
+after another, the pages cost ~6.5s each: 5 pages, 123 pull requests and ~33s
+of a ~40s pass on IntegrateIT (2026-11-15, lane runs 43670915759 and
+43671947062). With `fetch-concurrency` above 1, the lane first walks the list
+by cursor alone (`laneOpenListCursors`, 100 a page, about one point of the
+graphql bucket per 100 open), and then asks every 25-page at once, at most
+`fetch-concurrency` at a time. Each page is judged exactly as above. A page is
+taken only while the page before it ended on the pull request the walk said
+the next one begins after; at the first seam that does not meet (a pull
+request opened, reopened or retargeted between the walk and the pages) the
+pages after it are dropped and the read goes on serially from where the last
+taken page ended. The last page's next page is followed the same way, a pull
+request on two pages is kept once, a blind page fails the pass closed, and a
+walk that cannot be read is the serial read from the start. The verdicts do
+not change; the pass logs one more line, `lane: open list read in parallel: P
+page(s) asked at once, at most C at a time, after a W-page cursor walk; T
+taken, S read serially after them; D duplicate(s) dropped; Xs in all` (or
+`lane: open list read serially: the cursor walk could not be read`).
+
 **Those reads are made for every candidate at once, and the verdicts are then
 given in list order.** The ranking cannot be cut short — the oldest head wins at
 equal priority, and a stuck head can become a `drop` that outranks every merge —

@@ -81,11 +81,14 @@ cat >"$WORK/bin/gh" <<'STUB'
 set -u
 [ "${1:-}" = api ] || exit 2
 shift
-url='' prog='' include='' paginate='' cursor=''
+url='' prog='' include='' paginate='' cursor='' walk=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) prog="$2"; shift 2 ;;
     --paginate) paginate=1; shift ;;
+    # The cursor walk (`laneOpenListCursors`) is its own read: logged as
+    # `graphql-walk`, answered from the fixture `graphql_walk` the same way.
+    -f) if [ "$url" = graphql ] && [ $# -ge 2 ] && [[ "$2" == query=*laneOpenListCursors* ]]; then walk=1; shift 2; continue; fi ;;&
     -f) if [ "$url" = graphql ] && [ $# -ge 2 ] && [ "${2%%=*}" = endCursor ]; then cursor="${2#endCursor=}"; shift 2; continue; fi ;;&
     # `-i`: the answer's header block first, in `gh`'s own shape — a status line,
     # CR LF header lines, a lone CR LF. The window it reports is set by the case
@@ -122,7 +125,7 @@ if [ -n "$include" ] && [ -z "${GH_STUB_NO_HEADERS:-}" ]; then
   printf 'X-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: %s\r\nX-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: %s\r\nX-Ratelimit-Used: 10\r\n\r\n' \
     "${GH_STUB_REMAINING:-4990}" "${GH_STUB_QUOTA_RESET:-1900000000}" "${GH_STUB_RESOURCE:-$([ "$url" = graphql ] && echo graphql || echo core)}"
 fi
-printf '%s\n' "$url" >>"$GH_STUB_LOG"
+printf '%s\n' "$url${walk:+-walk}" >>"$GH_STUB_LOG"
 # The one read that moves the clock, for the pass that runs out of time: see
 # the clock below.
 if [ -n "${GH_STUB_TRIP_ON:-}" ] && [ "${url%%\?*}" = "$GH_STUB_TRIP_ON" ]; then : >"$CLOCK_TRIPPED"; fi
@@ -151,6 +154,7 @@ case "$url" in
     ;;
 esac
 key="$(printf '%s' "${url%%\?*}" | tr -c 'A-Za-z0-9' '_')"
+[ -z "$walk" ] || key=graphql_walk
 printf . >>"$GH_STUB_STATE/$key"
 seen="$(cat "$GH_STUB_STATE/$key")"
 file="$GH_STUB_FIXTURES/$key.${#seen}"
@@ -164,28 +168,30 @@ file="$GH_STUB_FIXTURES/$key.${#seen}"
 # is a refusal with no GraphQL body at all.
 if [ "$url" = graphql ] && [ -e "$file" ]; then
   [ -z "$paginate" ] || { printf 'gh api graphql --paginate is not how the lane reads\n' >&2; exit 98; }
-  printf '%s\n' "${cursor:--}" >>"$GH_STUB_STATE/graphql.cursors"
+  # One answer file per call: the open list's pages are asked for at once.
+  pg="$GH_STUB_STATE/graphql.page.$$" w="${walk:+-walk}"
+  printf '%s\n' "${cursor:--}" >>"$GH_STUB_STATE/graphql$w.cursors"
   line=1
   case "$cursor" in p[0-9]*) line="${cursor#p}" ;; esac
-  sed -n "${line}p" "$file" >"$GH_STUB_STATE/graphql.page"
+  sed -n "${line}p" "$file" >"$pg"
   # `<fault> then <page>`: the fault on the first ask of this page, the page on
   # every ask after it — a server that failed once (#1581).
-  page="$(cat "$GH_STUB_STATE/graphql.page")"
+  page="$(cat "$pg")"
   case "$page" in
     *' then '*)
-      printf . >>"$GH_STUB_STATE/graphql.flaky.$line"
-      if [ "$(wc -c <"$GH_STUB_STATE/graphql.flaky.$line" | tr -d ' ')" -ge 2 ]; then
-        printf '%s\n' "${page#* then }" >"$GH_STUB_STATE/graphql.page"
+      printf . >>"$GH_STUB_STATE/graphql$w.flaky.$line"
+      if [ "$(wc -c <"$GH_STUB_STATE/graphql$w.flaky.$line" | tr -d ' ')" -ge 2 ]; then
+        printf '%s\n' "${page#* then }" >"$pg"
       else
-        printf '%s\n' "${page%% then *}" >"$GH_STUB_STATE/graphql.page"
+        printf '%s\n' "${page%% then *}" >"$pg"
       fi
       ;;
   esac
-  case "$(cat "$GH_STUB_STATE/graphql.page")" in
+  case "$(cat "$pg")" in
     # `HTTP <code> [text]`: a refusal with no GraphQL body, gh's stderr naming it.
     'HTTP '*)
       printf '{"message":"Bad Gateway"}\n'
-      printf 'gh: %s\n' "$(cat "$GH_STUB_STATE/graphql.page")" >&2
+      printf 'gh: %s\n' "$(cat "$pg")" >&2
       exit 1
       ;;
     # GitHub's HTML error page where JSON was due.
@@ -195,12 +201,12 @@ if [ "$url" = graphql ] && [ -e "$file" ]; then
       exit 1
       ;;
   esac
-  if jq -e '(.errors // []) | length > 0' "$GH_STUB_STATE/graphql.page" >/dev/null 2>&1; then
-    cat "$GH_STUB_STATE/graphql.page"
-    printf 'gh: %s\n' "$(jq -r '.errors[0].message' "$GH_STUB_STATE/graphql.page" | tr -d '\r')" >&2
+  if jq -e '(.errors // []) | length > 0' "$pg" >/dev/null 2>&1; then
+    cat "$pg"
+    printf 'gh: %s\n' "$(jq -r '.errors[0].message' "$pg" | tr -d '\r')" >&2
     exit 1
   fi
-  file="$GH_STUB_STATE/graphql.page"
+  file="$pg"
 fi
 if [ ! -e "$file" ]; then
   printf '{"message":"Not Found","status":"404"}\n'
@@ -666,6 +672,10 @@ build_fixtures() {
     fx "repos/$REPO/compare/main...$(sha_of "$n")" '{"behind_by":0}'
   done
   fx graphql '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"p2"},"nodes":['"$list"']}}}}'
+  # The cursor walk a concurrent pass makes first: all fourteen on one page.
+  local edges=''
+  for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do edges="$edges${edges:+,}{\"cursor\":\"c$n\",\"node\":{\"number\":$n}}"; done
+  fx graphql_walk '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":"c14"},"edges":['"$edges"']}}}}'
   # 3, 11: settled red. 7: still running. 14: reports nothing at all.
   fx_checks "$(sha_of 3)" completed '"failure"'
   fx_checks "$(sha_of 11)" completed '"failure"'
@@ -704,7 +714,10 @@ lane_run() { # <scripts-dir> <fetch-concurrency> <tag>
     FETCH_CONCURRENCY="$2" bash "$1/merge-lane.sh" >"$out/log" 2>&1
   echo "$?" >"$out/rc"
   sort "$out/calls" >"$out/calls.sorted"
-  grep -v '^lane: fetch phase read ' "$out/log" >"$out/log.decided"
+  # A concurrent pass reads the open list in parallel after a cursor walk: one
+  # read more, which every count of reads includes, and one line more.
+  grep -v -e '^lane: fetch phase read ' -e '^lane: open list read in parallel: ' -e '^lane: open list read serially: ' "$out/log" \
+    | sed 's/[0-9]* API call(s) spent/N API call(s) spent/; s/so far: [0-9]*)/so far: N)/' >"$out/log.decided"
 }
 
 scripts_copy() { # <tag> -> a directory holding the three scripts the driver needs
@@ -729,7 +742,14 @@ cases_e2e() {
   say e2e-every-head-fetched $?
   # The same reads, the same number of times: nothing was read twice, so the
   # speed-up is real and the quota a pass spends did not move.
-  [ -s "$s/calls.sorted" ] && cmp -s "$s/calls.sorted" "$c/calls.sorted"
+  # The cursor walk is the one read more, and the "done" line counts it.
+  local sd cd
+  sd="$(sed -n 's/^lane: done, .*, \([0-9]*\) API call(s) spent by this run.*/\1/p' "$s/log")"
+  cd="$(sed -n 's/^lane: done, .*, \([0-9]*\) API call(s) spent by this run.*/\1/p' "$c/log")"
+  [ -s "$s/calls.sorted" ] && cmp -s "$s/calls.sorted" <(grep -vx graphql-walk "$c/calls.sorted") \
+    && [ "$(grep -cx graphql-walk "$c/calls")" -eq 1 ] && [ "$(grep -cx graphql-walk "$s/calls")" -eq 0 ] \
+    && [[ "$sd" =~ ^[0-9]+$ ]] && [ "$cd" = $((sd + 1)) ] \
+    && [ "$(grep -c '^lane: open list read in parallel: 1 page(s) asked at once, at most 8 at a time, after a 1-page cursor walk; 1 taken, 1 read serially after them; 0 duplicate(s) dropped; ' "$c/log")" -eq 1 ]
   say e2e-same-reads $?
   [ "$(grep -c '^WRITE ' "$s/calls")" -eq 0 ] && [ "$(grep -c '^WRITE ' "$c/calls")" -eq 0 ]
   say e2e-no-write-in-a-dry-run $?
@@ -1251,6 +1271,162 @@ cases_snap() { # <fetch-file>
   )
 }
 
+# ---------------------------------------------------------------------------
+# THE OPEN LIST READ IN PARALLEL, AFTER A CURSOR WALK.
+#
+# Pages of two (LANE_SNAP_PAGE=2), so five pull requests are three pages. A
+# heavy page is picked by its cursor the way every GraphQL fixture here is:
+# none is line 1, `pN` is line N. The walk names, at every second pull
+# request, the cursor the next page begins after. Each case is the same read
+# serially and in parallel, or a list that moved between the walk and the
+# pages: a page that overlaps the one before it, a list that grew past the
+# walk's end, a seam that does not meet, a walk that cannot be read, a page
+# that is the lane blind.
+# ---------------------------------------------------------------------------
+par_node() { snap_node "$1" "$(sha_of "$1")" MERGEABLE '{"__typename":"User","login":"x"}' '[]'; }
+par_nodes() { # <number>... -> the nodes of one page, comma-joined
+  local n out=''
+  for n in "$@"; do out="$out${out:+,}$(par_node "$n")"; done
+  printf '%s' "$out"
+}
+par_walk_page() { # <has-next> <end-cursor-json> <number:cursor>...
+  local has="$1" end="$2" e edges=''
+  shift 2
+  for e in "$@"; do edges="$edges${edges:+,}{\"cursor\":\"${e#*:}\",\"node\":{\"number\":${e%%:*}}}"; done
+  printf '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":%s,"endCursor":%s},"edges":[%s]}}}}\n' "$has" "$end" "$edges"
+}
+# <dir> <kind>
+build_par_fixture() {
+  local walk5
+  walk5="$(par_walk_page false '"x5"' 50:x1 49:p2 48:x3 47:p3 46:x5)"
+  case "$2" in
+    # Five on three pages, and nothing moved.
+    same | nowalk | badwalk)
+      printf '%s\n' "$(snap_page true '"p2"' "$(par_nodes 50 49)")" "$(snap_page true '"p3"' "$(par_nodes 48 47)")" \
+        "$(snap_page false null "$(par_nodes 46)")" >"$1/graphql"
+      case "$2" in
+        same) printf '%s\n' "$walk5" >"$1/graphql_walk" ;;
+        badwalk) printf '%s\n' '{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query."}]}' >"$1/graphql_walk" ;;
+      esac
+      ;;
+    # Page 2 begins one earlier than the walk said: 49 is on two pages.
+    overlap)
+      printf '%s\n' "$(snap_page true '"p2"' "$(par_nodes 50 49)")" "$(snap_page true '"p3"' "$(par_nodes 49 48 47)")" \
+        "$(snap_page false null "$(par_nodes 46)")" >"$1/graphql"
+      printf '%s\n' "$walk5" >"$1/graphql_walk"
+      ;;
+    # The walk saw four, on two pages of its own; 46 was opened after it.
+    grew)
+      printf '%s\n' "$(snap_page true '"p2"' "$(par_nodes 50 49)")" "$(snap_page true '"p3"' "$(par_nodes 48 47)")" \
+        "$(snap_page false null "$(par_nodes 46)")" >"$1/graphql"
+      printf '%s\n' "$(par_walk_page true '"p2"' 50:x1 49:p2)" "$(par_walk_page false '"p3"' 48:x3 47:p3)" >"$1/graphql_walk"
+      ;;
+    # 51 was opened after the walk: page 1 ends on 50, not on 49, and the page
+    # after 49 (asked at once) would leave 49 out. p4/p5: after 50, after 48.
+    seam)
+      printf '%s\n' "$(snap_page true '"p4"' "$(par_nodes 51 50)")" "$(snap_page true '"p3"' "$(par_nodes 48 47)")" \
+        "$(snap_page false null "$(par_nodes 46)")" "$(snap_page true '"p5"' "$(par_nodes 49 48)")" \
+        "$(snap_page false null "$(par_nodes 47 46)")" >"$1/graphql"
+      printf '%s\n' "$walk5" >"$1/graphql_walk"
+      ;;
+    # Page 2 carries an error at a check run: the lane is blind.
+    blind)
+      printf '%s\n' "$(snap_page true '"p2"' "$(par_nodes 50 49)")" \
+        "$(snap_page true '"p3"' "$(par_nodes 48 47)" '[{"type":"INTERNAL","path":["repository","pullRequests","nodes",0,"commits","nodes",0,"commit","checkSuites","nodes",0,"checkRuns"],"message":"x"}]')" \
+        "$(snap_page false null "$(par_nodes 46)")" >"$1/graphql"
+      printf '%s\n' "$walk5" >"$1/graphql_walk"
+      ;;
+  esac
+}
+
+# SC2034: the LANE_* globals and R are read by the sourced fetch file.
+# shellcheck disable=SC2034
+cases_par() { # <fetch-file>
+  (
+    # shellcheck source=/dev/null
+    source "$1"
+    d="$(mktemp -d "$WORK/par.XXXXXX")"
+    # shellcheck disable=SC2317,SC2329  # called indirectly, by lane_snap_ask
+    lane_snap_retry_sleep() { :; }
+    LANE_TMP="$d" LANE_RECORD='' LANE_REPLAY='' LANE_QUOTA="$d/quota" R="$REPO" LANE_BASE=main LANE_SNAP_PAGE=2
+    unset GH_STUB_REMAINING GH_STUB_QUOTA_RESET GH_STUB_RESOURCE GH_STUB_NO_HEADERS
+    # <kind> <concurrency> — the read, into $d/<kind>.<concurrency>: out, err,
+    # rc, the pull requests in order, the heavy and walk calls, the cursors.
+    par_run() {
+      local r="$d/$1.$2" rc=0
+      mkdir -p "$r/fix" "$r/snap"
+      build_par_fixture "$r/fix" "$1"
+      : >"$GH_STUB_LOG"
+      : >"$GH_STUB_STATE/graphql.cursors"
+      : >"$GH_STUB_STATE/graphql-walk.cursors"
+      FETCH_CONCURRENCY="$2" GH_STUB_FIXTURES="$r/fix" lane_snapshot "$r/snap" >"$r/out" 2>"$r/err" || rc=$?
+      printf '%s' "$rc" >"$r/rc"
+      awk 'NR % 6 == 1' "$r/out" | tr '\n' ' ' >"$r/numbers"
+      grep -cx graphql "$GH_STUB_LOG" >"$r/calls" || true
+      grep -cx graphql-walk "$GH_STUB_LOG" >"$r/walks" || true
+      sort "$GH_STUB_STATE/graphql.cursors" | tr '\n' ' ' >"$r/cursors"
+      tr '\n' ' ' <"$GH_STUB_STATE/graphql-walk.cursors" >"$r/walk-cursors"
+    }
+    # <kind> <concurrency> <numbers> <heavy-calls> — read whole, as expected.
+    par_read() {
+      local r="$d/$1.$2"
+      [ "$(<"$r/rc")" = 0 ] && [ "$(<"$r/numbers")" = "$3" ] && [ "$(<"$r/calls")" = "$4" ]
+    }
+    note() { cat "$d/$1/snap/parallel" 2>/dev/null; }
+
+    [[ "$LANE_SNAP_QUERY" == *"first: $(sed -n 's/^LANE_SNAP_PAGE=//p' "$1"), after: \$endCursor"* ]]
+    say par-page-size-is-the-query-s $?
+
+    local c
+    par_run same 1
+    for c in 2 4; do par_run same "$c"; done
+    par_read same 1 '50 49 48 47 46 ' 3 && [ "$(<"$d/same.1/walks")" = 0 ] \
+      && cmp -s "$d/same.1/out" "$d/same.4/out" && cmp -s "$d/same.1/out" "$d/same.2/out" \
+      && cmp -s "$d/same.1/snap/summary" "$d/same.4/snap/summary" \
+      && diff -r -x parallel "$d/same.1/snap" "$d/same.4/snap" >/dev/null \
+      && [ "$(<"$d/same.4/calls")" = 3 ] && [ "$(<"$d/same.4/walks")" = 1 ] && [ "$(<"$d/same.4/cursors")" = '- p2 p3 ' ] \
+      && [ ! -e "$d/same.1/snap/parallel" ] \
+      && [[ "$(note same.4)" == 'open list read in parallel: 3 page(s) asked at once, at most 4 at a time, after a 1-page cursor walk; 3 taken, 0 read serially after them; 0 duplicate(s) dropped; '*'s in all' ]]
+    say par-reads-what-the-serial-read-reads $?
+
+    par_run overlap 4
+    par_read overlap 4 '50 49 48 47 46 ' 3 \
+      && grep -q '^open list read in 3 GraphQL page(s), 5 pull request(s);' "$d/overlap.4/snap/summary" \
+      && [[ "$(note overlap.4)" == *'; 1 duplicate(s) dropped; '* ]]
+    say par-a-pull-request-on-two-pages-is-kept-once $?
+
+    par_run grew 4
+    par_read grew 4 '50 49 48 47 46 ' 3 && [ "$(<"$d/grew.4/walks")" = 2 ] && [ "$(<"$d/grew.4/walk-cursors")" = '- p2 ' ] \
+      && [ "$(<"$d/grew.4/cursors")" = '- p2 p3 ' ] && [[ "$(note grew.4)" == *'after a 2-page cursor walk; 2 taken, 1 read serially after them;'* ]]
+    say par-the-last-page-s-next-page-is-read $?
+
+    par_run seam 4
+    par_read seam 4 '51 50 49 48 47 46 ' 5 && [ "$(<"$d/seam.4/cursors")" = '- p2 p3 p4 p5 ' ] \
+      && grep -q '^open list read in 5 GraphQL page(s), 6 pull request(s);' "$d/seam.4/snap/summary" \
+      && [[ "$(note seam.4)" == *'1 taken, 2 read serially after them (page 1 did not end where the walk said the next one begins);'* ]]
+    say par-a-seam-that-does-not-meet-is-read-serially $?
+
+    local k fell=0
+    for k in nowalk badwalk; do
+      par_run "$k" 4
+      par_read "$k" 4 '50 49 48 47 46 ' 3 && cmp -s "$d/same.1/out" "$d/$k.4/out" && [ "$(<"$d/$k.4/walks")" = 1 ] \
+        && [ "$(<"$d/$k.4/cursors")" = '- p2 p3 ' ] && [ "$(note "$k.4")" = 'open list read serially: the cursor walk could not be read' ] \
+        && grep -q '^open list read in 3 GraphQL page(s), 5 pull request(s);' "$d/$k.4/snap/summary" || fell=1
+    done
+    [ "$fell" -eq 0 ]
+    say par-a-walk-that-cannot-be-read-is-the-serial-read $?
+
+    par_run blind 4
+    [ "$(<"$d/blind.4/rc")" != 0 ] && [ ! -s "$d/blind.4/out" ] && grep -q '^page 2 (gh exit 1): ' "$d/blind.4/err"
+    say par-a-blind-page-fails-closed $?
+
+    # A read that was taken leaves the snapshot and nothing else (a blind one's
+    # directory goes with the pass's temporary one).
+    [ -z "$(find "$d" -path '*/snap/*' ! -path '*/blind.4/*' \( -name 'par.*' -o -name 'walk*' -o -name 'page*' -o -name 'nodes.once' -o -name 'parallel.fallback' \) | sed -n 1p)" ]
+    say par-leaves-no-page-behind $?
+  )
+}
+
 tally_lines() { # <output> <how-many-expected> <group>
   local line n=0
   while IFS= read -r line; do
@@ -1297,6 +1473,7 @@ tally_lines "$(cases_shell "$FETCH" 2>&1)" 2 shell
 tally_lines "$(cases_retry "$FETCH" 2>&1)" 12 retry
 tally_lines "$(cases_quota "$FETCH" 2>&1)" 6 quota
 tally_lines "$(cases_snap "$FETCH" 2>&1)" 15 snap
+tally_lines "$(cases_par "$FETCH" 2>&1)" 8 "parallel open list"
 
 mutant "the header block reaches the caller" cases_quota "$FETCH"   's|^    inh { if ([$]0 == "[\]r" [|][|] [$]0 == "") { inh = 0 } else { print > hdr }; next }$|    inh { print; if (length($0) < 2) inh = 0; next }|' quota-headers-never-reach-the-caller
 mutant "a call goes out without its headers" cases_quota "$FETCH"   's|command gh api -i "\${@:2}"|command gh api "${@:2}"|' quota-noted-from-the-answer
@@ -1311,7 +1488,7 @@ mutant "the next page is asked without its cursor" cases_snap "$FETCH" \
 mutant "a Bot author keeps the GraphQL form" cases_snap "$FETCH" \
   's|then .author.login + "\[bot\]" else|then .author.login else|' snap-bot-login-in-rest-form
 mutant "gh's exit status decides the read again" cases_snap "$FETCH" \
-  's|^    pages=\$((pages + 1))$|    pages=$((pages + 1)); [ "$rc" -eq 0 ] \|\| return 1|' snap-app-error-with-full-data-proceeds
+  's|^    if ! lane_snap_page_ok "\$page"; then$|    if [ "$rc" -ne 0 ] \|\| ! lane_snap_page_ok "$page"; then|' snap-app-error-with-full-data-proceeds
 mutant "a head whose app GraphQL could not name is served" cases_snap "$FETCH" \
   's/select(\[\$s\[\] | .app.slug | type == "string"\] | all)/select(true)/' snap-app-error-with-full-data-proceeds
 mutant "any error is accepted" cases_snap "$FETCH" \
@@ -1356,6 +1533,23 @@ mutant "the retry time stops coming from the refusing window" cases_snap "$FETCH
   's|\[ "\${remaining:-}" = 0 \] \&\& \[\[ "\${reset:-}" =~|false \&\& [[ "${reset:-}" =~|' read-cause-names-a-quota-refusal-not-blind
 mutant "a missing permission reads as a rate limit" cases_snap "$FETCH" \
   "s/grep -q 'HTTP 403' \"\$err\" \&\& grep -qi 'rate limit' \"\$err\"/grep -q 'HTTP 403' \"\$err\"/" read-cause-names-a-quota-refusal-not-blind
+
+mutant "the page size stops being the query's" cases_par "$FETCH" \
+  's|^LANE_SNAP_PAGE=25$|LANE_SNAP_PAGE=20|' par-page-size-is-the-query-s
+mutant "the walk's boundaries are off by one" cases_par "$FETCH" \
+  's|^    if \[ \$((i % LANE_SNAP_PAGE)) -eq 0 \]; then$|    if [ $((i % LANE_SNAP_PAGE)) -eq 1 ]; then|' par-reads-what-the-serial-read-reads
+mutant "a pull request on two pages is kept twice" cases_par "$FETCH" \
+  's|if \.seen\[\$k\] then \. else|if false then . else|' par-a-pull-request-on-two-pages-is-kept-once
+mutant "the last page's next page is not read" cases_par "$FETCH" \
+  's|^      more="\$next" cursor="\$next" prev="\$next"$|      [ "$k" -lt $((p - 1)) ] \|\| { more=-; break; }; more="$next" cursor="$next" prev="$next"|' par-the-last-page-s-next-page-is-read
+mutant "a seam that does not meet is taken" cases_par "$FETCH" \
+  's|\] \|\| \[ "\$last" != "\${numbers\[k\]}" \]; then$|]; then|' par-a-seam-that-does-not-meet-is-read-serially
+mutant "a walk that cannot be read fails the pass" cases_par "$FETCH" \
+  's|^      1) return 1 ;;$|      *) return 1 ;;|' par-a-walk-that-cannot-be-read-is-the-serial-read
+mutant "a blind page is taken" cases_par "$FETCH" \
+  '/^    if \[ "\$rc" != 0 \]; then$/,/^    fi$/s|^      return 1$|      continue|' par-a-blind-page-fails-closed
+mutant "the pages are left behind" cases_par "$FETCH" \
+  's|^  for ((k = 0; k < p; k++)); do rm -f "\$dir/par\.\$k" "\$dir/par\.\$k"\.\*; done$|  :|' par-leaves-no-page-behind
 
 mutant "a call waits however long the window is" cases_retry "$FETCH" \
   's|^LANE_RETRY_MAX_WAIT=90$|LANE_RETRY_MAX_WAIT=99999|' retry-not-past-the-cap

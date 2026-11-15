@@ -2204,6 +2204,7 @@ one_pass() {
   fi
   rm -f "$list_err"
   echo "lane: $(cat "$LANE_SNAP/summary" 2>/dev/null)"
+  [ ! -s "$LANE_SNAP/parallel" ] || echo "lane: $(cat "$LANE_SNAP/parallel")"
   if [ -z "$prs_raw" ]; then
     echo "lane: no open pull requests on $LANE_BASE"
     return 1
