@@ -837,7 +837,8 @@ lane_snap_ask() {
 # `cursor`, `prev`, `pages`, `tolerated`, `reasked` and `par_*` (bash scoping
 # is dynamic). 0: pages taken into <dir>/nodes; 1: a blind page; 2: no walk.
 lane_snap_parallel() {
-  local dir="$1" walk="$dir/walk" wcursor='' wprev='' wmore num cur i k p jobs last next rc
+  local dir="$1"
+  local walk="$dir/walk" wcursor='' wprev='' wmore num cur i k p jobs last next rc
   local anchors=('') numbers=() pids=()
   : >"$dir/walk.items"
   while :; do
