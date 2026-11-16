@@ -1648,7 +1648,8 @@ retries_a_red_base_once() { # #1529
   local code
   code=$(code_of "$1")
   matches "$code" '^    lane_base_rerun_failed "\$base_sha"$' || return 1
-  matches "$code" '^    if \[ "\$attempt" != 1 \]; then$' || return 1
+  matches "$code" '^    if \[ "\$attempt" = 2 \] && \{ \[ -z "\$step" \] \|\| grep -qiE ' || return 1
+  matches "$code" '^    elif \[ "\$attempt" != 1 \]; then$' || return 1
   matches "$code" 'GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST "repos/\$R/actions/runs/\$id/rerun-failed-jobs"'
 }
 
@@ -2598,7 +2599,9 @@ mutate "the batch stops asking whether the base allows it" "$DRIVER" \
 mutate "a red base is never retried" "$DRIVER" \
   's@^    lane_base_rerun_failed "\$base_sha"$@    :@' retries_a_red_base_once
 mutate "the retry is not capped at the first attempt" "$DRIVER" \
-  's@^    if \[ "\$attempt" != 1 \]; then$@    if false; then@' retries_a_red_base_once
+  's@^    elif \[ "\$attempt" != 1 \]; then$@    elif false; then@' retries_a_red_base_once
+mutate "the second retry no longer requires attempt 2" "$DRIVER" \
+  's@^    if \[ "\$attempt" = 2 \] && @    if true \&\& @' retries_a_red_base_once
 mutate "the retry acts as the App" "$DRIVER" \
   's@GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST@gh api -X POST@' retries_a_red_base_once
 mutate "the lane job stops holding actions: write" "$CALLEE" \
