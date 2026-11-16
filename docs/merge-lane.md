@@ -1700,6 +1700,14 @@ So the lane does not try to prevent it. It **bounds** it, with two things:
    the `recover` job already needs). Without it the log carries a warning and
    the pass halts as before. A dry run only logs `would re-run`.
 
+   **One more re-run when the retry failed before the code ran.** On
+   `run_attempt` 2 the lane re-runs once more only if the failing job's first
+   failed step is `Set up job` or a checkout, or no step failed at all (a lost
+   runner). A commit cannot break those steps. IntegrateIT, 2026-11-16: two
+   `actions/checkout` "repository not found" failures in a row on two hosts
+   halted merges for 26 minutes. A failure in any other step on attempt 2, and
+   anything on attempt 3, still waits for a fix.
+
 **The gate fails open, deliberately, and it is only as good as your post-merge
 CI.** Only a definite failure halts it. A check that is *missing* or *pending*
 on the base tip does not, because most repositories run their required checks on

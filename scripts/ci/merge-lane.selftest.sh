@@ -1648,7 +1648,8 @@ retries_a_red_base_once() { # #1529
   local code
   code=$(code_of "$1")
   matches "$code" '^    lane_base_rerun_failed "\$base_sha"$' || return 1
-  matches "$code" '^    if \[ "\$attempt" != 1 \]; then$' || return 1
+  matches "$code" '^    if \[ "\$attempt" = 2 \] && \{ \[ -z "\$step" \] \|\| grep -qiE ' || return 1
+  matches "$code" '^    elif \[ "\$attempt" != 1 \]; then$' || return 1
   matches "$code" 'GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST "repos/\$R/actions/runs/\$id/rerun-failed-jobs"'
 }
 
@@ -2598,7 +2599,9 @@ mutate "the batch stops asking whether the base allows it" "$DRIVER" \
 mutate "a red base is never retried" "$DRIVER" \
   's@^    lane_base_rerun_failed "\$base_sha"$@    :@' retries_a_red_base_once
 mutate "the retry is not capped at the first attempt" "$DRIVER" \
-  's@^    if \[ "\$attempt" != 1 \]; then$@    if false; then@' retries_a_red_base_once
+  's@^    elif \[ "\$attempt" != 1 \]; then$@    elif false; then@' retries_a_red_base_once
+mutate "the second retry no longer requires attempt 2" "$DRIVER" \
+  's@^    if \[ "\$attempt" = 2 \] && @    if true \&\& @' retries_a_red_base_once
 mutate "the retry acts as the App" "$DRIVER" \
   's@GH_TOKEN="\$LANE_RERUN_TOKEN" gh api -X POST@gh api -X POST@' retries_a_red_base_once
 mutate "the lane job stops holding actions: write" "$CALLEE" \
@@ -4235,7 +4238,9 @@ behavioural_base_rerun_cases() {
       *) echo "rerun stub: unexpected gh call '$*'" >&2; return 1 ;;
     esac
   }
-  # _rr_case <label> <want: rerun|none> <failing names, |-separated> <run attempt> <failed job names> [dry|refuse|notoken]
+  # _rr_case <label> <want: rerun|none> <failing names, |-separated> <run attempt> <failed jobs> [dry|refuse|notoken]
+  # <failed jobs>: one `name::failed step` per line (`name` alone = no step failed),
+  # turned into the tab-separated lines the driver's --jq prints.
   # DRY_RUN, LANE_RERUN_TOKEN and LANE_BASE_FAILING are locals that
   # lane_base_rerun_failed reads through bash's dynamic scope.
   # shellcheck disable=SC2034
@@ -4243,7 +4248,7 @@ behavioural_base_rerun_cases() {
     rm -f "$fix/calls" "$fix/refuse"
     : >"$fix/calls"
     printf '101 %s\n' "$4" >"$fix/runs"
-    printf '%s\n' "$5" >"$fix/jobs"
+    printf '%s\n' "${5//::/$'\t'}" >"$fix/jobs"
     local DRY_RUN=false LANE_RERUN_TOKEN=run-token
     [ "${6:-}" = dry ] && DRY_RUN=true
     [ "${6:-}" = refuse ] && : >"$fix/refuse"
@@ -4266,7 +4271,13 @@ behavioural_base_rerun_cases() {
   else
     echo "FAIL the re-run must use LANE_RERUN_TOKEN, not the App token; calls: $(tr '\n' ' ' <"$fix/calls")"
   fi
-  _rr_case "attempt 2 already was the retry — no second re-run" none main-health 2 main-health
+  _rr_case "attempt 2 already was the retry — no second re-run" none main-health 2 'main-health::Typecheck'
+  _rr_case "attempt 2 failed in checkout — one last re-run" rerun main-health 2 'main-health::Run actions/checkout@fbc6f39'
+  _rr_case "attempt 2 failed setting up the job — one last re-run" rerun main-health 2 'main-health::Set up job'
+  _rr_case "attempt 2 with no failed step (runner lost) — one last re-run" rerun main-health 2 main-health
+  _rr_case "attempt 2 in a step that only mentions checkout is the code's failure" none main-health 2 'main-health::Run checkout-flow tests'
+  _rr_case "attempt 3 failed in checkout — the halt waits for a person" none main-health 3 'main-health::Run actions/checkout@fbc6f39'
+  _rr_case "attempt 2: the infra verdict is the failing base-health job's, not another's" none main-health 2 $'lint::Set up job\nmain-health::Typecheck'
   _rr_case "a run whose failed job is not a failing base-health name is left alone" none main-health 1 lint
   _rr_case "no failing base-health name — nothing is read or re-run" none '' 1 main-health
   if [ ! -s "$fix/calls" ]; then echo "PASS an empty failing list makes no API call"; else

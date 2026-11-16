@@ -1712,7 +1712,8 @@ lane_base_is_broken() {
 }
 
 # ---------------------------------------------------------------------------
-# lane_base_rerun_failed — retry a red base ONCE before the halt waits on a person.
+# lane_base_rerun_failed — retry a red base before the halt waits on a person:
+# once, and once more if the retry failed before the commit's code ran.
 #
 #   lane_base_rerun_failed <base-sha>        reads LANE_BASE_FAILING
 #
@@ -1732,6 +1733,17 @@ lane_base_is_broken() {
 # of that run are not repeated. Only runs on THIS tip whose failed job carries
 # a failing base-health name, so nothing else on the base is touched.
 #
+# A SECOND retry, only for a failure before the code ran. IntegrateIT,
+# 2026-11-16: `main-health` on dc799b04 failed at 03:38 AND on its retry at
+# 03:40, both in `actions/checkout` ("repository 'https://github.com/…' not
+# found"), on two different hosts; attempt 3, run by hand at 04:04, passed on
+# one of them. The lane halted for 26 minutes on a GitHub blip that its one
+# retry happened to land inside. So attempt 2 is re-run once more when the step
+# that failed it is job setup or a checkout, or when no step failed at all (a
+# runner lost or shut down mid-job). A commit cannot break those: they run
+# before any of its code does. Attempt 3 never re-runs, so the bound is still
+# two extra runs, kept by GitHub's attempt count as before.
+#
 # The halt itself is unchanged: while the retry runs the tip reads `unanswered`
 # and the lane waits, and it resumes on its own when the retry answers green.
 # The re-run uses the run's own GITHUB_TOKEN (LANE_RERUN_TOKEN; the lane job
@@ -1739,7 +1751,7 @@ lane_base_is_broken() {
 # effort — a refused re-run is a warning naming the grant, and the halt stands
 # as it did before this existed.
 lane_base_rerun_failed() { # <base-sha>
-  local base_sha="$1" runs id attempt names name hit err
+  local base_sha="$1" runs id attempt jobs names name hit step err why
   [ "${#LANE_BASE_FAILING[@]}" -gt 0 ] || return 0
   if ! runs="$(gh api "repos/$R/actions/runs?head_sha=$base_sha&status=completed&per_page=100" \
     --jq '.workflow_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | "\(.id) \(.run_attempt)"' 2>/dev/null)"; then
@@ -1748,8 +1760,11 @@ lane_base_rerun_failed() { # <base-sha>
   fi
   while read -r id attempt; do
     [ -n "$id" ] || continue
-    names="$(gh api --paginate "repos/$R/actions/runs/$id/jobs?per_page=100" \
-      --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name' 2>/dev/null)" || continue
+    # One line per failed job: its name, a tab, and the first step that failed
+    # it (empty when none did — a runner lost mid-job).
+    jobs="$(gh api --paginate "repos/$R/actions/runs/$id/jobs?per_page=100" \
+      --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | "\(.name)\t\([.steps[]? | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name][0] // "")"' 2>/dev/null)" || continue
+    names="$(cut -f1 <<<"$jobs")"
     hit=''
     for name in "${LANE_BASE_FAILING[@]}"; do
       if grep -qxF -- "$name" <<<"$names"; then
@@ -1758,12 +1773,16 @@ lane_base_rerun_failed() { # <base-sha>
       fi
     done
     [ -n "$hit" ] || continue
-    if [ "$attempt" != 1 ]; then
-      echo "lane: '$hit' failed on ${base_sha:0:8} on attempt $attempt of run $id — already retried once, so the halt waits for a fix"
+    step="$(awk -F'\t' -v n="$hit" '$1 == n { print $2; exit }' <<<"$jobs")"
+    why="its first attempt; one retry before the halt waits on a person (#1529)"
+    if [ "$attempt" = 2 ] && { [ -z "$step" ] || grep -qiE '^(set up job|run actions/checkout@.*|checkout.*)$' <<<"$step"; }; then
+      why="attempt 2, in '${step:-no step — the runner was lost}', before any of the commit's code ran; one last retry"
+    elif [ "$attempt" != 1 ]; then
+      echo "lane: '$hit' failed on ${base_sha:0:8} on attempt $attempt of run $id (step '${step:-none}') — already retried, so the halt waits for a fix"
       continue
     fi
     if [ "$DRY_RUN" = "true" ]; then
-      echo "lane: dry-run — would re-run the failed jobs of run $id ('$hit' failed on ${base_sha:0:8}, attempt 1)"
+      echo "lane: dry-run — would re-run the failed jobs of run $id ('$hit' failed on ${base_sha:0:8}, attempt $attempt)"
       continue
     fi
     if [ -z "${LANE_RERUN_TOKEN:-}" ]; then
@@ -1773,7 +1792,7 @@ lane_base_rerun_failed() { # <base-sha>
     # The run's own GITHUB_TOKEN, not the App: re-running is an Actions write,
     # which the lane job is granted (`actions: write`) and the App need not be.
     if err="$(GH_TOKEN="$LANE_RERUN_TOKEN" gh api -X POST "repos/$R/actions/runs/$id/rerun-failed-jobs" 2>&1)"; then
-      echo "::notice::lane: re-running the failed jobs of run $id — '$hit' failed on ${base_sha:0:8} on its first attempt; one retry before the halt waits on a person (#1529)"
+      echo "::notice::lane: re-running the failed jobs of run $id — '$hit' failed on ${base_sha:0:8} on $why"
     else
       echo "::warning::lane: could not re-run the failed jobs of run $id ('$hit' on ${base_sha:0:8}): ${err//$'\n'/ } — the calling job must grant 'actions: write'; until then re-run it by hand"
     fi
