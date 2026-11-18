@@ -153,7 +153,7 @@ locals {
   # what an unattended apply may destroy, with nothing merged here. Kept in
   # step with ci-runner-cache-warmer's var.gcloud_image by cloud-sdk-digest.yml
   # (scripts/ci/cloud-sdk-digest.sh).
-  cloud_sdk_image = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e8394c66f4f66336af311343ff9a84c84521f8c1113ebc8abfe98bab9a155099"
+  cloud_sdk_image = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:e600434bbbbb6c43446b0cd5d1b730e7c1690e635e591f98dce05d9ca52055fd"
 
   guard_script_gz    = base64gzip(file("${path.module}/../../scripts/ci/tf-apply-guard.sh"))
   guard_allowed_args = join(" ", [for t in var.unattended_destroy_allowed_types : "'${t}'"])
