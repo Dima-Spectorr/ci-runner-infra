@@ -346,7 +346,7 @@ variable "cache_scan_allow_file" {
 variable "gcloud_image" {
   description = "Image the publishing and staging steps run in, pinned by @sha256 digest (#1614). Kept in step with ci-runner-apply-trigger's local.cloud_sdk_image by cloud-sdk-digest.yml."
   type        = string
-  default     = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:399af28abb07ff5578b88a027761f2d468a685e68373b5433796fd8f85488e75"
+  default     = "gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:58661d3e1ea51bdf05fb4cb536467f186dd14304eb128ea0a2184653b2dce548"
 
   validation {
     condition     = can(regex("^[^[:space:]\"'$`\\\\]+@sha256:[0-9a-f]{64}$", var.gcloud_image))
